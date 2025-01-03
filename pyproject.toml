@@ -1,0 +1,2 @@
+[tool.poetry.scripts]
+llm_agent_x = "llm_agent_x.core:greet"
