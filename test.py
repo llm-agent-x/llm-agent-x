@@ -24,7 +24,7 @@ def web_search(query: str, num_results: int) -> List:
 
 def main(task, output_file):
     # Initialize the LLM
-    llm = ChatOpenAI(model="qwen2.5-coder-long:latest", base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), api_key=getenv("OPENAI_API_KEY"), temperature=0, )
+    llm = ChatOpenAI(model="qwen2.5-coder-long:latest", base_url=getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), api_key=getenv("OPENAI_API_KEY"), temperature=0, )
     
     # Initialize the agent with the task
     agent = llm_agent_x.Agent(task=task, llm=llm, max_layers=2, max_agents=5, search_tool = web_search)
