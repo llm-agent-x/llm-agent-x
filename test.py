@@ -7,7 +7,7 @@ from typing import List
 from langchain_community.utilities import SearxSearchWrapper
 from os import getenv
 
-search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080")
+search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 
 def web_search(query: str, num_results: int) -> List:
     """
