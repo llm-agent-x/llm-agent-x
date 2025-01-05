@@ -35,7 +35,7 @@ def main(task, output_file):
     
     # Write the response to the output file
     with open(output_file, "w") as f:
-        f.write(f"{agent_response}")
+        f.write(f"{agent_response["result"]}")
 
 if __name__ == "__main__":
     # Set up argument parsing
