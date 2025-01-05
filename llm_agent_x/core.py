@@ -35,12 +35,16 @@ class Agent:
         allow_search=False,
         task_thread=None,
         search_tool = None,
+        current_layer = 0,
+        on_subtasks_created=None,  # Callback for when subtasks are created
+        on_task_executed=None,  # Callback for when a task is executed
+        on_tool_call_executed=None  # Callback for when a tool call is executed
     ):
         self.task = task
         self.max_layers = max_layers
         self.max_agents = max_agents
         self.context = {}
-        self.current_layer = 0
+        self.current_layer = current_layer
         self.llm = llm
         self.task_split_llm = self.llm.with_structured_output(SplitTask)
         self.search_llm = self.llm.bind_tools([search_tool]) if search_llm is None else search_llm
@@ -48,6 +52,9 @@ class Agent:
         self.allow_search = allow_search
         self.tools = tools
         self.search_tool = search_tool
+        self.on_subtasks_created = on_subtasks_created
+        self.on_task_executed = on_task_executed
+        self.on_tool_call_executed = on_tool_call_executed
         if allow_search:
             self.tools.update({"web_search": search_tool})
         self.task_thread = task_thread if task_thread is not None else []
@@ -85,6 +92,9 @@ class Agent:
 
         msgs.append(HumanMessage(content=self._generate_execute_tasks_message()))
         parts = self.task_split_parser.parse(response.content)
+        # Callback for when subtasks are created
+        if self.on_subtasks_created:
+            self.on_subtasks_created(parts=parts, task_thread=self.task_thread)
         msgs.append(AIMessage(content="", tool_calls=[ToolCall(name="execute_tasks", id=str(uuid.uuid4()), args={"tasks": parts})]))
         if(type(parts) == list):
             pass
@@ -102,10 +112,18 @@ class Agent:
                 search_llm=self.search_llm,
                 allow_search=part["allow_search"],
                 task_thread=new_task_thread,
-                search_tool=self.search_tool
+                search_tool=self.search_tool,
+                current_layer=self.current_layer + 1,
+                on_subtasks_created=self.on_subtasks_created,  # Pass the callback
+                on_task_executed=self.on_task_executed,  # Pass the callback
+                on_tool_call_executed=self.on_tool_call_executed  # Pass the callback
             )
             current_agent.add_context({"previous_results": json.dumps(self.agent_results)})
-            self.agent_results.append(current_agent.run())
+            result = current_agent.run()
+            self.agent_results.append(result)
+            # Callback for when a task is executed
+            if self.on_task_executed:
+                self.on_task_executed(result=result, task_thread=self.task_thread)
 
         results = json.dumps([
             {"task": result.get("task", result), "result": result.get("result", result)}
@@ -137,10 +155,17 @@ class Agent:
                 tool = self.tools[name]
                 tool_response = tool(**args)
                 history.append(ToolMessage(content=tool_response, tool_call_id=id))
+                # Callback for when a tool call is executed
+                if self.on_tool_call_executed:
+                    self.on_tool_call_executed(tool_call=tool_call, tool_response=tool_response, task_thread=self.task_thread)
 
             response = self.llm.invoke(history)
 
-        return {"task": self.task, "result": response.content}
+        result = {"task": self.task, "result": response.content}
+        # Callback for when a task is executed
+        if self.on_task_executed:
+            self.on_task_executed(result=result, task_thread=self.task_thread)
+        return result
 
     def _generate_system_message(self) -> str:
         task_thread = "->".join(self.task_thread)
