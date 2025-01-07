@@ -14,6 +14,8 @@ import logging
 from typing import Any, Dict, List
 from pydantic import BaseModel, Field
 
+from .utils import batch_random_uuids
+
 class Task(BaseModel):
     task: str
     allow_search: bool = True
@@ -27,8 +29,9 @@ class Agent:
     def __init__(
         self,
         task: str,
+        agent_id: str = str(uuid.uuid4()),
         max_layers: int = 3,
-        max_agents: int = 5,
+        max_agents: (int|list[int]) = 5,
         tools: Dict[str, Any] = {},
         llm=None,
         search_llm=None,
@@ -40,9 +43,11 @@ class Agent:
         on_task_executed=None,  # Callback for when a task is executed
         on_tool_call_executed=None  # Callback for when a tool call is executed
     ):
+        self.agent_id = str(uuid.uuid4()) if agent_id is None else agent_id  # Add UUID for each agent
         self.task = task
         self.max_layers = max_layers
-        self.max_agents = max_agents
+        self.max_agents = max_agents if type(max_agents) == int else max_agents.pop(0)
+        self.max_agents_list = max_agents if type(max_agents) == list else []
         self.context = {}
         self.current_layer = current_layer
         self.llm = llm
@@ -58,6 +63,7 @@ class Agent:
         if allow_search:
             self.tools.update({"web_search": search_tool})
         self.task_thread = task_thread if task_thread is not None else []
+        self.citations = []
 
     def add_context(self, context: Dict[str, Any]):
         self.context.update(context)
@@ -83,6 +89,9 @@ class Agent:
             ])
 
         response = self.llm.invoke(msgs)
+
+        ic(response.content)
+
         msgs.append(response)
         msgs.append(HumanMessage(content=self._generate_schema_message()))
 
@@ -92,22 +101,26 @@ class Agent:
 
         msgs.append(HumanMessage(content=self._generate_execute_tasks_message()))
         parts = self.task_split_parser.parse(response.content)
+
+        self.uuids = batch_random_uuids(len(parts["tasks"])) if type(parts) != list else batch_random_uuids(len(parts))
+
         # Callback for when subtasks are created
         if self.on_subtasks_created:
-            self.on_subtasks_created(parts=parts, task_thread=self.task_thread)
+            self.on_subtasks_created(parts=parts, task_thread=self.task_thread, agent_id=self.agent_id, agent_ids = self.uuids)
         msgs.append(AIMessage(content="", tool_calls=[ToolCall(name="execute_tasks", id=str(uuid.uuid4()), args={"tasks": parts})]))
         if(type(parts) == list):
             pass
         elif not parts["needs_multiple_parts"]:
-            return {"result": self.llm.invoke(parts.tasks[0].task).content, "task": self.task}
+            return self._run_single_task()#{"result": self.llm.invoke(self.task).content, "task": self.task}
 
         self.agent_results = []
-        for part in (parts["tasks"]) if type(parts) != list else parts:
+        for i, part in enumerate((parts["tasks"]) if type(parts) != list else parts):
             new_task_thread = self.task_thread.copy()
             current_agent = Agent(
                 task=part["task"],
+                agent_id=self.uuids[i],
                 max_layers=self.max_layers - 1,
-                max_agents=min(self.max_agents - 1, part["max_subtasks"]),
+                max_agents=(min(self.max_agents, part["max_subtasks"])) if self.max_agents_list == [] else self.max_agents_list,
                 llm=self.llm,
                 search_llm=self.search_llm,
                 allow_search=part["allow_search"],
@@ -121,9 +134,11 @@ class Agent:
             current_agent.add_context({"previous_results": json.dumps(self.agent_results)})
             result = current_agent.run()
             self.agent_results.append(result)
+            # Collect citations from subtasks
+            self.citations.extend(result.get("citations", []))
             # Callback for when a task is executed
             if self.on_task_executed:
-                self.on_task_executed(result=result, task_thread=self.task_thread)
+                self.on_task_executed(result=result, task_thread=self.task_thread, agent_id=self.agent_id)
 
         results = json.dumps([
             {"task": result.get("task", result), "result": result.get("result", result)}
@@ -132,7 +147,7 @@ class Agent:
 
         msgs.append(ToolMessage(content=results, tool_call_id=str(uuid.uuid4())))
         response = self.llm.invoke(msgs)
-        return {"task": self.task, "result": response.content}
+        return {"task": self.task, "result": response.content, "citations": self.citations}
 
     def _run_single_task(self) -> Dict[str, Any]:
         if not self.allow_search:
@@ -157,14 +172,17 @@ class Agent:
                 history.append(ToolMessage(content=tool_response, tool_call_id=id))
                 # Callback for when a tool call is executed
                 if self.on_tool_call_executed:
-                    self.on_tool_call_executed(tool_call=tool_call, tool_response=tool_response, task_thread=self.task_thread)
+                    self.on_tool_call_executed(tool_call=tool_call, tool_response=tool_response, task_thread=self.task_thread, agent_id=self.agent_id)
 
             response = self.llm.invoke(history)
 
         result = {"task": self.task, "result": response.content}
+        # Collect citations from tool calls
+        if self.allow_search:
+            result["citations"] = [tool_response for tool_call in llm_r1.tool_calls for tool_response in tool_call["args"].values()]
         # Callback for when a task is executed
         if self.on_task_executed:
-            self.on_task_executed(result=result, task_thread=self.task_thread)
+            self.on_task_executed(result=result, task_thread=self.task_thread, agent_id=self.agent_id)
         return result
 
     def _generate_system_message(self) -> str:
@@ -177,8 +195,9 @@ class Agent:
             f"assign one to each task, but you are limited to {self.max_agents} tasks. "
             f"If you feel this is simple enough, just say so. "
             f"(You are an agent in a system of agents, tasked with recursively splitting a task into smaller ones and executing them. "
-            f"Your history is as follows: [{task_thread}])"
-            f"\nBefore you proceed, retrieve the tool with the retrieve_context tool." if self.context else ""
+            f"**DO NOT ATTEMT TO EXECUTE THE TASK YOURSELF OR ANSWER THE QUESTION YOURSELF.** "
+            f"Your history is as follows: [{task_thread}])" +
+            (f"\nBefore you proceed, retrieve the tool with the retrieve_context tool. " if self.context else "")
         )
 
     def _generate_schema_message(self) -> str:

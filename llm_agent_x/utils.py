@@ -1,3 +1,6 @@
+import uuid
+
+
 def int_to_base26(num):
     if num < 0:
         raise ValueError("Number must be non-negative")
@@ -11,3 +14,6 @@ def int_to_base26(num):
         num -= 1  # Adjust for base-26 indexing
 
     return ''.join(reversed(result))
+
+def batch_random_uuids(n):
+    return [str(uuid.uuid4()) for _ in range(n)]
