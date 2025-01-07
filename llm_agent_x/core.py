@@ -54,7 +54,7 @@ class AgentOptions(BaseModel):
         )
 
 
-class Agent1():
+class Agent():
     def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: AgentOptions = AgentOptions(), allow_subtasks = True, current_layer = 0, complexity = 3):
         self.task = task
         self.options = agent_options
