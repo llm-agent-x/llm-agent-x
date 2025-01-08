@@ -80,6 +80,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", type=str, default="output.md", help="The output file path"
     )
+    parser.add_argument(
+        "--model", type=str, default=getenv("DEFAULT_LLM"), help="The name of the LLM to use"
+    )
     args = parser.parse_args()
     llm = ChatOpenAI(
         base_url=getenv("OPENAI_BASE_URL"),
@@ -109,11 +112,12 @@ if __name__ == "__main__":
     )
 
     # Ensure the output directory exists
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Call agent.run()
     response = agent.run()
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
         flowchart_o.write(render_flowchart())
 
