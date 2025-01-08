@@ -5,15 +5,16 @@ from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, ToolCall
 from langchain_core.output_parsers import JsonOutputParser
 
-class task(BaseModel):
-    task: str
-    uuid: str
+from icecream import ic
 
 class TaskObject(BaseModel):
     task: str
     subtasks: int
     allow_search: bool
     allow_tools: bool
+
+class task(TaskObject):
+    uuid: str
 
 class SplitTask(BaseModel):
     needs_subtasks: bool
@@ -24,24 +25,27 @@ class SplitTask(BaseModel):
 class AgentOptions(BaseModel):
     max_layers: int=2
     max_agents: list|int = [5, 3, 2]
-    search_tool: callable
-    on_subtasks_created: callable
-    on_task_executed: callable
-    on_tool_call_executed: callable
-    task_tree: list[task]
-    llm: any
-    search_llm: any
-    tools: list
-    allow_search: bool
-    allow_tools: bool
-    tools_dict: dict
+    search_tool: any = None
+    pre_task_executed: any = None
+    on_task_executed: any = None
+    on_tool_call_executed: any = None
+    task_tree: list[task] = []
+    llm: any = None
+    search_llm: any = None
+    tools: list = []
+    allow_search: bool = True
+    allow_tools: bool = False
+    tools_dict: dict = {}
+
+    class Config:
+        arbitrary_types_allowed = True
 
     def propagate(self):
         return AgentOptions(
             max_layers=self.max_layers,
             max_agents=(lambda x: x if isinstance(x, int) else x[1:])(self.max_agents),
             search_tool=self.search_tool,
-            on_subtasks_created=self.on_subtasks_created,
+            pre_task_executed=self.pre_task_executed,
             on_task_executed=self.on_task_executed,
             on_tool_call_executed=self.on_tool_call_executed,
             task_tree=self.task_tree,
@@ -55,7 +59,7 @@ class AgentOptions(BaseModel):
 
 
 class Agent():
-    def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: AgentOptions = AgentOptions(), allow_subtasks = True, current_layer = 0, complexity = 3):
+    def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: AgentOptions = AgentOptions(), allow_subtasks = True, current_layer = 0, complexity = 3, parent: 'Agent' = None):
         self.task = task
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
@@ -68,38 +72,49 @@ class Agent():
         self.tools_llm = (self.search_llm.bind_tools(self.tools) if self.options.allow_search else self.llm.bind_tools(self.tools))
         self.task_split_parser = JsonOutputParser(pydantic_object=SplitTask)
         self.uuid = uuid
+        self.current_layer = current_layer
+        self.parent = parent
     def run(self) -> str:
-        try:
-            # Determine whether/not to split task (based on allow_subtasks and the layer)
-            if self.allow_subtasks and (self.current_layer < self.options.max_layers):
-                # Split task
-                self.tasks = self._split_task()
+        # Determine whether/not to split task (based on allow_subtasks and the layer)
+        if self.options.pre_task_executed:
+            self.options.pre_task_executed(task=self.task, uuid=self.uuid, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
 
-                if self.tasks:
-                    self.options.on_subtasks_created(task=self.task, uuid=self.uuid, subtasks=[task.task for task in self.tasks.subtasks])
-                    return self._run_subtasks()
-            # If no subtasks or not allowed to split, run single task
-            return self._run_single_task()
-        except Exception as e:
-            return f"An error occurred: {str(e)}"
+        if self.allow_subtasks and (self.current_layer < self.options.max_layers):
+            # Split task
+            self.tasks = self._split_task()
+
+            if self.tasks:
+                result = self._run_subtasks()
+                if self.options.on_task_executed:
+                    self.options.on_task_executed(task=self.task, uuid=self.uuid, response=result, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
+                
+                return result
+        # If no subtasks or not allowed to split, run single task
+        result = self._run_single_task()
+        if self.options.on_task_executed:
+            self.options.on_task_executed(task=self.task, uuid=self.uuid, response=result, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
+
+        return result
 
 
     def _run_subtasks(self) -> str:
         # We can assume that the tasks are valid, as they were parsed by the SplitTask parser
 
         agent_responses = []
-        for task in self.tasks.subtasks:
+        for task_x in self.tasks["subtasks"]:
             # Recursively run subtasks
-            agent = Agent1(
-                task=task.task,
+            task_x = task(**task_x)
+            agent = Agent(
+                task=task_x.task,
+                uuid=task_x.uuid,
                 agent_options=self.options.propagate(),
                 allow_subtasks=False,
                 current_layer=self.current_layer + 1,
-                complexity=task.subtasks
+                complexity=task_x.subtasks,
+                parent=self
             )
             response = agent.run()
             agent_responses.append(response)
-            self.options.on_task_executed(task=task.task, uuid=agent.uuid, response=response)
             
         content = self._summarize_subtask_results(agent_responses)
         return content
@@ -110,7 +125,7 @@ class Agent():
             SystemMessage("Your task is to answer the following question, using any tools that you deem necessary:"),
             HumanMessage(self.task)
             ]
-        response = self.tools_llm.invoke(history)
+        response = self.search_llm.invoke(history)
         
         history.append(response)
 
@@ -121,7 +136,8 @@ class Agent():
             tool = self.options.tools_dict[name]
 
             tool_response = tool(**args)
-            self.options.on_tool_call_executed(task=self.task, uuid=self.uuid, tool_name=name, tool_args=args, tool_response=tool_response)
+            if self.options.on_tool_call_executed:
+                self.options.on_tool_call_executed(task=self.task, uuid=self.uuid, tool_name=name, tool_args=args, tool_response=tool_response)
 
             history.append(
                 ToolMessage(json.dumps(tool_response), tool_call_id = id)
@@ -136,6 +152,7 @@ class Agent():
         """
         split_msgs_hist = [
             self._construct_subtask_sys_msg(),
+            HumanMessage(self.task),
             AIMessage("1. "),
         ]
         response = self.llm.invoke(split_msgs_hist)
@@ -143,7 +160,11 @@ class Agent():
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())
 
         structured_response = self.llm.invoke(split_msgs_hist)
-        split_task = self.task_split_parser.parse(structured_response)
+        split_task = self.task_split_parser.invoke(structured_response)
+
+        # Assign UUIDs to subtasks
+        for subtask in split_task["subtasks"]:
+            subtask["uuid"] = str(uuid.uuid4())
 
         return split_task
     def _summarize_subtask_results(self, subtask_results) -> str:

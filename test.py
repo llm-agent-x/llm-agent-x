@@ -8,6 +8,7 @@ from langchain_community.utilities import SearxSearchWrapper
 import llm_agent_x
 from llm_agent_x import int_to_base26
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -15,10 +16,27 @@ load_dotenv()
 
 # Initialize Searx search
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
-output_dir = getenv("OUTPUT_DIR", "./output/")
+output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 
-# Initialize log structure
-log = {"tasks": []}
+flowchart = ["flowchart TD"]
+task_ids: dict[str, str] = {}
+
+
+def get_or_set_task_id(id: str) -> str:
+    if id not in task_ids:
+        result = int_to_base26(len(task_ids))
+        task_ids[id] = result
+        return result
+    else:
+        return task_ids.get(id)
+
+
+def add_to_flowchart(line: str):
+    flowchart.append(f"    {line}")
+
+def render_flowchart():
+    return "\n".join(flowchart)
+
 
 def web_search(query: str, num_results: int) -> List:
     """
@@ -28,108 +46,79 @@ def web_search(query: str, num_results: int) -> List:
     print(f"Performing web search with query: {query} and num_results: {num_results}")
     try:
         results = search.results(query, num_results=num_results)
-        
+
         return json.dumps(results)
     except Exception as error:
         print(error)
         return json.dumps([])
 
-# Mermaid.js flowchart data
-flowchart = ["graph TD"]
-tasks_dict: dict = {}
+def pre_tasks_executed(task, uuid, parent_agent_uuid):
+    id = get_or_set_task_id(uuid)
 
-def get_task_label(agent_id):
-    if agent_id not in tasks_dict:
-        tasks_dict[agent_id] = int_to_base26(len(tasks_dict))
-    return tasks_dict[agent_id]
+    parent_id = get_or_set_task_id(parent_agent_uuid) if parent_agent_uuid is not None else None
 
-def add_flowchart_line(line):
-    flowchart.append(f'{line}')
+    if parent_agent_uuid is not None:
+        add_to_flowchart(f"{parent_id} -->|Subtask| {id}[{task}]")
+    else:
+        add_to_flowchart(f"{id}[{task}]")
+    ic(task)
 
-# Event handlers with better formatting for nodes and edges
-def on_subtasks_created(parts, task_thread, agent_id, agent_ids, **kwargs):
-    tasks = parts["tasks"] if isinstance(parts, dict) else parts
-    for i, part in enumerate(tasks):
-        task_label = get_task_label(agent_ids[i])
-        parent_label = get_task_label(agent_id)
-        ic(parent_label)
-        if f'    {parent_label} -->|Subtask| {task_label}[\"{part["task"]}\"]' not in flowchart:
-            add_flowchart_line(f'    {parent_label} -->|Subtask| {task_label}[\"{part["task"]}\"]')
 
-def on_task_executed(result, task_thread, agent_id, **kwargs):
-    task_label = get_task_label(agent_id)
-    parent_label = get_task_label(agent_id)
-    log_entry = {
-        "task": result.get("task", "Unknown Task"),
-        "result": result.get("result", "No result"),
-        "subtasks": []
-    }
-    current_log = log
-    for task in task_thread:
-        for subtask in current_log["tasks"]:
-            if subtask["task"] == task:
-                current_log = subtask
-                break
-    if "tasks" not in current_log:
-        current_log["tasks"] = []
-    current_log["tasks"].append(log_entry)
-
-def on_tool_call_executed(tool_call, tool_response, task_thread, agent_id, **kwargs):
-    tool_name = tool_call.get("name", "Unknown Tool")
-    parent_label = get_task_label(agent_id)
-    tool_label = get_task_label(f"{tool_name}_{len(flowchart)}")
-    response_label = get_task_label(f"response_{len(flowchart)}")
-    add_flowchart_line(f'    {parent_label} -->|Tool Used| {tool_label}[{tool_name}]')
-    add_flowchart_line(f'    {tool_label} -->|Response| {parent_label}')
-
-# Main function
-def main(task, output_file):
-    print(f"Starting main function with task: {task} and output_file: {output_file}")
-    # Initialize the LLM
-    llm = ChatOpenAI(
-        model="qwen2.5-coder-long:latest",
-        base_url=getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        api_key=getenv("OPENAI_API_KEY"),
-        temperature=0,
+def on_tool_call_executed(task, uuid, tool_name, tool_args,tool_response):
+    add_to_flowchart(
+        f"{get_or_set_task_id(uuid)} -->|Tool call| {get_or_set_task_id(f"{uuid}: {tool_name}")}[{tool_name}]"
     )
-    agent_id = str(uuid.uuid4())
-    task_label = get_task_label(agent_id)
-    add_flowchart_line(f"    {task_label}[\"{task}\"]")
-    
-    # Initialize the agent
-    agent = llm_agent_x.Agent(
-        task=task,
-        agent_id=agent_id,
-        llm=llm,
-        max_layers=2,
-        max_agents=[5, 3, 2],
-        search_tool=web_search,
-        on_subtasks_created=on_subtasks_created,
-        on_task_executed=on_task_executed,
-        on_tool_call_executed=on_tool_call_executed,
+    add_to_flowchart(
+        f"{get_or_set_task_id(f"{uuid}: {tool_name}")} --> {get_or_set_task_id(uuid)}"
     )
-    
-    # Run the agent
-    agent_response = agent.run()
-    ic(agent_response)
-    
-    # Write results to output file
-    with open(output_dir + output_file, "w") as f:
-        f.write(agent_response.get("result", "No result"))
 
-    # Write the flowchart to a Mermaid.js file
-    with open(output_dir + "flowchart.mmd", "w") as f:
-        f.write("\n".join(flowchart))
-
-    # Write the log to a JSON file
-    with open(output_dir + "log.json", "w") as f:
-        json.dump(log, f, indent=4)
 
 if __name__ == "__main__":
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(description="Research tool using a custom LLM agent.")
-    parser.add_argument("task", type=str, help="The research task to be performed.")
-    parser.add_argument("output_file", type=str, help="The file where the output will be saved.")
-    
+    parser = argparse.ArgumentParser(description="Run the LLM agent.")
+    parser.add_argument("task", type=str, help="The task to execute.")
+    parser.add_argument(
+        "--max_layers", type=int, default=1, help="The maximum number of layers."
+    )
+    parser.add_argument(
+        "--output", type=str, default="output.md", help="The output file path"
+    )
     args = parser.parse_args()
-    main(task=args.task, output_file=args.output_file)
+    llm = ChatOpenAI(
+        base_url=getenv("OPENAI_BASE_URL"),
+        api_key=getenv("OPENAI_API_KEY"),
+        model="qwen2.5-coder-long:latest",
+        temperature=0,
+    )
+    search_llm = llm.bind_tools([web_search])
+    # Create the agent
+    agent = llm_agent_x.Agent(
+        task=args.task,
+        agent_options=llm_agent_x.AgentOptions(
+            max_layers=args.max_layers,
+            search_tool=web_search,
+            pre_task_executed=pre_tasks_executed,
+            on_task_executed=None,
+            on_tool_call_executed=on_tool_call_executed,
+            llm=llm,
+            search_llm=search_llm,
+            tools=[],
+            allow_search=True,
+            allow_tools=False,
+            tools_dict={
+                "web_search": web_search,
+            },
+        ),
+    )
+
+    # Ensure the output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Call agent.run()
+    response = agent.run()
+    ic(response)
+
+    with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
+        flowchart_o.write(render_flowchart())
+
+    with (output_dir / args.output).open("w") as output:
+        output.write(response)
