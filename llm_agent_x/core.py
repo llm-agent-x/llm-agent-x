@@ -5,7 +5,8 @@ from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, ToolCall
 from langchain_core.output_parsers import JsonOutputParser
 
-from icecream import ic
+
+from typing import Any
 
 class TaskObject(BaseModel):
     task: str
@@ -25,13 +26,13 @@ class SplitTask(BaseModel):
 class AgentOptions(BaseModel):
     max_layers: int=2
     max_agents: list|int = [5, 3, 2]
-    search_tool: any = None
-    pre_task_executed: any = None
-    on_task_executed: any = None
-    on_tool_call_executed: any = None
+    search_tool: Any = None
+    pre_task_executed: Any = None
+    on_task_executed: Any = None
+    on_tool_call_executed: Any = None
     task_tree: list[task] = []
-    llm: any = None
-    search_llm: any = None
+    llm: Any = None
+    search_llm: Any = None
     tools: list = []
     allow_search: bool = True
     allow_tools: bool = False
@@ -79,7 +80,7 @@ class Agent():
         if self.options.pre_task_executed:
             self.options.pre_task_executed(task=self.task, uuid=self.uuid, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
 
-        if self.allow_subtasks and (self.current_layer < self.options.max_layers):
+        if self.allow_subtasks and (self.current_layer < self.options.max_layers) and ((self.options.max_agents[0] if len(self.options.max_agents) > 0 else 0)) > 0:
             # Split task
             self.tasks = self._split_task()
 
@@ -110,7 +111,7 @@ class Agent():
                 agent_options=self.options.propagate(),
                 allow_subtasks=False,
                 current_layer=self.current_layer + 1,
-                complexity=task_x.subtasks,
+                complexity=min(task_x.subtasks, ((self.options.max_agents[0] if len(self.options.max_agents) > 0 else 0))),
                 parent=self
             )
             response = agent.run()
@@ -148,15 +149,15 @@ class Agent():
         """Split the agent's task int subtasks (or not)
 
         Returns:
-            SplitTask: _description_
+            SplitTask: an object specifying the split up tasks
         """
         split_msgs_hist = [
             self._construct_subtask_sys_msg(),
             HumanMessage(self.task),
-            AIMessage("1. "),
+            
         ]
-        response = self.llm.invoke(split_msgs_hist)
-        split_msgs_hist.append(response)
+        response = self.llm.invoke(split_msgs_hist + [AIMessage("1. "),])
+        split_msgs_hist.append(AIMessage(content = "1. " + response.content))
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())
 
         structured_response = self.llm.invoke(split_msgs_hist)
@@ -183,7 +184,9 @@ class Agent():
                              f"Simply list the subtasks necessary to find the answer. "
                              f"If you don't need to split the task, respond with \"1. No subtasks needed.\" "
                              f"Keep in mind, each task will be run individually, so they won't be able to see each previous "
-                             f"task's results. Once each task is executed, you will summarize all the results to complete your task, so don't include any summarization tasks."
+                             f"task's results. Once each task is executed, you will summarize all the results to complete your task,"
+                             f"so **DO NOT** include any summarization tasks. For researching tasks, **think about the task you are given, and simply split it up into "
+                             f"simpler ones.**"
                              )
     def _construct_subtask_to_json_prompt(self):
         return HumanMessage(

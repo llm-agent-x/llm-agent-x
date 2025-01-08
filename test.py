@@ -2,7 +2,6 @@ import argparse
 import json
 from typing import List
 from os import getenv
-from icecream import ic
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 import llm_agent_x
@@ -61,7 +60,6 @@ def pre_tasks_executed(task, uuid, parent_agent_uuid):
         add_to_flowchart(f"{parent_id} -->|Subtask| {id}[{task}]")
     else:
         add_to_flowchart(f"{id}[{task}]")
-    ic(task)
 
 
 def on_tool_call_executed(task, uuid, tool_name, tool_args,tool_response):
@@ -77,7 +75,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
     parser.add_argument(
-        "--max_layers", type=int, default=1, help="The maximum number of layers."
+        "--max_layers", type=int, default=2, help="The maximum number of layers."
     )
     parser.add_argument(
         "--output", type=str, default="output.md", help="The output file path"
@@ -115,7 +113,6 @@ if __name__ == "__main__":
 
     # Call agent.run()
     response = agent.run()
-    ic(response)
 
     with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
         flowchart_o.write(render_flowchart())
