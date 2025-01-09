@@ -123,7 +123,7 @@ class Agent():
     def _run_single_task(self) -> str:
         # Run the task
         history = [
-            SystemMessage("Your task is to answer the following question, using any tools that you deem necessary:"),
+            SystemMessage("Your task is to answer the following question, using any tools that you deem necessary. If you use the web search tool, make sure you include citations (just use a pair of square brackets and a number in text, and at the end, include a citations section):"),
             HumanMessage(self.task)
             ]
         response = self.search_llm.invoke(history)
@@ -173,7 +173,10 @@ class Agent():
             SystemMessage("Your task is to summarize this list of tasks and results into a single response to the provided task:"),
             HumanMessage(
                 f"\"\"\"\n{json.dumps(subtask_results, indent=2)}\n\"\"\"\n\n"
-                f"And here is the task:\n\n\"\"\n{self.task}\n\"\""
+                f"And here is the task:\n\n\"\"\n{self.task}\n\"\"\n"
+                f"Also, make sure to cite everything. An in-text citation will just be a pair of square brackets, "
+                f"with a number. Then, include a citations section at the end, showing all your sources. "
+                f"Include citations from the sources that your are summarizing. "
                 ),
         ]
         response = self.llm.invoke(summary_history)

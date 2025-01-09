@@ -61,6 +61,14 @@ def pre_tasks_executed(task, uuid, parent_agent_uuid):
     else:
         add_to_flowchart(f"{id}[{task}]")
 
+def on_task_executed(task, uuid, response, parent_agent_uuid):
+    id = get_or_set_task_id(uuid)
+
+    parent_id = get_or_set_task_id(parent_agent_uuid) if parent_agent_uuid is not None else None
+
+    if parent_agent_uuid is not None:
+        add_to_flowchart(f"{id} -->|Completed| {parent_id}")
+
 
 def on_tool_call_executed(task, uuid, tool_name, tool_args,tool_response):
     add_to_flowchart(
@@ -98,7 +106,7 @@ if __name__ == "__main__":
             max_layers=args.max_layers,
             search_tool=web_search,
             pre_task_executed=pre_tasks_executed,
-            on_task_executed=None,
+            on_task_executed=on_task_executed,
             on_tool_call_executed=on_tool_call_executed,
             llm=llm,
             search_llm=search_llm,
@@ -117,7 +125,7 @@ if __name__ == "__main__":
     response = agent.run()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
         flowchart_o.write(render_flowchart())
 
