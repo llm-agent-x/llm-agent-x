@@ -23,7 +23,7 @@ class SplitTask(BaseModel):
     def __bool__(self):
         return self.needs_subtasks
 
-class AgentOptions(BaseModel):
+class RecursiveAgentOptions(BaseModel):
     max_layers: int=2
     max_agents: list|int = [5, 3, 2]
     search_tool: Any = None
@@ -42,7 +42,7 @@ class AgentOptions(BaseModel):
         arbitrary_types_allowed = True
 
     def propagate(self):
-        return AgentOptions(
+        return RecursiveAgentOptions(
             max_layers=self.max_layers,
             max_agents=(lambda x: x if isinstance(x, int) else x[1:])(self.max_agents),
             search_tool=self.search_tool,
@@ -59,8 +59,8 @@ class AgentOptions(BaseModel):
         )
 
 
-class Agent():
-    def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: AgentOptions = AgentOptions(), allow_subtasks = True, current_layer = 0, complexity = 3, parent: 'Agent' = None):
+class RecursiveAgent():
+    def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: RecursiveAgentOptions = RecursiveAgentOptions(), allow_subtasks = True, current_layer = 0, complexity = 3, parent: 'RecursiveAgent' = None):
         self.task = task
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
@@ -105,7 +105,7 @@ class Agent():
         for task_x in self.tasks["subtasks"]:
             # Recursively run subtasks
             task_x = task(**task_x)
-            agent = Agent(
+            agent = RecursiveAgent(
                 task=task_x.task,
                 uuid=task_x.uuid,
                 agent_options=self.options.propagate(),

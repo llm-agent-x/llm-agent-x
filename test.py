@@ -1,12 +1,10 @@
 import argparse
 import json
-from typing import List
 from os import getenv
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 import llm_agent_x
 from llm_agent_x import int_to_base26
-import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,7 +19,7 @@ flowchart = ["flowchart TD"]
 task_ids: dict[str, str] = {}
 
 
-def get_or_set_task_id(id: str) -> str:
+def get_or_set_task_id(id: str) -> str|None:
     if id not in task_ids:
         result = int_to_base26(len(task_ids))
         task_ids[id] = result
@@ -37,7 +35,7 @@ def render_flowchart():
     return "\n".join(flowchart)
 
 
-def web_search(query: str, num_results: int) -> List:
+def web_search(query: str, num_results: int) -> str:
     """
     Perform a web search using the Searx search engine.
     Returns: List of search results. Each result is a dictionary with keys: title, link, snippet.
@@ -100,9 +98,9 @@ if __name__ == "__main__":
     )
     search_llm = llm.bind_tools([web_search])
     # Create the agent
-    agent = llm_agent_x.Agent(
+    agent = llm_agent_x.RecursiveAgent(
         task=args.task,
-        agent_options=llm_agent_x.AgentOptions(
+        agent_options=llm_agent_x.RecursiveAgentOptions(
             max_layers=args.max_layers,
             search_tool=web_search,
             pre_task_executed=pre_tasks_executed,
