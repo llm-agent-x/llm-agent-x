@@ -11,6 +11,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from icecream import ic
 import re
 import ast
+from typing import Callable, Any
 
 def is_valid_python(code):
     """
@@ -53,7 +54,7 @@ class SequentialCodeAgentOptions(BaseModel):
     llm: BaseChatModel = None
 
 class SequentialCodeAgent:
-    def __init__(self, options: SequentialCodeAgentOptions, execute:function):
+    def __init__(self, options: SequentialCodeAgentOptions, execute:Callable[[str], Any]):
         self.options = options
         self.llm = self.options.llm.bind(stop="```\n")
         self.execute = execute
@@ -81,6 +82,10 @@ class SequentialCodeAgent:
 
         result = self.execute(code_block)
 
+        if result is None:
+            result = ValueError("Error executing code; This may be because the user didn't approve code execution, "
+                                "because the system detected malicious code or denied code execution priveliges for "
+                                "other reasons, or a catch-all code execution callback.")
         ic(result)
 
 
