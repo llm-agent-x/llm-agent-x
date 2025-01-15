@@ -10,7 +10,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
-
+llm = ChatOpenAI(
+        base_url=getenv("OPENAI_BASE_URL"),
+        api_key=getenv("OPENAI_API_KEY"),
+        model="qwen2.5-coder-long:latest",
+        temperature=0,
+    )
 # Initialize Searx search
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
@@ -90,12 +95,7 @@ if __name__ == "__main__":
         "--model", type=str, default=getenv("DEFAULT_LLM"), help="The name of the LLM to use"
     )
     args = parser.parse_args()
-    llm = ChatOpenAI(
-        base_url=getenv("OPENAI_BASE_URL"),
-        api_key=getenv("OPENAI_API_KEY"),
-        model="qwen2.5-coder-long:latest",
-        temperature=0,
-    )
+
     search_llm = llm.bind_tools([web_search])
     # Create the agent
     agent = llm_agent_x.RecursiveAgent(
