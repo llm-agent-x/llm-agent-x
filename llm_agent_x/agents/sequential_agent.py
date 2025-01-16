@@ -1,4 +1,5 @@
-from pydantic import BaseModel
+import uuid
+from pydantic import BaseModel, Field
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     SystemMessage,
@@ -11,7 +12,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from icecream import ic
 import re
 import ast
-from typing import Callable, Any
+from typing import Callable, Any, Dict
 
 def is_valid_python(code):
     """
@@ -53,40 +54,82 @@ def extract_valid_python_blocks(text):
 class SequentialCodeAgentOptions(BaseModel):
     llm: BaseChatModel = None
 
+class IsDone(BaseModel):
+    is_complete: bool=Field(description="Whether or not the conversation history has enough context to answer the original user question, or if the original user task is complete")
+
 class SequentialCodeAgent:
-    def __init__(self, options: SequentialCodeAgentOptions, execute:Callable[[str], Any]):
+    def __init__(self, options: SequentialCodeAgentOptions, execute:Callable[[str, Dict], Any]):
         self.options = options
         self.llm = self.options.llm.bind(stop="```\n")
+
+        self.continue_llm = self.options.llm.with_structured_output(schema=IsDone)
         self.execute = execute
 
         self.msgs = [
             SystemMessage(
-                f""
+                f"You are an AI agent. Your task is to assist the user. To help you do that, you have the ability "
+                f"to execute python. If you include a valid python code block, it will be executed with `exec()`. "
+                f"Keep in mind, you can't access a filesystem. You can't make any system calls. "
+                f"if the user provides you any context, it will be saved in a variable `context`. "
+                f"When you need to use this variable, first include a block of code to understand the "
+                f"structure of the object. There are also functions that you can call, to help complete tasks. "
+                f"These will be specified by the user. Keep in mind, the user doesn't need to run any code. "
+                f"As soon as you output the *closing triple backticks*, your generation will be paused, and a "
+                f"user message will be appended to give you the results. Once you get the result to the python "
+                f"code block, just answer the question for the user if you have enough to answer the question. "
+                f"If an entry in the function list has type hints, don't use code to attempt to understand the structure. "
+                f"If you need to see the result of a codeblock, assign it to the `result` variable, and the system will show you "
+                f"the response after execution. "
             )
         ]
+        self.code_execution_starting_namespace = {}
+        self.code_execution_namespace = {}
+        self.code_execution_namespace.update(self.code_execution_starting_namespace)
 
-    
-    def run(self):
-        c = self.llm.invoke("Generate a simple python script.").content
-        ic(c)
+    def reset_code_execution_namespace(self):
+        self.code_execution_namespace.clear()
+        self.code_execution_namespace.update(self.code_execution_starting_namespace)
         
-        # Use extract_valid_python_blocks to extract all valid code blocks
-        valid_blocks = extract_valid_python_blocks(c)
-        
-        if not valid_blocks:
-            raise ValueError("No valid code blocks found")
+    def run(self, prompt):
+        self.msgs.append(HumanMessage(f"USER: {prompt}"))
 
-        # Take the last valid code block
-        code_block = valid_blocks[-1][0].strip()
-        ic(code_block)
+        done = False
+        while not done:
+            c = self.llm.invoke(self.msgs).content
+            response = AIMessage(f"{c}\n```")
+            ic(c)
+            
+            # Use extract_valid_python_blocks to extract all valid code blocks
+            valid_blocks = extract_valid_python_blocks(c)
+            
+            if not valid_blocks:
+                return c
 
-        result = self.execute(code_block)
+            # Take the last valid code block
+            code_block = valid_blocks[-1][0].strip()
+            ic(code_block)
 
-        if result is None:
-            result = ValueError("Error executing code; This may be because the user didn't approve code execution, "
-                                "because the system detected malicious code or denied code execution priveliges for "
-                                "other reasons, or a catch-all code execution callback.")
-        ic(result)
+            self.execute(code_block, self.code_execution_namespace)
+            result = self.code_execution_namespace.get("result", None)
+            if result is None:
+                result = ValueError("Error executing code; This may be because the user didn't approve code execution, "
+                                    "because the system detected malicious code or denied code execution priveliges for "
+                                    "other reasons, or a catch-all code execution callback. "
+                                    "This could also be because the code didn't assign anything to the `result` variable. "
+                                    "This may or may not be normal behaviour. It is up to you to decide.")
+            ic(result)
+
+            self.msgs.append(ToolMessage(content=str(result), tool_call_id=f"run_python_snippet_{str(uuid.uuid4())}"))
 
 
-        return code_block
+            # Check if the task is complete
+
+            complete = self.continue_llm.invoke(self.msgs[1:] + [HumanMessage(
+                "Now, is this question sufficiently answered, or the task sufficiently completed? "
+                "Respond following this JSON schema:\n\n"
+                f"{IsDone.model_json_schema()}"
+            )])
+
+            done = complete.is_complete
+
+        return self.llm.invoke(self.msgs).content
