@@ -1,3 +1,4 @@
+import json
 import uuid
 from pydantic import BaseModel, Field
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -8,7 +9,6 @@ from langchain_core.messages import (
     ToolMessage,
     ToolCall,
 )
-from langchain_core.output_parsers import JsonOutputParser
 from icecream import ic
 import re
 import ast
@@ -91,7 +91,11 @@ class SequentialCodeAgent:
         self.code_execution_namespace.update(self.code_execution_starting_namespace)
         
     def run(self, prompt):
-        self.msgs.append(HumanMessage(f"USER: {prompt}"))
+        self.msgs.append(HumanMessage(
+            f"USER: {prompt}\n\n"
+            f"If it helps you, this is the state of the global variables in the code execution namespace: \n\n"
+            f"{json.dumps(self.code_execution_starting_namespace)}"
+            ))
 
         done = False
         while not done:
