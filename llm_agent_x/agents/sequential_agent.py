@@ -94,7 +94,7 @@ class SequentialCodeAgent:
         self.msgs.append(HumanMessage(
             f"USER: {prompt}\n\n"
             f"If it helps you, this is the state of the global variables in the code execution namespace: \n\n"
-            f"{json.dumps(self.code_execution_starting_namespace)}"
+            f"{json.dumps(self.code_execution_namespace)}"
             ))
 
         done = False
