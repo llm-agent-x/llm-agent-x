@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, ToolCall
 from langchain_core.output_parsers import JsonOutputParser
 
-
 from typing import Any
 
 class TaskObject(BaseModel):
@@ -86,6 +85,13 @@ class RecursiveAgent():
 
             if self.tasks:
                 result = self._run_subtasks()
+                if result is None:
+                    # Skip to single task
+                    result = self._run_single_task()
+                    if self.options.on_task_executed:
+                        self.options.on_task_executed(task=self.task, uuid=self.uuid, response=result, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
+                    return result
+
                 if self.options.on_task_executed:
                     self.options.on_task_executed(task=self.task, uuid=self.uuid, response=result, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
                 
@@ -100,7 +106,8 @@ class RecursiveAgent():
 
     def _run_subtasks(self) -> str:
         # We can assume that the tasks are valid, as they were parsed by the SplitTask parser
-
+        if self.tasks["needs_subtasks"] == False:
+            return None
         agent_responses = []
         for task_x in self.tasks["subtasks"]:
             # Recursively run subtasks
@@ -157,10 +164,12 @@ class RecursiveAgent():
             
         ]
         response = self.llm.invoke(split_msgs_hist + [AIMessage("1. "),])
+
         split_msgs_hist.append(AIMessage(content = "1. " + response.content))
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())
 
         structured_response = self.llm.invoke(split_msgs_hist)
+
         split_task = self.task_split_parser.invoke(structured_response)
 
         # Assign UUIDs to subtasks

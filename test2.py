@@ -4,5 +4,5 @@ from test import llm
 from icecream import ic
 
 agent = SequentialCodeAgent(options=SequentialCodeAgentOptions(llm=llm), execute=exec)
-response = agent.run("Make a web request to google.com")
+response = agent.run("Get the date and time. then multiply the day of the month by the month number.")
 ic(response)

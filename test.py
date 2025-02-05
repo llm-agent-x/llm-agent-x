@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(".env", override=True)
 llm = ChatOpenAI(
         base_url=getenv("OPENAI_BASE_URL"),
         api_key=getenv("OPENAI_API_KEY"),
@@ -45,7 +45,7 @@ def web_search(query: str, num_results: int) -> str:
     Perform a web search using the Searx search engine.
     Returns: List of search results. Each result is a dictionary with keys: title, link, snippet.
     """
-    print(f"Performing web search with query: {query} and num_results: {num_results}")
+    # print(f"Performing web search with query: {query} and num_results: {num_results}")
     try:
         results = search.results(query, num_results=num_results)
 
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
     parser.add_argument(
-        "--max_layers", type=int, default=2, help="The maximum number of layers."
+        "--max_layers", type=int, default=3, help="The maximum number of layers."
     )
     parser.add_argument(
         "--output", type=str, default="output.md", help="The output file path"
