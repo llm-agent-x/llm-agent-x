@@ -31,7 +31,7 @@ class RecursiveAgentOptions(BaseModel):
     on_tool_call_executed: Any = None
     task_tree: list[task] = []
     llm: Any = None
-    search_llm: Any = None
+    tool_llm: Any = None
     tools: list = []
     allow_search: bool = True
     allow_tools: bool = False
@@ -50,7 +50,7 @@ class RecursiveAgentOptions(BaseModel):
             on_tool_call_executed=self.on_tool_call_executed,
             task_tree=self.task_tree,
             llm=self.llm,
-            search_llm=self.search_llm,
+            tool_llm=self.tool_llm,
             tools=self.tools,
             allow_search=self.allow_search,
             allow_tools=self.allow_tools,
@@ -66,10 +66,10 @@ class RecursiveAgent():
         self.complexity = complexity
 
         self.llm = self.options.llm
-        self.search_llm = self.options.search_llm
+        self.tool_llm = self.options.tool_llm
         self.tools = self.options.tools
 
-        self.tools_llm = (self.search_llm.bind_tools(self.tools) if self.options.allow_search else self.llm.bind_tools(self.tools))
+        self.tools_llm = (self.tool_llm.bind_tools(self.tools) if self.options.allow_search else self.llm.bind_tools(self.tools))
         self.task_split_parser = JsonOutputParser(pydantic_object=SplitTask)
         self.uuid = uuid
         self.current_layer = current_layer
@@ -133,7 +133,7 @@ class RecursiveAgent():
             SystemMessage("Your task is to answer the following question, using any tools that you deem necessary. If you use the web search tool, make sure you include citations (just use a pair of square brackets and a number in text, and at the end, include a citations section):"),
             HumanMessage(self.task)
             ]
-        response = self.search_llm.invoke(history)
+        response = self.tool_llm.invoke(history)
         
         history.append(response)
 
