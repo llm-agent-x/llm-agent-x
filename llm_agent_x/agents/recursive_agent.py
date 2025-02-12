@@ -1,12 +1,11 @@
 import json
 import uuid
 from difflib import SequenceMatcher
+from typing import Any, Optional, List
 
 from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, ToolCall
 from langchain_core.output_parsers import JsonOutputParser
-
-from typing import Any
 
 class TaskObject(BaseModel):
     task: str
@@ -22,6 +21,15 @@ class SplitTask(BaseModel):
     subtasks: list[TaskObject]
     def __bool__(self):
         return self.needs_subtasks
+
+class TaskContext(BaseModel):
+    task: str
+    result: Optional[str] = None
+    siblings: List['TaskContext'] = []
+    parent_context: Optional['TaskContext'] = None
+
+    class Config:
+        arbitrary_types_allowed = True
 
 class RecursiveAgentOptions(BaseModel):
     max_layers: int=2
@@ -49,20 +57,58 @@ def calculate_raw_similarity(text1: str, text2: str) -> float:
     return SequenceMatcher(None, text1, text2).ratio()
 
 class RecursiveAgent():
-    def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: RecursiveAgentOptions = RecursiveAgentOptions(), allow_subtasks = True, current_layer = 0, parent: 'RecursiveAgent' = None):
+    def __init__(self, 
+                 task: str, 
+                 uuid: str = str(uuid.uuid4()), 
+                 agent_options: RecursiveAgentOptions = RecursiveAgentOptions(), 
+                 allow_subtasks: bool = True, 
+                 current_layer: int = 0, 
+                 parent: Optional['RecursiveAgent'] = None,
+                 context: Optional[TaskContext] = None,
+                 siblings: List['RecursiveAgent'] = None):
         self.task = task
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
-
         self.llm = self.options.llm
         self.tool_llm = self.options.tool_llm
         self.tools = self.options.tools
-
         self.task_split_parser = JsonOutputParser(pydantic_object=SplitTask)
         self.uuid = uuid
         self.current_layer = current_layer
         self.parent = parent
+        self.siblings = siblings or []
+        self.context = context or TaskContext(task=task)
+        self.result = None
     
+    def _build_context_information(self) -> dict:
+        """
+        Build context information including parent chain and sibling tasks
+        """
+        # Get parent context chain
+        parent_contexts = []
+        current_context = self.context.parent_context
+        while current_context:
+            if current_context.result:
+                parent_contexts.append({
+                    "task": current_context.task,
+                    "result": current_context.result
+                })
+            current_context = current_context.parent_context
+
+        # Get sibling contexts
+        sibling_contexts = []
+        for sibling in self.siblings:
+            if sibling.result and sibling != self:  # Exclude self from siblings
+                sibling_contexts.append({
+                    "task": sibling.task,
+                    "result": sibling.result
+                })
+
+        return {
+            "parent_contexts": parent_contexts,
+            "sibling_contexts": sibling_contexts
+        }
+
     def run(self) -> str:
         if self.options.pre_task_executed:
             self.options.pre_task_executed(task=self.task, uuid=self.uuid, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
@@ -72,30 +118,72 @@ class RecursiveAgent():
                 similarity = calculate_raw_similarity(self.task, self.parent.task)
                 if similarity >= self.options.similarity_threshold:
                     print(f"Task similarity with parent is high ({similarity:.2f}), executing as single task.")
-                    return self._run_single_task()
+                    self.result = self._run_single_task()
+                    return self.result
 
             self.tasks = self._split_task()
             if not self.tasks or not self.tasks["needs_subtasks"]:
                 break
 
-            agent_responses = [RecursiveAgent(
-                task=subtask["task"],
-                uuid=subtask["uuid"],
-                agent_options=self.options,
-                allow_subtasks=True,
-                current_layer=self.current_layer + 1,
-                parent=self
-            ).run() for subtask in self.tasks["subtasks"]]
+            # Create child agents with shared context
+            child_agents = []
+            for subtask in self.tasks["subtasks"]:
+                child_context = TaskContext(
+                    task=subtask["task"],
+                    parent_context=self.context
+                )
+                
+                child_agent = RecursiveAgent(
+                    task=subtask["task"],
+                    uuid=subtask["uuid"],
+                    agent_options=self.options,
+                    allow_subtasks=True,
+                    current_layer=self.current_layer + 1,
+                    parent=self,
+                    context=child_context,
+                    siblings=child_agents  # Pass reference to all child agents
+                )
+                child_agents.append(child_agent)
+
+            # Run all child agents and collect results
+            subtask_results = []
+            for child_agent in child_agents:
+                result = child_agent.run()
+                child_agent.result = result
+                child_agent.context.result = result
+                subtask_results.append(result)
             
-            return self._summarize_subtask_results(agent_responses)
+            self.result = self._summarize_subtask_results(subtask_results)
+            return self.result
         
-        return self._run_single_task()
+        self.result = self._run_single_task()
+        return self.result
 
     def _run_single_task(self) -> str:
+        # Get context information
+        context_info = self._build_context_information()
+        
+        # Build context string
+        context_str = ""
+        if context_info["parent_contexts"]:
+            context_str += "\n\nParent task history:\n" + "\n".join(
+                f"Parent task: {ctx['task']}\nResult: {ctx['result']}\n"
+                for ctx in context_info["parent_contexts"]
+            )
+        
+        if context_info["sibling_contexts"]:
+            context_str += "\n\nParallel tasks in progress:\n" + "\n".join(
+                f"Task: {ctx['task']}\nResult: {ctx['result']}\n"
+                for ctx in context_info["sibling_contexts"]
+            )
+
         history = [
-            SystemMessage("Your task is to answer the following question, using any tools that you deem necessary. If you use the web search tool, make sure you include citations (just use a pair of square brackets and a number in text, and at the end, include a citations section):"),
+            SystemMessage(f"Your task is to answer the following question, using any tools that you deem necessary. "
+                        f"If you use the web search tool, make sure you include citations (just use a pair of square "
+                        f"brackets and a number in text, and at the end, include a citations section).{context_str}"),
             HumanMessage(self.task)
         ]
+        
         response = self.tool_llm.invoke(history)
         history.append(response)
         
