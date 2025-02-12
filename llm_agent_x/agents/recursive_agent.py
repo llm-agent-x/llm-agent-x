@@ -1,14 +1,12 @@
 import json
 import uuid
+from difflib import SequenceMatcher
 
 from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, ToolCall
 from langchain_core.output_parsers import JsonOutputParser
 
 from typing import Any
-import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 class TaskObject(BaseModel):
     task: str
@@ -43,18 +41,12 @@ class RecursiveAgentOptions(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-def cosine_similarity(text1, text2):
-
-    vectorizer = TfidfVectorizer()
-
-    # Fit and transform the documents
-    tfidf_matrix = vectorizer.fit_transform([text1, text2])
-
-    # Calculate the cosine similarity
-    cosine_sim = cosine_similarity(tfidf_matrix[0], tfidf_matrix[1])
-
-    return cosine_sim
-
+def calculate_raw_similarity(text1: str, text2: str) -> float:
+    """
+    Calculate the similarity ratio between two texts using SequenceMatcher.
+    Returns a float between 0 and 1, where 1 means the texts are identical.
+    """
+    return SequenceMatcher(None, text1, text2).ratio()
 
 class RecursiveAgent():
     def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: RecursiveAgentOptions = RecursiveAgentOptions(), allow_subtasks = True, current_layer = 0, parent: 'RecursiveAgent' = None):
@@ -77,7 +69,7 @@ class RecursiveAgent():
 
         while self.allow_subtasks and self.current_layer < self.options.max_layers:
             if self.parent:
-                similarity = cosine_similarity(self.task, self.parent.task)
+                similarity = calculate_raw_similarity(self.task, self.parent.task)
                 if similarity >= self.options.similarity_threshold:
                     print(f"Task similarity with parent is high ({similarity:.2f}), executing as single task.")
                     return self._run_single_task()
