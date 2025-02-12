@@ -6,6 +6,9 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_core.output_parsers import JsonOutputParser
 
 from typing import Any
+import numpy as np
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 class TaskObject(BaseModel):
     task: str
@@ -35,9 +38,23 @@ class RecursiveAgentOptions(BaseModel):
     allow_search: bool = True
     allow_tools: bool = False
     tools_dict: dict = {}
+    similarity_threshold: float = 0.8
 
     class Config:
         arbitrary_types_allowed = True
+
+def cosine_similarity(text1, text2):
+
+    vectorizer = TfidfVectorizer()
+
+    # Fit and transform the documents
+    tfidf_matrix = vectorizer.fit_transform([text1, text2])
+
+    # Calculate the cosine similarity
+    cosine_sim = cosine_similarity(tfidf_matrix[0], tfidf_matrix[1])
+
+    return cosine_sim
+
 
 class RecursiveAgent():
     def __init__(self, task, uuid= str(uuid.uuid4()), agent_options: RecursiveAgentOptions = RecursiveAgentOptions(), allow_subtasks = True, current_layer = 0, parent: 'RecursiveAgent' = None):
@@ -59,8 +76,14 @@ class RecursiveAgent():
             self.options.pre_task_executed(task=self.task, uuid=self.uuid, parent_agent_uuid = (self.parent.uuid) if self.parent is not None else None)
 
         while self.allow_subtasks and self.current_layer < self.options.max_layers:
+            if self.parent:
+                similarity = cosine_similarity(self.task, self.parent.task)
+                if similarity >= self.options.similarity_threshold:
+                    print(f"Task similarity with parent is high ({similarity:.2f}), executing as single task.")
+                    return self._run_single_task()
+
             self.tasks = self._split_task()
-            if not self.tasks or not self.tasks.get("needs_subtasks", False):
+            if not self.tasks or not self.tasks["needs_subtasks"]:
                 break
 
             agent_responses = [RecursiveAgent(
@@ -70,7 +93,7 @@ class RecursiveAgent():
                 allow_subtasks=True,
                 current_layer=self.current_layer + 1,
                 parent=self
-            ).run() for subtask in self.tasks.get("subtasks", [])]
+            ).run() for subtask in self.tasks["subtasks"]]
             
             return self._summarize_subtask_results(agent_responses)
         
@@ -85,11 +108,11 @@ class RecursiveAgent():
         history.append(response)
         
         for tool_call in response.tool_calls:
-            tool = self.options.tools_dict[tool_call['name']]
-            tool_response = tool(**tool_call['args'])
+            tool = self.options.tools_dict[tool_call["name"]]
+            tool_response = tool(**tool_call["args"])
             if self.options.on_tool_call_executed:
-                self.options.on_tool_call_executed(task=self.task, uuid=self.uuid, tool_name=tool_call['name'], tool_args=tool_call['args'], tool_response=tool_response)
-            history.append(ToolMessage(json.dumps(tool_response), tool_call_id=tool_call['id']))
+                self.options.on_tool_call_executed(task=self.task, uuid=self.uuid, tool_name=tool_call["name"], tool_args=tool_call["args"], tool_response=tool_response)
+            history.append(ToolMessage(json.dumps(tool_response), tool_call_id=tool_call["id"]))
         
         return self.tool_llm.invoke(history).content
 
@@ -101,7 +124,7 @@ class RecursiveAgent():
         structured_response = self.llm.invoke(split_msgs_hist)
         split_task = self.task_split_parser.invoke(structured_response)
 
-        for subtask in split_task.get("subtasks", []):
+        for subtask in split_task["subtasks"]:
             subtask["uuid"] = str(uuid.uuid4())
 
         return split_task
