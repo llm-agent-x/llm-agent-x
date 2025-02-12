@@ -98,7 +98,7 @@ class RecursiveAgent():
         # Get sibling contexts
         sibling_contexts = []
         for sibling in self.siblings:
-            if sibling.result and sibling != self:  # Exclude self from siblings
+            if sibling.result and sibling != self:
                 sibling_contexts.append({
                     "task": sibling.task,
                     "result": sibling.result
@@ -108,6 +108,27 @@ class RecursiveAgent():
             "parent_contexts": parent_contexts,
             "sibling_contexts": sibling_contexts
         }
+
+    def _build_task_history(self) -> str:
+        """
+        Build a string representation of the task history for context
+        """
+        context_info = self._build_context_information()
+        history = []
+        
+        # Add parent tasks
+        if context_info["parent_contexts"]:
+            history.append("Previous parent tasks:")
+            for ctx in context_info["parent_contexts"]:
+                history.append(f"- {ctx['task']}")
+        
+        # Add sibling tasks
+        if context_info["sibling_contexts"]:
+            history.append("\nParallel tasks already being worked on:")
+            for ctx in context_info["sibling_contexts"]:
+                history.append(f"- {ctx['task']}")
+                
+        return "\n".join(history)
 
     def run(self) -> str:
         if self.options.pre_task_executed:
@@ -141,7 +162,7 @@ class RecursiveAgent():
                     current_layer=self.current_layer + 1,
                     parent=self,
                     context=child_context,
-                    siblings=child_agents  # Pass reference to all child agents
+                    siblings=child_agents
                 )
                 child_agents.append(child_agent)
 
@@ -160,10 +181,8 @@ class RecursiveAgent():
         return self.result
 
     def _run_single_task(self) -> str:
-        # Get context information
         context_info = self._build_context_information()
         
-        # Build context string
         context_str = ""
         if context_info["parent_contexts"]:
             context_str += "\n\nParent task history:\n" + "\n".join(
@@ -197,7 +216,26 @@ class RecursiveAgent():
         return self.tool_llm.invoke(history).content
 
     def _split_task(self) -> SplitTask:
-        split_msgs_hist = [self._construct_subtask_sys_msg(), HumanMessage(self.task)]
+        # Get task history for context
+        task_history = self._build_task_history()
+        
+        # Create system message with context
+        system_msg = (
+            "Split this task into smaller ones only if necessary. Do not attempt to answer it yourself.\n\n"
+            "Consider these tasks that are already being worked on or have been completed:\n"
+            f"{task_history}\n\n"
+            "When splitting the current task, make sure to:\n"
+            "1. Avoid overlap with existing tasks\n"
+            "2. Build upon completed parent tasks\n"
+            "3. Complement parallel tasks\n"
+            "4. Split only if the task is too complex for a single response"
+        )
+        
+        split_msgs_hist = [
+            SystemMessage(system_msg),
+            HumanMessage(self.task)
+        ]
+        
         response = self.llm.invoke(split_msgs_hist + [AIMessage("1. ")])
         split_msgs_hist.append(AIMessage(content="1. " + response.content))
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())
@@ -216,8 +254,5 @@ class RecursiveAgent():
         ]
         return self.llm.invoke(summary_history).content
 
-    def _construct_subtask_sys_msg(self):
-        return SystemMessage("Split this task into smaller ones only if necessary. Do not attempt to answer it yourself.")
-    
     def _construct_subtask_to_json_prompt(self):
         return HumanMessage(f"Now format it in JSON: {SplitTask.model_json_schema()}")
