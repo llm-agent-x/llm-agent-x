@@ -122,7 +122,7 @@ def on_task_executed(task, uuid, response, parent_agent_uuid):
         live.update(task_tree)
 
 
-def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response):
+def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, success=True):
     global live
 
     tool_task_id = f"{uuid}: {tool_name}"
@@ -130,8 +130,13 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response):
     add_to_flowchart(f"{get_or_set_task_id(tool_task_id)} --> {get_or_set_task_id(uuid)}")
 
     # Real-time Hierarchy Update
-    tool_text = Text(f"{tool_name} 🔧 {json.dumps(tool_args, indent=0).replace("\n", "")}", style="blue")
-    task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
+    tool_text = Text(f"{tool_name} 🔧 {json.dumps(tool_args, indent=0).replace("\n", '')}", style="blue")
+    if not success:
+        tool_text.stylize("bold red")
+        task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
+        task_nodes[tool_task_id].label = Text(f"{tool_name} ❌", style="red")
+    else:
+        task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
 
     if live:
         live.update(task_tree)
@@ -145,8 +150,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default=getenv("DEFAULT_LLM"), help="The name of the LLM to use")
     args = parser.parse_args()
 
-    tool_llm = llm.bind_tools([web_search, exec_python])
-
+    tool_llm = llm.bind_tools([web_search]) #, exec_python])
+    print(f"Using {llm.name}")
     # Create the agent
     agent = llm_agent_x.RecursiveAgent(
         task=args.task,
@@ -161,7 +166,8 @@ if __name__ == "__main__":
             tools=[],
             allow_search=True,
             allow_tools=False,
-            tools_dict={"web_search": web_search, "exec_python": exec_python, "exec": exec_python},
+            tools_dict={"web_search": web_search}, # "exec_python": exec_python, "exec": exec_python},
+            task_limits=llm_agent_x.TaskLimit.from_array([2,3, 2, 0])
         ),
     )
 
