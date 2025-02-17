@@ -258,6 +258,7 @@ class RecursiveAgent():
 
         history = [
             SystemMessage(f"Your task is to answer the following question, using any tools that you deem necessary. "
+                        f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
                         f"If you use the web search tool, make sure you include citations (just use a pair of square "
                         f"brackets and a number in text, and at the end, include a citations section).{context_str}"),
             HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results.")
@@ -326,8 +327,15 @@ class RecursiveAgent():
         # return self.llm.invoke(summary_history).content
         merge_options = MergeOptions(llm = self.llm, context_window=15)
         merger = LLMMerger(merge_options)
-
-        return merger.merge_documents(subtask_results)
+        merged = merger.merge_documents(subtask_results)
+        aligned = self.llm.invoke(
+            [
+                HumanMessage(
+                    f"{merged}\n\nCompile a comprehensive report to answer this question:\n{self.task}\n\nCustom instructions:\ngo into extreme detail. disregard irrelevant information, but include anything relevant. ensure that your report has a good structure and organization."
+                )
+            ]
+        )
+        return aligned.content
 
 
     def _construct_subtask_to_json_prompt(self):

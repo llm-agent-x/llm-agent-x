@@ -1,7 +1,7 @@
 import argparse
 import json
 import time
-from os import getenv
+from os import getenv, environ
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
@@ -15,7 +15,6 @@ from llm_agent_x import int_to_base26
 
 # Load environment variables
 load_dotenv(".env", override=True)
-
 # Initialize Console and Live Display
 console = Console()
 live = None  # Global live display manager
@@ -26,7 +25,7 @@ task_nodes = {}  # Store references to tree nodes
 llm = ChatOpenAI(
     base_url=getenv("OPENAI_BASE_URL"),
     api_key=getenv("OPENAI_API_KEY"),
-    model="qwen2.5-coder-long:latest",
+    model=getenv("DEFAULT_LLM", "gpt-4-0613"),
     temperature=0,
 )
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))

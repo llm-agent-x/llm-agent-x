@@ -1,11 +1,9 @@
-from typing import List, Any
 import re
+from typing import List, Any
 from dataclasses import dataclass
 from pydantic import BaseModel
-from langchain.prompts import PromptTemplate
-import tiktoken
-from tqdm import tqdm
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+
 
 @dataclass
 class MergeChunk:
@@ -15,73 +13,54 @@ class MergeChunk:
 
 class MergeOptions(BaseModel):
     llm: Any
-    token_count_model_name: str = "gpt-4-0613"
     context_window: int = 50
-    chunk_size: int = 800
 
 
 class LLMMerger:
     def __init__(self, options: MergeOptions):
         self.options = options
         self.llm = options.llm
-        self.encoding = tiktoken.encoding_for_model(options.token_count_model_name)
 
-    def count_tokens(self, text: str) -> int:
-        return len(self.encoding.encode(text))
+    def summarize_single_chunk(self, chunk, n=5):
+        sys_msg = (
+            "Summarize this, but make the ending able to flow into more content:\n"
+        )
+        words = chunk.split()
 
-    def chunk_documents(self, documents: List[str]) -> List[MergeChunk]:
-        chunks = []
-        for doc_idx, doc in enumerate(documents):
-            while doc:
-                if self.count_tokens(doc) <= self.options.chunk_size:
-                    chunks.append(MergeChunk(text=doc, source_doc=doc_idx))
-                    break
-                split_idx = doc[: self.options.chunk_size].rfind("\n")
-                if split_idx == -1:
-                    split_idx = self.options.chunk_size
-                chunks.append(MergeChunk(text=doc[:split_idx], source_doc=doc_idx))
-                doc = doc[split_idx:]
-        return chunks
+        # Get the first five words
+        start = words[:n]
+
+        # Join the first five words back into a string
+        ffw = ' '.join(start)
+        result = self.llm.invoke([
+            SystemMessage(sys_msg),
+            HumanMessage(chunk),
+            AIMessage(ffw),
+        ])
+        return ffw + result.content
+
 
     def merge_documents(self, documents: List[str]) -> str:
-        chunks = self.chunk_documents(documents)
-        merged_text = f"{chunks[0].text}\n<merged>"
+        if not documents:
+            return ""
 
-        for i in tqdm(range(1, len(chunks))):
+        merged_text = self.summarize_single_chunk(documents[0]) + "\n"
+        sys_msg = ("Reproduce the previous context, and then, in <merged></merged> tags, "
+                   "add the next document, making sure that the two documents flow into each other. "
+                   "Ensure the end of the merged document can transition into a new document unless this is the final document.")
+
+        for i in range(1, len(documents)):
             context = " ".join(merged_text.split()[-self.options.context_window:])
-            prompt = f"""Previous context:
-{context}
-
-<merge>
-{chunks[i].text}
-</merge>
-
-Merge the content within the merge tags into a coherent continuation of the previous context. Ensure:
-1. The merged text flows naturally from the context
-2. All important information is preserved
-3. Redundancy is eliminated
-4. Markdown formatting is preserved
-5. Section headers and structure are maintained appropriately
-6. All technical details and specifics are retained
-
-Begin your response with the previous context followed by your merged text in <merged> tags."""
+            user_prompt = f"{context}\n<merge>\n{documents[i]}\n</merge>"
 
             response = self.llm.bind(stop="</merged>").invoke([
-                SystemMessage(prompt),
-                HumanMessage(context + "\n<merge>\n" + chunks[i].text + "\n</merge>"),
-                AIMessage(f"{context}\n<merged>"),
-            ],)
-            
+                SystemMessage(sys_msg),
+                HumanMessage(user_prompt),
+                AIMessage(f"{context}\n<merged>\n"),
+            ])
 
             merged_content = re.search(r"<merged>(.*?)$", response.content, re.DOTALL)
-            merged_text += (
-                "\n\n"
-                + (
-                    merged_content.group(1).strip()
-                    if merged_content
-                    else chunks[i].text
-                )
-                + "\n</merged>"
-            )
-
-        return merged_text.rstrip("</merged>")
+            merged_text += "\n\n" + (
+                merged_content.group(1).strip() if merged_content else documents[i]) + "\n"
+        merged_text = merged_text.rstrip("</merged>")
+        return merged_text
