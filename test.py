@@ -147,6 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_layers", type=int, default=3, help="The maximum number of layers.")
     parser.add_argument("--output", type=str, default="output.md", help="The output file path")
     parser.add_argument("--model", type=str, default=getenv("DEFAULT_LLM"), help="The name of the LLM to use")
+    parser.add_argument("--task_limit", type=str, default="[3,2,2,0]")
     args = parser.parse_args()
 
     tool_llm = llm.bind_tools([web_search]) #, exec_python])
@@ -166,7 +167,7 @@ if __name__ == "__main__":
             allow_search=True,
             allow_tools=False,
             tools_dict={"web_search": web_search}, # "exec_python": exec_python, "exec": exec_python},
-            task_limits=llm_agent_x.TaskLimit.from_array([2,3, 2, 0])
+            task_limits=llm_agent_x.TaskLimit.from_array(eval(args.task_limit))
         ),
     )
 
