@@ -50,7 +50,7 @@ python test.py "Research the impact of climate change on polar bears" --max_laye
 
 ```mermaid
 flowchart TD
-    A[Research the evolution of the internet. use 5 subtasks, and make sure you follow all your previous instructions (and don't include a summarization task at the end). make your final report very detailed.]
+    A[Research the evolution of the internet. use 5 subtasks, and make sure you follow all your previous instructions nd don't include a summarization task at the end. make your final report very detailed.]
     A -->|Subtask| B[Identify key milestones in the development of the internet.]
     B -->|Tool call| C[web_search]
     C --> B
