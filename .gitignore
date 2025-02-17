@@ -4,3 +4,4 @@ venv/*
 output/*
 .vscode/*
 *.pyc
+.idea/*

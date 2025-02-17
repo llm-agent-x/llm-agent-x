@@ -1,7 +1,7 @@
 import argparse
 import json
 import time
-from os import getenv
+from os import getenv, environ
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
@@ -12,10 +12,10 @@ from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 import llm_agent_x
 from llm_agent_x import int_to_base26
+from llm_agent_x.backend import AppendMerger, LLMMerger
 
 # Load environment variables
 load_dotenv(".env", override=True)
-
 # Initialize Console and Live Display
 console = Console()
 live = None  # Global live display manager
@@ -26,7 +26,7 @@ task_nodes = {}  # Store references to tree nodes
 llm = ChatOpenAI(
     base_url=getenv("OPENAI_BASE_URL"),
     api_key=getenv("OPENAI_API_KEY"),
-    model="qwen2.5-coder-long:latest",
+    model=getenv("DEFAULT_LLM", "gpt-4-0613"),
     temperature=0,
 )
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
@@ -122,7 +122,7 @@ def on_task_executed(task, uuid, response, parent_agent_uuid):
         live.update(task_tree)
 
 
-def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response):
+def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, success=True):
     global live
 
     tool_task_id = f"{uuid}: {tool_name}"
@@ -130,8 +130,13 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response):
     add_to_flowchart(f"{get_or_set_task_id(tool_task_id)} --> {get_or_set_task_id(uuid)}")
 
     # Real-time Hierarchy Update
-    tool_text = Text(f"{tool_name} 🔧", style="blue")
-    task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
+    tool_text = Text(f"{tool_name} 🔧 {json.dumps(tool_args, indent=0).replace('\n', '')}", style="blue")
+    if not success:
+        tool_text.stylize("bold red")
+        task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
+        task_nodes[tool_task_id].label = Text(f"{tool_name} ❌", style="red")
+    else:
+        task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
 
     if live:
         live.update(task_tree)
@@ -140,16 +145,20 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
+    parser.add_argument("--u_inst", type=str, help="The task to execute.", default="")
     parser.add_argument("--max_layers", type=int, default=3, help="The maximum number of layers.")
     parser.add_argument("--output", type=str, default="output.md", help="The output file path")
     parser.add_argument("--model", type=str, default=getenv("DEFAULT_LLM"), help="The name of the LLM to use")
+    parser.add_argument("--task_limit", type=str, default="[3,2,2,0]")
+
+    parser.add_argument("--merger", type=str, default="ai")
     args = parser.parse_args()
 
-    tool_llm = llm.bind_tools([web_search, exec_python])
-
+    tool_llm = llm.bind_tools([web_search]) #, exec_python])
     # Create the agent
     agent = llm_agent_x.RecursiveAgent(
         task=args.task,
+        u_inst=args.u_inst,
         agent_options=llm_agent_x.RecursiveAgentOptions(
             max_layers=args.max_layers,
             search_tool=web_search,
@@ -161,7 +170,9 @@ if __name__ == "__main__":
             tools=[],
             allow_search=True,
             allow_tools=False,
-            tools_dict={"web_search": web_search, "exec_python": exec_python, "exec": exec_python},
+            tools_dict={"web_search": web_search}, # "exec_python": exec_python, "exec": exec_python},
+            task_limits=llm_agent_x.TaskLimit.from_array(eval(args.task_limit)),
+            merger = { "ai":LLMMerger, "append":AppendMerger}[args.merger]
         ),
     )
 
