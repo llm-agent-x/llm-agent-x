@@ -1,19 +1,8 @@
 import re
 from typing import List, Any
-from dataclasses import dataclass
-from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+from ..config_classes.MergerConfig import MergeChunk, MergeOptions
 
-
-@dataclass
-class MergeChunk:
-    text: str
-    source_doc: int
-
-
-class MergeOptions(BaseModel):
-    llm: Any
-    context_window: int = 50
 
 
 class LLMMerger:

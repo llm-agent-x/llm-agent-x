@@ -4,9 +4,9 @@ from difflib import SequenceMatcher
 from typing import Any, Callable, Optional, List
 
 from pydantic import BaseModel, validator
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, ToolCall
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.output_parsers import JsonOutputParser
-from ..backend.merger import MergeChunk, MergeOptions, LLMMerger
+from llm_agent_x.backend.mergers.LLMMerger import MergeOptions, LLMMerger
 class TaskLimitConfig:
     """Configuration for task limits at each layer"""
     
@@ -83,6 +83,8 @@ class RecursiveAgentOptions(BaseModel):
     allow_tools: bool = False
     tools_dict: dict = {}
     similarity_threshold: float = 0.8
+    merger: Any=LLMMerger
+    align_summaries:bool=True
 
     class Config:
         arbitrary_types_allowed = True
@@ -97,13 +99,15 @@ def calculate_raw_similarity(text1: str, text2: str) -> float:
 class RecursiveAgent():
     def __init__(self, 
                  task: str, 
-                 uuid: str = str(uuid.uuid4()), 
-                 agent_options: RecursiveAgentOptions = None, 
-                 allow_subtasks: bool = True, 
-                 current_layer: int = 0, 
+                 u_inst: str,
+                 uuid: str = str(uuid.uuid4()),
+                 agent_options: RecursiveAgentOptions = None,
+                 allow_subtasks: bool = True,
+                 current_layer: int = 0,
                  parent: Optional['RecursiveAgent'] = None,
                  context: Optional[TaskContext] = None,
-                 siblings: List['RecursiveAgent'] = None):
+                 siblings: List['RecursiveAgent'] = None,
+                 ):
         
         if agent_options is None:
             # Default configuration: 3 tasks per layer, max 2 layers
@@ -112,6 +116,7 @@ class RecursiveAgent():
             )
             
         self.task = task
+        self.u_inst = u_inst
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
         self.llm = self.options.llm
@@ -213,6 +218,7 @@ class RecursiveAgent():
                 
                 child_agent = RecursiveAgent(
                     task=subtask["task"],
+                    u_inst=self.u_inst,
                     uuid=subtask["uuid"],
                     agent_options=self.options,
                     allow_subtasks=True,
@@ -231,7 +237,7 @@ class RecursiveAgent():
                 child_agent.context.result = result
                 subtask_results.append(result)
             
-            self.result = self._summarize_subtask_results(subtask_results)
+            self.result = self._summarize_subtask_results([child_agent.task for child_agent in child_agents], subtask_results)
             self.options.on_task_executed(self.task, self.uuid, self.result, self.parent.uuid if self.parent else None)
 
             return self.result
@@ -261,7 +267,8 @@ class RecursiveAgent():
                         f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
                         f"If you use the web search tool, make sure you include citations (just use a pair of square "
                         f"brackets and a number in text, and at the end, include a citations section).{context_str}"),
-            HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results.")
+            HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results."
+                         f"{f"Use this info to help you: {self.u_inst}" if self.u_inst else ""}")
         ]
         
         response = self.tool_llm.invoke(history)
@@ -293,7 +300,11 @@ class RecursiveAgent():
             "2. Build upon completed parent tasks\n"
             "3. Complement parallel tasks\n"
             "4. Split only if the task is too complex for a single response\n"
-            f"5. Create no more than {max_subtasks} subtasks"
+            f"5. Create no more than {max_subtasks} subtasks\n\n\n"
+            f"{
+                (f"Also, use this user-provided info to help you, and include any details in your output:\n"
+                f"{self.u_inst}") if self.u_inst else ""
+            }"
         )
         
         split_msgs_hist = [
@@ -319,23 +330,23 @@ class RecursiveAgent():
         if self.current_layer >= len(self.options.task_limits.limits):
             return 0  # No more subtasks allowed beyond configured depth
         return self.options.task_limits.limits[self.current_layer]
-    def _summarize_subtask_results(self, subtask_results) -> str:
-        # summary_history = [
-        #     SystemMessage("Summarize the results into a single response with citations."),
-        #     HumanMessage(json.dumps(subtask_results, indent=2))
-        # ]
-        # return self.llm.invoke(summary_history).content
+    def _summarize_subtask_results(self, tasks, subtask_results) -> str:
         merge_options = MergeOptions(llm = self.llm, context_window=15)
-        merger = LLMMerger(merge_options)
-        merged = merger.merge_documents(subtask_results)
-        aligned = self.llm.invoke(
-            [
-                HumanMessage(
-                    f"{merged}\n\nCompile a comprehensive report to answer this question:\n{self.task}\n\nCustom instructions:\ngo into extreme detail. disregard irrelevant information, but include anything relevant. ensure that your report has a good structure and organization."
-                )
-            ]
-        )
-        return aligned.content
+        merger = self.options.merger(merge_options)
+
+        x = [f"QUESTION: {question}\n\nANSWER\n{answer}" for (question, answer) in zip(tasks, subtask_results)]
+        merged = merger.merge_documents(x)
+        if self.options.align_summaries:
+            aligned = self.llm.invoke(
+                [
+                    HumanMessage(
+                        f"{merged}\n\nCompile a comprehensive report to answer this question:\n{self.task}\n\nCustom instructions:\ngo into extreme detail. disregard irrelevant information, but include anything relevant. ensure that your report has a good structure and organization."
+                    )
+                ]
+            )
+            return aligned.content
+        else:
+            return merged
 
 
     def _construct_subtask_to_json_prompt(self):

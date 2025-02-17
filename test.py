@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 import llm_agent_x
 from llm_agent_x import int_to_base26
+from llm_agent_x.backend import AppendMerger, LLMMerger
 
 # Load environment variables
 load_dotenv(".env", override=True)
@@ -144,17 +145,20 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, succe
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
+    parser.add_argument("--u_inst", type=str, help="The task to execute.", default="")
     parser.add_argument("--max_layers", type=int, default=3, help="The maximum number of layers.")
     parser.add_argument("--output", type=str, default="output.md", help="The output file path")
     parser.add_argument("--model", type=str, default=getenv("DEFAULT_LLM"), help="The name of the LLM to use")
     parser.add_argument("--task_limit", type=str, default="[3,2,2,0]")
+
+    parser.add_argument("--merger", type=str, default="ai")
     args = parser.parse_args()
 
     tool_llm = llm.bind_tools([web_search]) #, exec_python])
-    print(f"Using {llm.name}")
     # Create the agent
     agent = llm_agent_x.RecursiveAgent(
         task=args.task,
+        u_inst=args.u_inst,
         agent_options=llm_agent_x.RecursiveAgentOptions(
             max_layers=args.max_layers,
             search_tool=web_search,
@@ -167,7 +171,8 @@ if __name__ == "__main__":
             allow_search=True,
             allow_tools=False,
             tools_dict={"web_search": web_search}, # "exec_python": exec_python, "exec": exec_python},
-            task_limits=llm_agent_x.TaskLimit.from_array(eval(args.task_limit))
+            task_limits=llm_agent_x.TaskLimit.from_array(eval(args.task_limit)),
+            merger = { "ai":LLMMerger, "append":AppendMerger}[args.merger]
         ),
     )
 
