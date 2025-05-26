@@ -18,7 +18,7 @@ from .backend import AppendMerger, LLMMerger # Adjusted import
 load_dotenv(".env", override=True) # This might need adjustment if .env is not in the right place relative to cli.py
 # Initialize Console and Live Display
 console = Console()
-live = None  # Global live display manager
+live = None  #  display manager
 task_tree = Tree("Agent Execution")  # Root of the real-time task tree
 task_nodes = {}  # Store references to tree nodes
 
@@ -82,7 +82,7 @@ def exec_python(code, globals=None, locals=None):
 
 
 def pre_tasks_executed(task, uuid, parent_agent_uuid):
-    global live
+    
 
     id = get_or_set_task_id(uuid)
     parent_id = get_or_set_task_id(parent_agent_uuid) if parent_agent_uuid is not None else None
@@ -105,7 +105,7 @@ def pre_tasks_executed(task, uuid, parent_agent_uuid):
 
 
 def on_task_executed(task, uuid, response, parent_agent_uuid):
-    global live
+    
 
     id = get_or_set_task_id(uuid)
     parent_id = get_or_set_task_id(parent_agent_uuid) if parent_agent_uuid is not None else None
@@ -123,7 +123,7 @@ def on_task_executed(task, uuid, response, parent_agent_uuid):
 
 
 def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, success=True):
-    global live
+    
 
     tool_task_id = f"{uuid}: {tool_name}"
     add_to_flowchart(f"{get_or_set_task_id(uuid)} -->|Tool call| {get_or_set_task_id(tool_task_id)}[{tool_name}]")
@@ -146,7 +146,7 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, succe
         live.update(task_tree)
 
 def main():
-    global live # Ensure 'live' can be assigned in this function
+     # Ensure 'live' can be assigned in this function
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
     parser.add_argument("--u_inst", type=str, help="The task to execute.", default="")
