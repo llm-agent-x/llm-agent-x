@@ -267,8 +267,7 @@ class RecursiveAgent():
                         f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
                         f"If you use the web search tool, make sure you include citations (just use a pair of square "
                         f"brackets and a number in text, and at the end, include a citations section).{context_str}"),
-            HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results."
-                         f"{f"Use this info to help you: {self.u_inst}" if self.u_inst else ""}")
+            HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results." + f"Use this info to help you: {self.u_inst}" if self.u_inst else "")
         ]
         
         response = self.tool_llm.invoke(history)
