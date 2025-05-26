@@ -300,12 +300,14 @@ class RecursiveAgent():
             "2. Build upon completed parent tasks\n"
             "3. Complement parallel tasks\n"
             "4. Split only if the task is too complex for a single response\n"
-            f"5. Create no more than {max_subtasks} subtasks\n\n\n"
-            f"{
-                (f"Also, use this user-provided info to help you, and include any details in your output:\n"
-                f"{self.u_inst}") if self.u_inst else ""
-            }"
+            f"5. Create no more than {max_subtasks} subtasks\n\n"
         )
+        
+        if self.u_inst:
+            system_msg += (
+                "Also, use this user-provided info to help you, and include any details in your output:\n"
+                f"{self.u_inst}\n"
+            )
         
         split_msgs_hist = [
             SystemMessage(system_msg),
