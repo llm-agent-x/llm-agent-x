@@ -130,7 +130,10 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, succe
     add_to_flowchart(f"{get_or_set_task_id(tool_task_id)} --> {get_or_set_task_id(uuid)}")
 
     # Real-time Hierarchy Update
-    tool_text = Text(f"{tool_name} 🔧 {json.dumps(tool_args, indent=0).replace('\n', '')}", style="blue")
+    tool_text = Text(
+        f"{tool_name} 🔧 {json.dumps(tool_args, indent=0).replace('\\n', '')}",
+        style="blue"
+    )
     if not success:
         tool_text.stylize("bold red")
         task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
