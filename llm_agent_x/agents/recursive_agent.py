@@ -267,8 +267,7 @@ class RecursiveAgent():
                         f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
                         f"If you use the web search tool, make sure you include citations (just use a pair of square "
                         f"brackets and a number in text, and at the end, include a citations section).{context_str}"),
-            HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results."
-                         f"{f"Use this info to help you: {self.u_inst}" if self.u_inst else ""}")
+            HumanMessage(self.task + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results." + f"Use this info to help you: {self.u_inst}" if self.u_inst else "")
         ]
         
         response = self.tool_llm.invoke(history)
@@ -300,12 +299,14 @@ class RecursiveAgent():
             "2. Build upon completed parent tasks\n"
             "3. Complement parallel tasks\n"
             "4. Split only if the task is too complex for a single response\n"
-            f"5. Create no more than {max_subtasks} subtasks\n\n\n"
-            f"{
-                (f"Also, use this user-provided info to help you, and include any details in your output:\n"
-                f"{self.u_inst}") if self.u_inst else ""
-            }"
+            f"5. Create no more than {max_subtasks} subtasks\n\n"
         )
+        
+        if self.u_inst:
+            system_msg += (
+                "Also, use this user-provided info to help you, and include any details in your output:\n"
+                f"{self.u_inst}\n"
+            )
         
         split_msgs_hist = [
             SystemMessage(system_msg),
