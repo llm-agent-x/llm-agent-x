@@ -8,7 +8,7 @@ LLM Agent X is a task execution framework that leverages language models to perf
 
 1. Clone the repository:
     ```sh
-    git clone https://github.com/yourusername/llm_agent_x.git
+    git clone https://github.com/cvaz1306/llm_agent_x.git
     cd llm_agent_x
     ```
 
