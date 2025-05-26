@@ -10,12 +10,12 @@ from rich.live import Live
 from rich.text import Text
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
-import llm_agent_x
-from llm_agent_x import int_to_base26
-from llm_agent_x.backend import AppendMerger, LLMMerger
+
+from . import int_to_base26, RecursiveAgent, RecursiveAgentOptions, TaskLimit # Adjusted import
+from .backend import AppendMerger, LLMMerger # Adjusted import
 
 # Load environment variables
-load_dotenv(".env", override=True)
+load_dotenv(".env", override=True) # This might need adjustment if .env is not in the right place relative to cli.py
 # Initialize Console and Live Display
 console = Console()
 live = None  # Global live display manager
@@ -141,8 +141,8 @@ def on_tool_call_executed(task, uuid, tool_name, tool_args, tool_response, succe
     if live:
         live.update(task_tree)
 
-
-if __name__ == "__main__":
+def main():
+    global live # Ensure 'live' can be assigned in this function
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
     parser.add_argument("--u_inst", type=str, help="The task to execute.", default="")
@@ -156,10 +156,10 @@ if __name__ == "__main__":
 
     tool_llm = llm.bind_tools([web_search]) #, exec_python])
     # Create the agent
-    agent = llm_agent_x.RecursiveAgent(
+    agent = RecursiveAgent( # Adjusted: Removed llm_agent_x prefix
         task=args.task,
         u_inst=args.u_inst,
-        agent_options=llm_agent_x.RecursiveAgentOptions(
+        agent_options=RecursiveAgentOptions( # Adjusted: Removed llm_agent_x prefix
             max_layers=args.max_layers,
             search_tool=web_search,
             pre_task_executed=pre_tasks_executed,
@@ -171,7 +171,7 @@ if __name__ == "__main__":
             allow_search=True,
             allow_tools=False,
             tools_dict={"web_search": web_search}, # "exec_python": exec_python, "exec": exec_python},
-            task_limits=llm_agent_x.TaskLimit.from_array(eval(args.task_limit)),
+            task_limits=TaskLimit.from_array(eval(args.task_limit)), # Adjusted: Removed llm_agent_x prefix
             merger = { "ai":LLMMerger, "append":AppendMerger}[args.merger]
         ),
     )
@@ -190,3 +190,6 @@ if __name__ == "__main__":
     # Save Response
     with (output_dir / args.output).open("w") as output:
         output.write(response)
+
+if __name__ == "__main__":
+    main()
