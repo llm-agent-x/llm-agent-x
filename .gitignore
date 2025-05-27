@@ -5,3 +5,4 @@ output/*
 .vscode/*
 *.pyc
 .idea/*
+dist/

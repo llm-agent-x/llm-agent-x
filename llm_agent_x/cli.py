@@ -17,7 +17,19 @@ from . import (
     RecursiveAgentOptions,
     TaskLimit,
 )  # Adjusted import
-from .backend import AppendMerger, LLMMerger  # Adjusted import
+from .backend import AppendMerger, LLMMerger
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+# Setup (only needed once)
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+exporter = OTLPSpanExporter(endpoint="http://localhost:6006/v1/traces")
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
 # Load environment variables
 load_dotenv(
@@ -189,45 +201,47 @@ def main():
     args = parser.parse_args()
 
     tool_llm = llm.bind_tools([web_search])  # , exec_python])
-    # Create the agent
-    agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
-        task=args.task,
-        u_inst=args.u_inst,
-        agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
-            max_layers=args.max_layers,
-            search_tool=web_search,
-            pre_task_executed=pre_tasks_executed,
-            on_task_executed=on_task_executed,
-            on_tool_call_executed=on_tool_call_executed,
-            llm=llm,
-            tool_llm=tool_llm,
-            tools=[],
-            allow_search=True,
-            allow_tools=False,
-            tools_dict={
-                "web_search": web_search
-            },  # "exec_python": exec_python, "exec": exec_python},
-            task_limits=TaskLimit.from_array(
-                eval(args.task_limit)
-            ),  # Adjusted: Removed llm_agent_x prefix
-            merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
-        ),
-    )
+    with tracer.start_as_current_span("A") as span:
+        # Create the agent
+        agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
+            task=args.task,
+            u_inst=args.u_inst,
+            tracer_span=span,
+            agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
+                max_layers=args.max_layers,
+                search_tool=web_search,
+                pre_task_executed=pre_tasks_executed,
+                on_task_executed=on_task_executed,
+                on_tool_call_executed=on_tool_call_executed,
+                llm=llm,
+                tool_llm=tool_llm,
+                tools=[],
+                allow_search=True,
+                allow_tools=False,
+                tools_dict={
+                    "web_search": web_search
+                },  # "exec_python": exec_python, "exec": exec_python},
+                task_limits=TaskLimit.from_array(
+                    eval(args.task_limit)
+                ),  # Adjusted: Removed llm_agent_x prefix
+                merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
+            ),
+        )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Start Live Display
-    with Live(task_tree, console=console, auto_refresh=True) as live_display:
-        live = live_display  # Assign to global variable
-        response = agent.run()  # Execute the agent
+        # Start Live Display
+        with Live(task_tree, console=console, auto_refresh=True) as live_display:
+            live = live_display  # Assign to global variable
+            response = agent.run()  # Execute the agent
 
-    # Save Flowchart
-    with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
-        flowchart_o.write(render_flowchart())
+        # Save Flowchart
+        with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
+            flowchart_o.write(render_flowchart())
 
-    # Save Response
-    with (output_dir / args.output).open("w") as output:
-        output.write(response)
+        # Save Response
+        with (output_dir / args.output).open("w") as output:
+            output.write(response)
 
 
 if __name__ == "__main__":

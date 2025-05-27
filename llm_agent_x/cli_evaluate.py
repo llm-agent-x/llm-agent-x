@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import time
 from os import getenv
@@ -7,9 +8,8 @@ from dotenv import load_dotenv
 from rich.console import Console
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
-
+from icecream import ic
 from . import (
-    int_to_base26,
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
@@ -71,13 +71,15 @@ def exec_python(code, globals=None, locals=None):
 def main():
     # Ensure 'live' can be assigned in this function
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
-    parser.add_argument("task", type=str, help="The task to execute.")
+    parser.add_argument(
+        "prompts", type=str, help="The path of the file containing prompts to evaluate."
+    )
     parser.add_argument("--u_inst", type=str, help="The task to execute.", default="")
     parser.add_argument(
         "--max_layers", type=int, default=3, help="The maximum number of layers."
     )
     parser.add_argument(
-        "--output", type=str, default="output.md", help="The output file path"
+        "--output", type=str, default="output.json", help="The output file path"
     )
     parser.add_argument(
         "--model",
@@ -86,38 +88,45 @@ def main():
         help="The name of the LLM to use",
     )
     parser.add_argument("--task_limit", type=str, default="[3,2,2,0]")
-
     parser.add_argument("--merger", type=str, default="ai")
     args = parser.parse_args()
-
     tool_llm = llm.bind_tools([web_search])  # , exec_python])
+    with open(args.prompts, "r") as f:
+        prompts = json.loads(f.read())
     # Create the agent
-    agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
-        task=args.task,
-        u_inst=args.u_inst,
-        agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
-            max_layers=args.max_layers,
-            search_tool=web_search,
-            llm=llm,
-            tool_llm=tool_llm,
-            tools=[],
-            allow_search=True,
-            allow_tools=False,
-            tools_dict={
-                "web_search": web_search
-            },  # "exec_python": exec_python, "exec": exec_python},
-            task_limits=TaskLimit.from_array(
-                eval(args.task_limit)
-            ),  # Adjusted: Removed llm_agent_x prefix
-            merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
-        ),
-    )
-    response = agent.run()
-
+    responses = []
+    for prompt in prompts:
+        agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
+            task=prompt,
+            u_inst=args.u_inst,
+            agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
+                max_layers=args.max_layers,
+                search_tool=web_search,
+                llm=llm,
+                tool_llm=tool_llm,
+                tools=[],
+                allow_search=True,
+                allow_tools=False,
+                tools_dict={
+                    "web_search": web_search
+                },  # "exec_python": exec_python, "exec": exec_python},
+                task_limits=TaskLimit.from_array(
+                    eval(args.task_limit)
+                ),  # Adjusted: Removed llm_agent_x prefix
+                merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
+            ),
+        )
+        response = agent.run()
+        responses.append(
+            {"prompt": prompt, "response": base64.b64encode(response.encode()).decode()}
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     # Save Response
     with (output_dir / args.output).open("w") as output:
-        output.write(response)
+        print("Saving responses...")
+        save_path = output_dir / args.output
+        ic(save_path)
+        output.write(json.dumps(responses))
 
 
 if __name__ == "__main__":

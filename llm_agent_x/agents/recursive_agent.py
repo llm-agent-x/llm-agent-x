@@ -2,6 +2,7 @@ import json
 import uuid
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional, List
+from opentelemetry import trace
 
 from pydantic import BaseModel, validator
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
@@ -51,6 +52,7 @@ class TaskLimit(BaseModel):
     def from_falloff(
         cls, initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
     ):
+
         return cls(
             limits=TaskLimitConfig.falloff(initial_tasks, max_depth, falloff_func)
         )
@@ -119,6 +121,8 @@ class RecursiveAgent:
         self,
         task: str,
         u_inst: str,
+        tracer: trace.Tracer = None,
+        tracer_span: trace.Span = None,
         uuid: str = str(uuid.uuid4()),
         agent_options: RecursiveAgentOptions = None,
         allow_subtasks: bool = True,
@@ -136,6 +140,8 @@ class RecursiveAgent:
 
         self.task = task
         self.u_inst = u_inst
+        self.tracer = tracer
+        self.tracer_span = tracer_span
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
         self.llm = self.options.llm
@@ -197,7 +203,25 @@ class RecursiveAgent:
 
         return "\n".join(history)
 
-    def run(self) -> str:
+    def run(self):
+        if self.tracer and self.tracer_span:
+            with self.tracer.start_as_current_span(
+                "run", context=self.tracer_span.context
+            ) as span:
+                span.add_event(
+                    "Start", {"layer": self.current_layer, "task": self.task}
+                )
+                self._run(span=span)
+        else:
+            self._run()
+
+    def _run(self, span=None) -> str:
+        self.span.add_event(
+            "run",
+            {
+                "task": self.task,
+            },
+        )
         if self.options.pre_task_executed:
             self.options.pre_task_executed(
                 task=self.task,
@@ -209,12 +233,13 @@ class RecursiveAgent:
         if max_subtasks == 0:
             # If no subtasks allowed at this layer, execute as single task
             self.result = self._run_single_task()
-            self.options.on_task_executed(
-                self.task,
-                self.uuid,
-                self.result,
-                self.parent.uuid if self.parent else None,
-            )
+            if self.options.on_task_executed:
+                self.options.on_task_executed(
+                    self.task,
+                    self.uuid,
+                    self.result,
+                    self.parent.uuid if self.parent else None,
+                )
 
             return self.result
 
@@ -245,6 +270,8 @@ class RecursiveAgent:
                 child_agent = RecursiveAgent(
                     task=subtask["task"],
                     u_inst=self.u_inst,
+                    tracer=self.tracer,
+                    tracer_span=span,
                     uuid=subtask["uuid"],
                     agent_options=self.options,
                     allow_subtasks=True,
@@ -266,19 +293,25 @@ class RecursiveAgent:
             self.result = self._summarize_subtask_results(
                 [child_agent.task for child_agent in child_agents], subtask_results
             )
+
+            if self.options.on_task_executed:
+                self.options.on_task_executed(
+                    self.task,
+                    self.uuid,
+                    self.result,
+                    self.parent.uuid if self.parent else None,
+                )
+
+            return self.result
+
+        self.result = self._run_single_task()
+        if self.options.on_task_executed:
             self.options.on_task_executed(
                 self.task,
                 self.uuid,
                 self.result,
                 self.parent.uuid if self.parent else None,
             )
-
-            return self.result
-
-        self.result = self._run_single_task()
-        self.options.on_task_executed(
-            self.task, self.uuid, self.result, self.parent.uuid if self.parent else None
-        )
         return self.result
 
     def _run_single_task(self) -> str:
@@ -335,14 +368,15 @@ class RecursiveAgent:
                 history.append(
                     ToolMessage("Tool not found", tool_call_id=tool_call["id"])
                 )
-                self.options.on_tool_call_executed(
-                    task=self.task,
-                    uuid=self.uuid,
-                    tool_name=tool_call["name"],
-                    tool_args=tool_call["args"],
-                    tool_response=tool_response,
-                    success=False,
-                )
+                if self.options.on_tool_call_executed:
+                    self.options.on_tool_call_executed(
+                        task=self.task,
+                        uuid=self.uuid,
+                        tool_name=tool_call["name"],
+                        tool_args=tool_call["args"],
+                        tool_response=tool_response,
+                        success=False,
+                    )
         return self.tool_llm.invoke(history).content
 
     def _split_task(self) -> SplitTask:
