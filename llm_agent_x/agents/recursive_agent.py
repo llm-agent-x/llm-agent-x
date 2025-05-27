@@ -350,48 +350,181 @@ class RecursiveAgent:
             HumanMessage(
                 self.task
                 + "\n\nApply the distributive property to any tool calls. for instance if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results."
-                + f"Use this info to help you: {self.u_inst}"
-                if self.u_inst
-                else ""
+                + (f"Use this info to help you: {self.u_inst}" if self.u_inst else "")
             ),
         ]
 
-        self.current_span.set_attribute(
-            "single_task_context", json.dumps(history, indent=0).replace("\n", " ")
-        )
+        with self.tracer.start_as_current_span("Single Task") as span:
+            span.set_attribute("task", self.task)
 
-        response = self.tool_llm.invoke(history)
-        history.append(response)
+            while True:  # Loop for multi-turn interaction
+                current_llm_response = self.tool_llm.invoke(history)
+                span.set_attribute("response_content", current_llm_response.content)
+                span.set_attribute(
+                    "response_tool_calls", current_llm_response.tool_calls
+                )
 
-        for tool_call in response.tool_calls:
-            try:
-                tool = self.options.tools_dict[tool_call["name"]]
-                tool_response = tool(**tool_call["args"])
-                if self.options.on_tool_call_executed:
-                    self.options.on_tool_call_executed(
-                        task=self.task,
-                        uuid=self.uuid,
-                        tool_name=tool_call["name"],
-                        tool_args=tool_call["args"],
-                        tool_response=tool_response,
-                    )
-                history.append(
-                    ToolMessage(json.dumps(tool_response), tool_call_id=tool_call["id"])
-                )
-            except KeyError:
-                history.append(
-                    ToolMessage("Tool not found", tool_call_id=tool_call["id"])
-                )
-                if self.options.on_tool_call_executed:
-                    self.options.on_tool_call_executed(
-                        task=self.task,
-                        uuid=self.uuid,
-                        tool_name=tool_call["name"],
-                        tool_args=tool_call["args"],
-                        tool_response=tool_response,
-                        success=False,
-                    )
-        return self.tool_llm.invoke(history).content
+                # Add the LLM's response (which might contain tool calls or be a final answer) to history
+                history.append(current_llm_response)
+
+                if not current_llm_response.tool_calls:
+                    # No tool calls, means LLM thinks it has the final answer
+                    return current_llm_response.content
+
+                # If there are tool calls, process them
+                needs_llm_reprompt_after_batch = False
+
+                for tool_call in current_llm_response.tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
+                    tool_call_id = tool_call["id"]
+
+                    try:
+                        # Similarity check for search tools
+                        if tool_name in ["search", "web_search", "brave_web_search"]:
+                            if "query" in tool_args:
+                                query = tool_args["query"]
+                                # Assuming calculate_raw_similarity is available, e.g. self.calculate_raw_similarity
+                                similarity = calculate_raw_similarity(query, self.task)
+
+                                with self.tracer.start_as_current_span(
+                                    f"{tool_name} (Query Check)"
+                                ) as search_span:
+                                    search_span.set_attribute("query", query)
+                                    search_span.set_attribute(
+                                        "similarity_to_task", similarity
+                                    )
+                                    search_span.set_attribute(
+                                        "task_for_similarity", self.task
+                                    )
+
+                                # Adjust similarity threshold divisor as needed. 1.4 means threshold is ~71% of original.
+                                if similarity < self.options.similarity_threshold / 1.4:
+                                    error_message = (
+                                        f"The search query '{query}' is not sufficiently related to the overall task: '{self.task}'. "
+                                        f"Similarity score: {similarity:.2f}. "
+                                        f"Please regenerate a query that is more directly related to the task, "
+                                        f"or explain why this query is relevant if you believe it is."
+                                    )
+                                    history.append(
+                                        ToolMessage(
+                                            json.dumps(
+                                                {
+                                                    "error": "Query not related to task.",
+                                                    "details": error_message,
+                                                }
+                                            ),
+                                            tool_call_id=tool_call_id,
+                                        )
+                                    )
+                                    # Add a HumanMessage to guide the LLM for the next turn.
+                                    history.append(HumanMessage(error_message))
+
+                                    with self.tracer.start_as_current_span(
+                                        "Requesting Tool Call Regeneration"
+                                    ) as regenerate_span:
+                                        regenerate_span.set_attribute(
+                                            "original_query", query
+                                        )
+                                        regenerate_span.set_attribute(
+                                            "similarity", similarity
+                                        )
+                                        regenerate_span.set_attribute("task", self.task)
+
+                                    needs_llm_reprompt_after_batch = True
+                                    break  # Stop processing tool calls in this batch; go back to LLM for new plan.
+
+                        # If we reach here, the tool call is either not a search, or the search query is good.
+                        # Proceed to execute the tool.
+                        tool_to_execute = self.options.tools_dict[tool_name]
+                        tool_response_content = tool_to_execute(**tool_args)
+
+                        if self.options.on_tool_call_executed:
+                            self.options.on_tool_call_executed(
+                                task=self.task,
+                                uuid=self.uuid,
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                tool_response=tool_response_content,
+                                success=True,
+                            )
+
+                        history.append(
+                            ToolMessage(
+                                json.dumps(tool_response_content),
+                                tool_call_id=tool_call_id,
+                            )
+                        )
+
+                    except KeyError:
+                        error_msg_str = f"Tool '{tool_name}' not found. Available tools are: {list(self.options.tools_dict.keys())}"
+                        error_payload_for_llm = {
+                            "error": "Tool not found",
+                            "details": error_msg_str,
+                        }
+                        history.append(
+                            ToolMessage(
+                                json.dumps(error_payload_for_llm),
+                                tool_call_id=tool_call_id,
+                            )
+                        )
+                        history.append(
+                            HumanMessage(
+                                f"You attempted to use a tool named '{tool_name}' which is not available. "
+                                f"Please choose from the available tools: {list(self.options.tools_dict.keys())} or re-evaluate your approach."
+                            )
+                        )
+                        if self.options.on_tool_call_executed:
+                            self.options.on_tool_call_executed(
+                                task=self.task,
+                                uuid=self.uuid,
+                                tool_name=tool_name,
+                                tool_args=tool_args,  # Args LLM tried to use
+                                tool_response=error_payload_for_llm,  # Pass the error dict
+                                success=False,
+                            )
+                        needs_llm_reprompt_after_batch = True
+                        break
+
+                    except Exception as e:
+                        # General exception during tool execution
+                        error_msg_str = f"Error executing tool {tool_name} with args {tool_args}: {str(e)}"
+                        error_payload_for_llm = {
+                            "error": "Tool execution failed",
+                            "details": error_msg_str,
+                        }
+                        # Log exception with tracer if possible
+                        span.record_exception(e)
+                        history.append(
+                            ToolMessage(
+                                json.dumps(error_payload_for_llm),
+                                tool_call_id=tool_call_id,
+                            )
+                        )
+                        history.append(
+                            HumanMessage(
+                                f"An error occurred while executing the tool '{tool_name}': {str(e)}. "
+                                f"The arguments were: {tool_args}. "
+                                f"Please check the arguments, try a different approach, or ask for clarification if needed."
+                            )
+                        )
+                        if self.options.on_tool_call_executed:
+                            self.options.on_tool_call_executed(
+                                task=self.task,
+                                uuid=self.uuid,
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                tool_response=error_payload_for_llm,  # Pass the error dict
+                                success=False,
+                            )
+                        needs_llm_reprompt_after_batch = True
+                        break
+
+                if needs_llm_reprompt_after_batch:
+                    # If any tool call processing indicated a need to re-prompt the LLM,
+                    # continue to the next iteration of the `while True` loop.
+                    # This will re-invoke `self.tool_llm.invoke(history)` with the new error messages in history.
+                    continue
 
     def _split_task(self) -> SplitTask:
         task_history = self._build_task_history()
@@ -438,6 +571,7 @@ class RecursiveAgent:
                 needs_subtasks=False, subtasks=[], evaluation=evaluation
             )
             return split_task
+        self.current_span.add_event("Split Task", {"task": self.task})
         response = self.llm.invoke(split_msgs_hist + [AIMessage("1. ")])
         split_msgs_hist.append(AIMessage(content="1. " + response.content))
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())

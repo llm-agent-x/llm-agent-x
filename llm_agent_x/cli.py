@@ -4,6 +4,7 @@ import time
 from os import getenv, environ
 from pathlib import Path
 from dotenv import load_dotenv
+import requests
 from rich.console import Console
 from rich.tree import Tree
 from rich.live import Live
@@ -46,8 +47,8 @@ task_nodes = {}  # Store references to tree nodes
 llm = ChatOpenAI(
     base_url=getenv("OPENAI_BASE_URL"),
     api_key=getenv("OPENAI_API_KEY"),
-    model=getenv("DEFAULT_LLM", "gpt-4-0613"),
-    temperature=0,
+    model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
+    temperature=0.5,
 )
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
@@ -74,20 +75,79 @@ def render_flowchart():
     return "\n".join(flowchart)
 
 
-def web_search(query: str, num_results: int) -> str:
+def brave_web_search(query: str, num_results: int) -> str:
     """
-    Perform a web search with the given query and number of results, returning JSON-formatted results. **Make sure to be very specific in your search phrase. Ask for specific information, not general information.**
+    Perform a web search with the given query and number of results using the Brave Search API,
+    returning JSON-formatted results.
+    **Make sure to be very specific in your search phrase. Ask for specific information,
+    not general information.**
+
+    Requires the BRAVE_API_KEY environment variable to be set.
 
     :param query: The search query.
-    :param num_results: The number of results to return.
-    :return: A JSON-formatted string containing the search results.
+    :param num_results: The desired number of results. This will be passed as the 'count'
+                        parameter to the Brave API.
+    :return: A JSON-formatted string containing the search results, or a JSON-formatted error
+             message if the API call fails or returns an error.
     """
+    api_key = getenv("BRAVE_API_KEY")
+    if not api_key:
+        print("Error: BRAVE_API_KEY environment variable not set.")
+        return json.dumps(
+            {"error": "BRAVE_API_KEY environment variable not set.", "results": []}
+        )
+
+    base_url = "https://api.search.brave.com/res/v1/web/search"
+
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",  # The requests library handles gzip decompression automatically
+        "X-Subscription-Token": api_key,
+    }
+
+    params = {
+        "q": query,
+        "count": num_results,  # Assuming 'count' is the parameter for number of results.
+        # Please verify with the Brave API "Query Parameters" documentation.
+    }
+
     try:
-        results = search.results(query, num_results=num_results)
-        return json.dumps(results)
-    except Exception as error:
-        print(error)
-        return json.dumps([])
+        response = requests.get(base_url, headers=headers, params=params)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+
+        # The API is expected to return JSON directly.
+        # We parse it to ensure it's valid JSON and then dump it back to string
+        # to match the original function's return type and behavior.
+        json_response_data = response.json()
+        return json.dumps(json_response_data)
+
+    except requests.exceptions.HTTPError as http_err:
+        error_message = f"HTTP error occurred: {http_err}"
+        details = {
+            "error": error_message,
+            "status_code": response.status_code,
+            "results": [],
+        }
+        try:
+            # Try to include Brave's error response if it's JSON
+            brave_error = response.json()
+            details["brave_api_error"] = brave_error
+        except json.JSONDecodeError:
+            details["brave_api_response_text"] = response.text
+        print(details)
+        return json.dumps(details)
+    except requests.exceptions.RequestException as req_err:
+        error_message = f"Request error occurred: {req_err}"
+        print(error_message)
+        return json.dumps({"error": error_message, "results": []})
+    except json.JSONDecodeError as json_err:
+        error_message = f"JSON decode error: {json_err}. Response text: {response.text if 'response' in locals() else 'N/A'}"
+        print(error_message)
+        return json.dumps({"error": error_message, "results": []})
+    except Exception as e:
+        error_message = f"An unexpected error occurred: {e}"
+        print(error_message)
+        return json.dumps({"error": error_message, "results": []})
 
 
 def exec_python(code, globals=None, locals=None):
@@ -200,7 +260,7 @@ def main():
     parser.add_argument("--merger", type=str, default="ai")
     args = parser.parse_args()
 
-    tool_llm = llm.bind_tools([web_search])  # , exec_python])
+    tool_llm = llm.bind_tools([brave_web_search])  # , exec_python])
     with tracer.start_as_current_span("agent run") as span:
         # Create the agent
         agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
@@ -210,7 +270,7 @@ def main():
             tracer_span=span,
             agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
                 # max_layers=args.max_layers,
-                search_tool=web_search,
+                search_tool=brave_web_search,
                 pre_task_executed=pre_tasks_executed,
                 on_task_executed=on_task_executed,
                 on_tool_call_executed=on_tool_call_executed,
@@ -220,7 +280,8 @@ def main():
                 allow_search=True,
                 allow_tools=False,
                 tools_dict={
-                    "web_search": web_search
+                    "web_search": brave_web_search,
+                    "brave_web_search": brave_web_search,
                 },  # "exec_python": exec_python, "exec": exec_python},
                 task_limits=TaskLimit.from_array(
                     eval(args.task_limit)
