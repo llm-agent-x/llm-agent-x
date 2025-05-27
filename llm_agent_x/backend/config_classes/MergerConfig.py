@@ -2,6 +2,7 @@
 from pydantic import BaseModel
 from typing import Any
 
+
 @dataclass
 class MergeChunk:
     text: str

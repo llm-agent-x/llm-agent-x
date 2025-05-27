@@ -1,7 +1,6 @@
 import uuid
 
 
-
 def int_to_base26(num):
     if num < 0:
         raise ValueError("Number must be non-negative")

@@ -14,6 +14,7 @@ import re
 import ast
 from typing import Callable, Any, Dict
 
+
 def is_valid_python(code):
     """
     Check if the provided string is valid Python code using the AST module.
@@ -23,6 +24,7 @@ def is_valid_python(code):
         return True
     except SyntaxError:
         return False
+
 
 def extract_valid_python_blocks(text):
     """
@@ -51,14 +53,21 @@ def extract_valid_python_blocks(text):
 
     return valid_code_blocks[::-1]  # Return results in original order
 
+
 class SequentialCodeAgentOptions(BaseModel):
     llm: BaseChatModel = None
 
+
 class IsDone(BaseModel):
-    is_complete: bool=Field(description="Whether or not the conversation history has enough context to answer the original user question, or if the original user task is complete")
+    is_complete: bool = Field(
+        description="Whether or not the conversation history has enough context to answer the original user question, or if the original user task is complete"
+    )
+
 
 class SequentialCodeAgent:
-    def __init__(self, options: SequentialCodeAgentOptions, execute:Callable[[str, Dict], Any]):
+    def __init__(
+        self, options: SequentialCodeAgentOptions, execute: Callable[[str, Dict], Any]
+    ):
         self.options = options
         self.llm = self.options.llm.bind(stop="```\n")
 
@@ -89,23 +98,25 @@ class SequentialCodeAgent:
     def reset_code_execution_namespace(self):
         self.code_execution_namespace.clear()
         self.code_execution_namespace.update(self.code_execution_starting_namespace)
-        
+
     def run(self, prompt):
-        self.msgs.append(HumanMessage(
-            f"USER: {prompt}\n\n"
-            f"If it helps you, this is the state of the global variables in the code execution namespace: \n\n"
-            f"{json.dumps(self.code_execution_namespace)}"
-            ))
+        self.msgs.append(
+            HumanMessage(
+                f"USER: {prompt}\n\n"
+                f"If it helps you, this is the state of the global variables in the code execution namespace: \n\n"
+                f"{json.dumps(self.code_execution_namespace)}"
+            )
+        )
 
         done = False
         while not done:
             c = self.llm.invoke(self.msgs).content
             response = AIMessage(f"{c}\n```")
             ic(c)
-            
+
             # Use extract_valid_python_blocks to extract all valid code blocks
             valid_blocks = extract_valid_python_blocks(c)
-            
+
             if not valid_blocks:
                 return c
 
@@ -116,23 +127,34 @@ class SequentialCodeAgent:
             self.execute(code_block, self.code_execution_namespace)
             result = self.code_execution_namespace.get("result", None)
             if result is None:
-                result = ValueError("Error executing code; This may be because the user didn't approve code execution, "
-                                    "because the system detected malicious code or denied code execution priveliges for "
-                                    "other reasons, or a catch-all code execution callback. "
-                                    "This could also be because the code didn't assign anything to the `result` variable. "
-                                    "This may or may not be normal behaviour. It is up to you to decide.")
+                result = ValueError(
+                    "Error executing code; This may be because the user didn't approve code execution, "
+                    "because the system detected malicious code or denied code execution priveliges for "
+                    "other reasons, or a catch-all code execution callback. "
+                    "This could also be because the code didn't assign anything to the `result` variable. "
+                    "This may or may not be normal behaviour. It is up to you to decide."
+                )
             ic(result)
 
-            self.msgs.append(ToolMessage(content=str(result), tool_call_id=f"run_python_snippet_{str(uuid.uuid4())}"))
-
+            self.msgs.append(
+                ToolMessage(
+                    content=str(result),
+                    tool_call_id=f"run_python_snippet_{str(uuid.uuid4())}",
+                )
+            )
 
             # Check if the task is complete
 
-            complete = self.continue_llm.invoke(self.msgs[1:] + [HumanMessage(
-                "Now, is this question sufficiently answered, or the task sufficiently completed? "
-                "Respond following this JSON schema:\n\n"
-                f"{IsDone.model_json_schema()}"
-            )])
+            complete = self.continue_llm.invoke(
+                self.msgs[1:]
+                + [
+                    HumanMessage(
+                        "Now, is this question sufficiently answered, or the task sufficiently completed? "
+                        "Respond following this JSON schema:\n\n"
+                        f"{IsDone.model_json_schema()}"
+                    )
+                ]
+            )
 
             done = complete.is_complete
 
