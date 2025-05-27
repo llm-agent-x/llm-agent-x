@@ -2,12 +2,13 @@ import json
 import uuid
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional, List
-from opentelemetry import trace
-
+from opentelemetry import trace, context as otel_context  # Modified import
 from pydantic import BaseModel, validator
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.output_parsers import JsonOutputParser
 from llm_agent_x.backend.mergers.LLMMerger import MergeOptions, LLMMerger
+from icecream import ic
+from llm_agent_x.complexity_model import TaskEvaluation, evaluate_prompt
 
 
 class TaskLimitConfig:
@@ -72,6 +73,7 @@ class task(TaskObject):
 class SplitTask(BaseModel):
     needs_subtasks: bool
     subtasks: list[TaskObject]
+    evaluation: Optional[TaskEvaluation]
 
     def __bool__(self):
         return self.needs_subtasks
@@ -203,25 +205,32 @@ class RecursiveAgent:
 
         return "\n".join(history)
 
+    # In class RecursiveAgent:
     def run(self):
         if self.tracer and self.tracer_span:
+            # Create an OpenTelemetry Context object where self.tracer_span is the active span.
+            # This makes self.tracer_span the parent of the new span created by start_as_current_span.
+            parent_otel_ctx = trace.set_span_in_context(self.tracer_span)
             with self.tracer.start_as_current_span(
-                "run", context=self.tracer_span.context
+                f"Execute Task: {self.task}",
+                context=parent_otel_ctx,  # Pass the OTEL Context object here
             ) as span:
+                self.current_span = span
                 span.add_event(
                     "Start", {"layer": self.current_layer, "task": self.task}
                 )
-                self._run(span=span)
+                return self._run(span=span)
         else:
-            self._run()
+            return self._run()
 
     def _run(self, span=None) -> str:
-        self.span.add_event(
-            "run",
-            {
-                "task": self.task,
-            },
-        )
+        if span:
+            span.add_event(
+                "run",
+                {
+                    "task": self.task,
+                },
+            )
         if self.options.pre_task_executed:
             self.options.pre_task_executed(
                 task=self.task,
@@ -247,13 +256,14 @@ class RecursiveAgent:
             if self.parent:
                 similarity = calculate_raw_similarity(self.task, self.parent.task)
                 if similarity >= self.options.similarity_threshold:
-                    print(
+                    self.current_span.add_event(
                         f"Task similarity with parent is high ({similarity:.2f}), executing as single task."
                     )
                     self.result = self._run_single_task()
                     return self.result
 
             self.tasks = self._split_task()
+            span.set_attribute("task", ic.format(self.tasks))
             if not self.tasks or not self.tasks["needs_subtasks"]:
                 break
 
@@ -346,6 +356,10 @@ class RecursiveAgent:
             ),
         ]
 
+        self.current_span.set_attribute(
+            "single_task_context", json.dumps(history, indent=0).replace("\n", " ")
+        )
+
         response = self.tool_llm.invoke(history)
         history.append(response)
 
@@ -404,11 +418,32 @@ class RecursiveAgent:
 
         split_msgs_hist = [SystemMessage(system_msg), HumanMessage(self.task)]
 
+        evaluation = evaluate_prompt(f"Prompt: {self.task}")
+        self.current_span.set_attribute(
+            "prompt_complexity", evaluation.prompt_complexity_score[0]
+        )
+        self.current_span.set_attribute(
+            "domain_knowledge", evaluation.domain_knowledge[0]
+        )
+        self.current_span.set_attribute(
+            "contextual_knowledge", evaluation.contextual_knowledge[0]
+        )
+        self.current_span.set_attribute("task_type", evaluation.task_type_1[0])
+        # ic(evaluation)
+        if (
+            evaluation.prompt_complexity_score[0] > 0.5
+            and evaluation.domain_knowledge[0] < 0.8
+        ):
+            split_task = SplitTask(
+                needs_subtasks=False, subtasks=[], evaluation=evaluation
+            )
+            return split_task
         response = self.llm.invoke(split_msgs_hist + [AIMessage("1. ")])
         split_msgs_hist.append(AIMessage(content="1. " + response.content))
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())
         structured_response = self.llm.invoke(split_msgs_hist)
         split_task = self.task_split_parser.invoke(structured_response)
+        split_task["evaluation"] = evaluation
         # ic(type(split_task))
         # Ensure we don't exceed the maximum number of subtasks
         try:

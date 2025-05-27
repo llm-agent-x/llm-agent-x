@@ -201,14 +201,15 @@ def main():
     args = parser.parse_args()
 
     tool_llm = llm.bind_tools([web_search])  # , exec_python])
-    with tracer.start_as_current_span("A") as span:
+    with tracer.start_as_current_span("agent run") as span:
         # Create the agent
         agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
             task=args.task,
             u_inst=args.u_inst,
+            tracer=tracer,
             tracer_span=span,
             agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
-                max_layers=args.max_layers,
+                # max_layers=args.max_layers,
                 search_tool=web_search,
                 pre_task_executed=pre_tasks_executed,
                 on_task_executed=on_task_executed,
