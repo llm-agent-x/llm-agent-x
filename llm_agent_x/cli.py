@@ -77,18 +77,11 @@ def render_flowchart():
 
 def brave_web_search(query: str, num_results: int) -> str:
     """
-    Perform a web search with the given query and number of results using the Brave Search API,
-    returning JSON-formatted results.
-    **Make sure to be very specific in your search phrase. Ask for specific information,
-    not general information.**
-
-    Requires the BRAVE_API_KEY environment variable to be set.
+    Perform a web search with the given query and number of results using the Brave Search API, returning JSON-formatted results. **Make sure to be very specific in your search phrase. Ask for specific information, not general information.**
 
     :param query: The search query.
-    :param num_results: The desired number of results. This will be passed as the 'count'
-                        parameter to the Brave API.
-    :return: A JSON-formatted string containing the search results, or a JSON-formatted error
-             message if the API call fails or returns an error.
+    :param num_results: The desired number of results. This will be passed as the 'count' parameter to the Brave API.
+    :return: A JSON-formatted string containing the search results, or a JSON-formatted error message if the API call fails or returns an error.
     """
     api_key = getenv("BRAVE_API_KEY")
     if not api_key:
@@ -113,6 +106,7 @@ def brave_web_search(query: str, num_results: int) -> str:
 
     try:
         response = requests.get(base_url, headers=headers, params=params)
+        time.sleep(1.5)
         response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
 
         # The API is expected to return JSON directly.

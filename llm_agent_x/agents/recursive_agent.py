@@ -364,166 +364,195 @@ class RecursiveAgent:
                     "response_tool_calls", current_llm_response.tool_calls
                 )
 
-                # Add the LLM's response (which might contain tool calls or be a final answer) to history
                 history.append(current_llm_response)
 
                 if not current_llm_response.tool_calls:
-                    # No tool calls, means LLM thinks it has the final answer
                     return current_llm_response.content
 
-                # If there are tool calls, process them
-                needs_llm_reprompt_after_batch = False
+                needs_llm_reprompt_after_this_batch = False
+                first_error_guiding_human_message_content = None
+                tool_messages_for_this_turn = []
 
                 for tool_call in current_llm_response.tool_calls:
                     tool_name = tool_call["name"]
                     tool_args = tool_call["args"]
                     tool_call_id = tool_call["id"]
 
-                    try:
-                        # Similarity check for search tools
-                        if tool_name in ["search", "web_search", "brave_web_search"]:
-                            if "query" in tool_args:
-                                query = tool_args["query"]
-                                # Assuming calculate_raw_similarity is available, e.g. self.calculate_raw_similarity
-                                similarity = calculate_raw_similarity(query, self.task)
+                    current_tool_output_payload: Any = None
+                    current_tool_human_message_guidance: Optional[str] = None
+                    tool_call_failed_for_reprompt_this_iteration = False
+                    tool_executed_successfully_this_iteration = False
 
-                                with self.tracer.start_as_current_span(
-                                    f"{tool_name} (Query Check)"
-                                ) as search_span:
-                                    search_span.set_attribute("query", query)
-                                    search_span.set_attribute(
-                                        "similarity_to_task", similarity
-                                    )
-                                    search_span.set_attribute(
-                                        "task_for_similarity", self.task
-                                    )
-
-                                # Adjust similarity threshold divisor as needed. 1.4 means threshold is ~71% of original.
-                                if similarity < self.options.similarity_threshold / 1.4:
-                                    error_message = (
-                                        f"The search query '{query}' is not sufficiently related to the overall task: '{self.task}'. "
-                                        f"Similarity score: {similarity:.2f}. "
-                                        f"Please regenerate a query that is more directly related to the task, "
-                                        f"or explain why this query is relevant if you believe it is."
-                                    )
-                                    history.append(
-                                        ToolMessage(
-                                            json.dumps(
-                                                {
-                                                    "error": "Query not related to task.",
-                                                    "details": error_message,
-                                                }
-                                            ),
-                                            tool_call_id=tool_call_id,
-                                        )
-                                    )
-                                    # Add a HumanMessage to guide the LLM for the next turn.
-                                    history.append(HumanMessage(error_message))
-
-                                    with self.tracer.start_as_current_span(
-                                        "Requesting Tool Call Regeneration"
-                                    ) as regenerate_span:
-                                        regenerate_span.set_attribute(
-                                            "original_query", query
-                                        )
-                                        regenerate_span.set_attribute(
-                                            "similarity", similarity
-                                        )
-                                        regenerate_span.set_attribute("task", self.task)
-
-                                    needs_llm_reprompt_after_batch = True
-                                    break  # Stop processing tool calls in this batch; go back to LLM for new plan.
-
-                        # If we reach here, the tool call is either not a search, or the search query is good.
-                        # Proceed to execute the tool.
-                        tool_to_execute = self.options.tools_dict[tool_name]
-                        tool_response_content = tool_to_execute(**tool_args)
-
-                        if self.options.on_tool_call_executed:
-                            self.options.on_tool_call_executed(
-                                task=self.task,
-                                uuid=self.uuid,
-                                tool_name=tool_name,
-                                tool_args=tool_args,
-                                tool_response=tool_response_content,
-                                success=True,
-                            )
-
-                        history.append(
-                            ToolMessage(
-                                json.dumps(tool_response_content),
-                                tool_call_id=tool_call_id,
-                            )
+                    if (
+                        needs_llm_reprompt_after_this_batch
+                    ):  # A previous tool in this batch already failed
+                        skipped_error_message = (
+                            f"Skipped execution of tool '{tool_name}' because a preceding "
+                            f"tool call in this batch resulted in an error requiring a plan revision."
                         )
-
-                    except KeyError:
-                        error_msg_str = f"Tool '{tool_name}' not found. Available tools are: {list(self.options.tools_dict.keys())}"
-                        error_payload_for_llm = {
-                            "error": "Tool not found",
-                            "details": error_msg_str,
+                        current_tool_output_payload = {
+                            "error": "Skipped due to prior error in batch.",
+                            "details": skipped_error_message,
                         }
-                        history.append(
-                            ToolMessage(
-                                json.dumps(error_payload_for_llm),
-                                tool_call_id=tool_call_id,
-                            )
-                        )
-                        history.append(
-                            HumanMessage(
+                        # tool_executed_successfully_this_iteration remains False
+                        # No specific human guidance for a skipped tool, the primary error's guidance is used.
+                    else:
+                        try:
+                            if tool_name in [
+                                "search",
+                                "web_search",
+                                "brave_web_search",
+                            ]:
+                                if "query" in tool_args:
+                                    query = tool_args["query"]
+                                    similarity = calculate_raw_similarity(
+                                        query, self.task
+                                    )
+                                    with self.tracer.start_as_current_span(
+                                        f"{tool_name} (Query Check)"
+                                    ) as search_span:
+                                        search_span.set_attribute("query", query)
+                                        search_span.set_attribute(
+                                            "similarity_to_task", similarity
+                                        )
+                                        search_span.set_attribute(
+                                            "task_for_similarity", self.task
+                                        )
+
+                                    if (
+                                        similarity
+                                        < self.options.similarity_threshold / 1.4
+                                    ):
+                                        error_detail = (
+                                            f"The search query '{query}' is not sufficiently related to the overall task: '{self.task}'. "
+                                            f"Similarity score: {similarity:.2f}. "
+                                            f"Please regenerate a query that is more directly related to the task, "
+                                            f"or explain why this query is relevant if you believe it is."
+                                        )
+                                        current_tool_output_payload = {
+                                            "error": "Query not related to task.",
+                                            "details": error_detail,
+                                        }
+                                        current_tool_human_message_guidance = (
+                                            error_detail
+                                        )
+                                        tool_call_failed_for_reprompt_this_iteration = (
+                                            True
+                                        )
+                                    else:  # Query is good
+                                        tool_to_execute = self.options.tools_dict[
+                                            tool_name
+                                        ]
+                                        current_tool_output_payload = tool_to_execute(
+                                            **tool_args
+                                        )
+                                        tool_executed_successfully_this_iteration = True
+                                else:  # "query" not in tool_args for search tool
+                                    error_detail = f"Search tool '{tool_name}' called without a 'query' argument. Please provide a query."
+                                    current_tool_output_payload = {
+                                        "error": "Missing query argument for search tool.",
+                                        "details": error_detail,
+                                    }
+                                    current_tool_human_message_guidance = error_detail
+                                    tool_call_failed_for_reprompt_this_iteration = True
+                            else:  # Not a search tool
+                                tool_to_execute = self.options.tools_dict[tool_name]
+                                current_tool_output_payload = tool_to_execute(
+                                    **tool_args
+                                )
+                                tool_executed_successfully_this_iteration = True
+                        except KeyError:
+                            error_msg_str = f"Tool '{tool_name}' not found. Available tools are: {list(self.options.tools_dict.keys())}"
+                            current_tool_output_payload = {
+                                "error": "Tool not found",
+                                "details": error_msg_str,
+                            }
+                            current_tool_human_message_guidance = (
                                 f"You attempted to use a tool named '{tool_name}' which is not available. "
                                 f"Please choose from the available tools: {list(self.options.tools_dict.keys())} or re-evaluate your approach."
                             )
-                        )
-                        if self.options.on_tool_call_executed:
-                            self.options.on_tool_call_executed(
-                                task=self.task,
-                                uuid=self.uuid,
-                                tool_name=tool_name,
-                                tool_args=tool_args,  # Args LLM tried to use
-                                tool_response=error_payload_for_llm,  # Pass the error dict
-                                success=False,
-                            )
-                        needs_llm_reprompt_after_batch = True
-                        break
-
-                    except Exception as e:
-                        # General exception during tool execution
-                        error_msg_str = f"Error executing tool {tool_name} with args {tool_args}: {str(e)}"
-                        error_payload_for_llm = {
-                            "error": "Tool execution failed",
-                            "details": error_msg_str,
-                        }
-                        # Log exception with tracer if possible
-                        span.record_exception(e)
-                        history.append(
-                            ToolMessage(
-                                json.dumps(error_payload_for_llm),
-                                tool_call_id=tool_call_id,
-                            )
-                        )
-                        history.append(
-                            HumanMessage(
+                            tool_call_failed_for_reprompt_this_iteration = True
+                        except Exception as e:
+                            error_msg_str = f"Error executing tool {tool_name} with args {tool_args}: {str(e)}"
+                            current_tool_output_payload = {
+                                "error": "Tool execution failed",
+                                "details": error_msg_str,
+                            }
+                            span.record_exception(e)
+                            current_tool_human_message_guidance = (
                                 f"An error occurred while executing the tool '{tool_name}': {str(e)}. "
                                 f"The arguments were: {tool_args}. "
                                 f"Please check the arguments, try a different approach, or ask for clarification if needed."
                             )
-                        )
-                        if self.options.on_tool_call_executed:
-                            self.options.on_tool_call_executed(
-                                task=self.task,
-                                uuid=self.uuid,
-                                tool_name=tool_name,
-                                tool_args=tool_args,
-                                tool_response=error_payload_for_llm,  # Pass the error dict
-                                success=False,
-                            )
-                        needs_llm_reprompt_after_batch = True
-                        break
+                            tool_call_failed_for_reprompt_this_iteration = True
 
-                if needs_llm_reprompt_after_batch:
-                    # If any tool call processing indicated a need to re-prompt the LLM,
-                    # continue to the next iteration of the `while True` loop.
-                    # This will re-invoke `self.tool_llm.invoke(history)` with the new error messages in history.
+                    # Attempt to serialize the payload for the ToolMessage
+                    tool_message_content_final_str: str
+                    try:
+                        tool_message_content_final_str = json.dumps(
+                            current_tool_output_payload
+                        )
+                    except TypeError as serialization_error:
+                        span.record_exception(serialization_error)
+                        error_detail_serialization = f"Tool '{tool_name}' output could not be serialized to JSON: {serialization_error}. Original output was: {str(current_tool_output_payload)[:200]}"
+                        current_tool_output_payload = {
+                            "error": "Tool output serialization error",
+                            "details": error_detail_serialization,
+                        }
+                        tool_message_content_final_str = json.dumps(
+                            current_tool_output_payload
+                        )  # Should be safe now
+
+                        tool_executed_successfully_this_iteration = False  # Serialization failure means tool call effectively failed
+                        if (
+                            not tool_call_failed_for_reprompt_this_iteration
+                        ):  # If not already failing for a primary reason
+                            current_tool_human_message_guidance = f"Tool '{tool_name}' produced data that could not be processed due to a serialization issue. Please check the tool's output format or try a different approach."
+                            tool_call_failed_for_reprompt_this_iteration = True
+
+                    # Call on_tool_call_executed once with the final status and payload
+                    if self.options.on_tool_call_executed:
+                        self.options.on_tool_call_executed(
+                            task=self.task,
+                            uuid=self.uuid,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            tool_response=current_tool_output_payload,
+                            success=tool_executed_successfully_this_iteration,
+                        )
+
+                    tool_messages_for_this_turn.append(
+                        ToolMessage(
+                            content=tool_message_content_final_str,
+                            tool_call_id=tool_call_id,
+                        )
+                    )
+
+                    if (
+                        tool_call_failed_for_reprompt_this_iteration
+                        and not needs_llm_reprompt_after_this_batch
+                    ):
+                        needs_llm_reprompt_after_this_batch = True
+                        first_error_guiding_human_message_content = (
+                            current_tool_human_message_guidance
+                        )
+
+                history.extend(tool_messages_for_this_turn)
+
+                if needs_llm_reprompt_after_this_batch:
+                    if first_error_guiding_human_message_content:
+                        history.append(
+                            HumanMessage(
+                                content=first_error_guiding_human_message_content
+                            )
+                        )
+                    else:
+                        # Fallback if somehow a reprompt was triggered without specific guidance
+                        history.append(
+                            HumanMessage(
+                                content="An error occurred with one or more tool calls, or their output was invalid. Please review the tool responses and adjust your plan."
+                            )
+                        )
                     continue
 
     def _split_task(self) -> SplitTask:
