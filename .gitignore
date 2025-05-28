@@ -6,3 +6,4 @@ output/*
 *.pyc
 .idea/*
 dist/
+llm_agent_x.log

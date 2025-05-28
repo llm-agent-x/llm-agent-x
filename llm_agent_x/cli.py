@@ -36,14 +36,15 @@ trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 load_dotenv(
     ".env", override=True
 )  # This might need adjustment if .env is not in the right place relative to cli.py
-# Initialize Console and Live Display
+# Initialize Console
 console = Console()
-live = None  #  display manager
-task_tree = Tree("Agent Execution")  # Root of the real-time task tree
-task_nodes = {}  # Store references to tree nodes
+live = None  #  display manager, will be initialized conditionally
+task_tree = Tree(
+    "Agent Execution"
+)  # Root of the real-time task tree, used if live display is active
+task_nodes = {}  # Store references to tree nodes, used if live display is active
 
 # Initialize LLM and Search
-
 llm = ChatOpenAI(
     base_url=getenv("OPENAI_BASE_URL"),
     api_key=getenv("OPENAI_API_KEY"),
@@ -85,7 +86,7 @@ def brave_web_search(query: str, num_results: int) -> str:
     """
     api_key = getenv("BRAVE_API_KEY")
     if not api_key:
-        print("Error: BRAVE_API_KEY environment variable not set.")
+        # console.print("[red]Error: BRAVE_API_KEY environment variable not set.[/red]") # Using console for error output
         return json.dumps(
             {"error": "BRAVE_API_KEY environment variable not set.", "results": []}
         )
@@ -94,24 +95,20 @@ def brave_web_search(query: str, num_results: int) -> str:
 
     headers = {
         "Accept": "application/json",
-        "Accept-Encoding": "gzip",  # The requests library handles gzip decompression automatically
+        "Accept-Encoding": "gzip",
         "X-Subscription-Token": api_key,
     }
 
     params = {
         "q": query,
-        "count": num_results,  # Assuming 'count' is the parameter for number of results.
-        # Please verify with the Brave API "Query Parameters" documentation.
+        "count": num_results,
     }
 
     try:
         response = requests.get(base_url, headers=headers, params=params)
         time.sleep(1.5)
-        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+        response.raise_for_status()
 
-        # The API is expected to return JSON directly.
-        # We parse it to ensure it's valid JSON and then dump it back to string
-        # to match the original function's return type and behavior.
         json_response_data = response.json()
         return json.dumps(json_response_data)
 
@@ -123,24 +120,23 @@ def brave_web_search(query: str, num_results: int) -> str:
             "results": [],
         }
         try:
-            # Try to include Brave's error response if it's JSON
             brave_error = response.json()
             details["brave_api_error"] = brave_error
         except json.JSONDecodeError:
             details["brave_api_response_text"] = response.text
-        print(details)
+        # console.print(details, style="red")
         return json.dumps(details)
     except requests.exceptions.RequestException as req_err:
         error_message = f"Request error occurred: {req_err}"
-        print(error_message)
+        # console.print(error_message, style="red")
         return json.dumps({"error": error_message, "results": []})
     except json.JSONDecodeError as json_err:
         error_message = f"JSON decode error: {json_err}. Response text: {response.text if 'response' in locals() else 'N/A'}"
-        print(error_message)
+        # console.print(error_message, style="red")
         return json.dumps({"error": error_message, "results": []})
     except Exception as e:
         error_message = f"An unexpected error occurred: {e}"
-        print(error_message)
+        # console.print(error_message, style="red")
         return json.dumps({"error": error_message, "results": []})
 
 
@@ -164,53 +160,63 @@ def exec_python(code, globals=None, locals=None):
 
 
 def pre_tasks_executed(task, uuid, parent_agent_uuid):
-
     id = get_or_set_task_id(uuid)
     parent_id = (
         get_or_set_task_id(parent_agent_uuid) if parent_agent_uuid is not None else None
     )
 
-    # Flowchart Update
+    # Flowchart Update (always runs)
     if parent_agent_uuid is not None:
         add_to_flowchart(f"{parent_id} -->|Subtask| {id}[{task}]")
     else:
         add_to_flowchart(f"{id}[{task}]")
 
-    # Real-time Hierarchy Update
-    task_text = Text(task, style="bold yellow")
-    if parent_agent_uuid is None:
-        task_nodes[uuid] = task_tree.add(task_text)  # Top-level task
-    else:
-        task_nodes[uuid] = task_nodes[parent_agent_uuid].add(task_text)  # Subtask
-
+    # Real-time Hierarchy Update (conditional on live display being active)
     if live:
+        task_text = Text(task, style="bold yellow")
+        if parent_agent_uuid is None:
+            task_nodes[uuid] = task_tree.add(task_text)  # Top-level task
+        elif parent_agent_uuid in task_nodes:  # Check if parent node exists
+            task_nodes[uuid] = task_nodes[parent_agent_uuid].add(task_text)  # Subtask
+        else:
+            # This case should ideally not happen if tasks are processed in order.
+            # Adding as a direct child of the root tree if parent is missing for some reason.
+            console.print(
+                f"[yellow]Warning: Parent node {parent_agent_uuid} for task '{task}' not found in tree. Adding as top-level.[/yellow]"
+            )
+            task_nodes[uuid] = task_tree.add(task_text)
+
         live.update(task_tree)
 
 
 def on_task_executed(task, uuid, response, parent_agent_uuid):
-
     id = get_or_set_task_id(uuid)
     parent_id = (
         get_or_set_task_id(parent_agent_uuid) if parent_agent_uuid is not None else None
     )
 
-    # Flowchart Update
+    # Flowchart Update (always runs)
     if parent_agent_uuid is not None:
         add_to_flowchart(f"{id} -->|Completed| {parent_id}")
     add_to_flowchart(f'{id} --> |Result| ("`{response}`")')
-    # Real-time Hierarchy Update
-    if uuid in task_nodes:
-        task_nodes[uuid].label = Text(f"{task} ✅", style="green")
 
+    # Real-time Hierarchy Update (conditional on live display being active)
     if live:
+        if uuid in task_nodes:
+            task_nodes[uuid].label = Text(f"{task} ✅", style="green")
+        else:
+            console.print(
+                f"[yellow]Warning: Task node {uuid} for task '{task}' not found in tree for completion update.[/yellow]"
+            )
         live.update(task_tree)
 
 
 def on_tool_call_executed(
     task, uuid, tool_name, tool_args, tool_response, success=True
 ):
+    tool_task_id = f"{uuid}: {tool_name}"  # Unique ID for the tool call visualization
 
-    tool_task_id = f"{uuid}: {tool_name}"
+    # Flowchart Update (always runs)
     add_to_flowchart(
         f"{get_or_set_task_id(uuid)} -->|Tool call| {get_or_set_task_id(tool_task_id)}[{tool_name}]"
     )
@@ -218,27 +224,45 @@ def on_tool_call_executed(
         f"{get_or_set_task_id(tool_task_id)} --> {get_or_set_task_id(uuid)}"
     )
 
-    text_json = json.dumps(tool_args, indent=0).replace("\\n", "")
-    # Real-time Hierarchy Update
-    tool_text = Text(f"{tool_name} 🔧 {text_json}", style="blue")
-    if not success:
-        tool_text.stylize("bold red")
-        task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
-        task_nodes[tool_task_id].label = Text(f"{tool_name} ❌", style="red")
-    else:
-        task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
-
+    # Real-time Hierarchy Update (conditional on live display being active)
     if live:
+        text_json = json.dumps(tool_args, indent=0).replace("\\n", "")
+        tool_text = Text(f"{tool_name} 🔧 {text_json}", style="blue")
+
+        if uuid in task_nodes:  # Check if parent task node exists
+            if not success:
+                tool_text.stylize("bold red")
+                # Create a new node for the tool call itself, even if it failed
+                tool_node = task_nodes[uuid].add(tool_text)
+                tool_node.label = Text(
+                    f"{tool_name} ❌", style="red"
+                )  # Update its label to show failure
+                task_nodes[tool_task_id] = (
+                    tool_node  # Store reference if needed elsewhere, though not strictly necessary for this structure
+                )
+            else:
+                task_nodes[tool_task_id] = task_nodes[uuid].add(tool_text)
+        else:
+            console.print(
+                f"[yellow]Warning: Parent task node {uuid} for tool '{tool_name}' not found in tree.[/yellow]"
+            )
+
         live.update(task_tree)
 
 
 def main():
-    # Ensure 'live' can be assigned in this function
+    global live  # Allow assignment to the global 'live' variable
+
     parser = argparse.ArgumentParser(description="Run the LLM agent.")
     parser.add_argument("task", type=str, help="The task to execute.")
-    parser.add_argument("--u_inst", type=str, help="The task to execute.", default="")
     parser.add_argument(
-        "--max_layers", type=int, default=3, help="The maximum number of layers."
+        "--u_inst", type=str, help="User instructions for the task.", default=""
+    )
+    parser.add_argument(
+        "--max_layers",
+        type=int,
+        default=3,
+        help="The maximum number of layers (deprecated, use task_limit).",
     )
     parser.add_argument(
         "--output", type=str, default="output.md", help="The output file path"
@@ -246,24 +270,49 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=getenv("DEFAULT_LLM"),
+        default=getenv(
+            "DEFAULT_LLM", "gpt-4o-mini"
+        ),  # Ensure default matches initialization
         help="The name of the LLM to use",
     )
-    parser.add_argument("--task_limit", type=str, default="[3,2,2,0]")
+    parser.add_argument(
+        "--task_limit",
+        type=str,
+        default="[3,2,2,0]",
+        help="Task limits per layer as a Python list string e.g., '[3,2,2,0]'",
+    )
+    parser.add_argument(
+        "--merger",
+        type=str,
+        default="ai",
+        choices=["ai", "append"],
+        help="Merger type: 'ai' or 'append'.",
+    )
+    parser.add_argument(
+        "--no-tree", action="store_true", help="Disable the real-time tree view."
+    )
 
-    parser.add_argument("--merger", type=str, default="ai")
     args = parser.parse_args()
 
+    # Update LLM if model argument is different from default used for global llm
+    global llm  # Allow modification of global llm
+    if args.model != getenv("DEFAULT_LLM", "gpt-4o-mini"):
+        llm = ChatOpenAI(
+            base_url=getenv("OPENAI_BASE_URL"),
+            api_key=getenv("OPENAI_API_KEY"),
+            model=args.model,
+            temperature=0.5,
+        )
+
     tool_llm = llm.bind_tools([brave_web_search])  # , exec_python])
+
     with tracer.start_as_current_span("agent run") as span:
-        # Create the agent
-        agent = RecursiveAgent(  # Adjusted: Removed llm_agent_x prefix
+        agent = RecursiveAgent(
             task=args.task,
             u_inst=args.u_inst,
             tracer=tracer,
             tracer_span=span,
-            agent_options=RecursiveAgentOptions(  # Adjusted: Removed llm_agent_x prefix
-                # max_layers=args.max_layers,
+            agent_options=RecursiveAgentOptions(
                 search_tool=brave_web_search,
                 pre_task_executed=pre_tasks_executed,
                 on_task_executed=on_task_executed,
@@ -272,32 +321,49 @@ def main():
                 tool_llm=tool_llm,
                 tools=[],
                 allow_search=True,
-                allow_tools=False,
+                allow_tools=False,  # Set to True if you want tools like exec_python to be considered by the agent's planning
                 tools_dict={
                     "web_search": brave_web_search,
                     "brave_web_search": brave_web_search,
-                },  # "exec_python": exec_python, "exec": exec_python},
-                task_limits=TaskLimit.from_array(
-                    eval(args.task_limit)
-                ),  # Adjusted: Removed llm_agent_x prefix
+                    # "exec_python": exec_python, "exec": exec_python # Uncomment if exec_python is to be used
+                },
+                task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
             ),
         )
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Start Live Display
-        with Live(task_tree, console=console, auto_refresh=True) as live_display:
-            live = live_display  # Assign to global variable
-            response = agent.run()  # Execute the agent
+        response = ""
+        if not args.no_tree:
+            console.print("Starting agent with real-time tree view...")
+            with Live(
+                task_tree,
+                console=console,
+                auto_refresh=True,
+                vertical_overflow="visible",
+            ) as live_display:
+                live = live_display  # Assign to global variable for callbacks
+                response = agent.run()  # Execute the agent
+            live = None  # Clear live display manager after use
+        else:
+            console.print("Starting agent without real-time tree view...")
+            # 'live' remains None, callbacks will skip tree updates
+            response = agent.run()
 
         # Save Flowchart
-        with (output_dir / "flowchart.mmd").open("w") as flowchart_o:
+        flowchart_file = output_dir / "flowchart.mmd"
+        with flowchart_file.open("w") as flowchart_o:
             flowchart_o.write(render_flowchart())
+        console.print(f"Flowchart saved to {flowchart_file}")
 
         # Save Response
-        with (output_dir / args.output).open("w") as output:
-            output.write(response)
+        output_file = output_dir / args.output
+        with output_file.open("w") as output_f:
+            output_f.write(response)
+        console.print(f"Agent response saved to {output_file}")
+        console.print("\nFinal Response:\n", style="bold green")
+        console.print(response)
 
 
 if __name__ == "__main__":
