@@ -85,7 +85,7 @@ class task(TaskObject):
 class SplitTask(BaseModel):
     needs_subtasks: bool
     subtasks: list[TaskObject]
-    evaluation: Optional[TaskEvaluation]
+    evaluation: Optional[TaskEvaluation] = None  # Set default to None
 
     def __bool__(self):
         return self.needs_subtasks
