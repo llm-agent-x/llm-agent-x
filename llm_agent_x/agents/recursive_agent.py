@@ -3,9 +3,12 @@ import uuid
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional, List
 from opentelemetry import trace, context as otel_context  # Modified import
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, ValidationError
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.exceptions import (
+    OutputParserException,
+)  # Import for specific exception handling
 from llm_agent_x.backend.mergers.LLMMerger import MergeOptions, LLMMerger
 from icecream import ic
 from llm_agent_x.complexity_model import TaskEvaluation, evaluate_prompt
@@ -78,7 +81,7 @@ class TaskObject(BaseModel):
     allow_tools: bool
 
 
-class task(TaskObject):
+class task(TaskObject):  # pylint: disable=invalid-name
     uuid: str
 
 
@@ -106,7 +109,9 @@ class RecursiveAgentOptions(BaseModel):
     search_tool: Any = None
     pre_task_executed: Any = None
     on_task_executed: Any = None
-    on_tool_call_executed: Any = None
+    on_tool_call_executed: Any = (
+        None  # Expects: (task, uuid, tool_name, tool_args, tool_response, success, tool_call_id)
+    )
     task_tree: list[Any] = []
     llm: Any = None
     tool_llm: Any = None
@@ -137,7 +142,7 @@ class RecursiveAgent:
         u_inst: str,
         tracer: trace.Tracer = None,
         tracer_span: trace.Span = None,
-        uuid: str = str(uuid.uuid4()),
+        uuid: str = str(uuid.uuid4()),  # pylint: disable=redefined-outer-name
         agent_options: RecursiveAgentOptions = None,
         allow_subtasks: bool = True,
         current_layer: int = 0,
@@ -195,9 +200,9 @@ class RecursiveAgent:
         # Get sibling contexts
         sibling_contexts = []
         for sibling in self.siblings:
-            if sibling.result and sibling != self:
+            if sibling.result and sibling != self:  # type: ignore
                 sibling_contexts.append(
-                    {"task": sibling.task, "result": sibling.result}
+                    {"task": sibling.task, "result": sibling.result}  # type: ignore
                 )
 
         context_info = {
@@ -236,12 +241,10 @@ class RecursiveAgent:
         self.logger.info(f"Starting run for task: '{self.task}'")
         if self.tracer and self.tracer_span:
             self.logger.debug("Tracer and tracer_span available, creating new span.")
-            # Create an OpenTelemetry Context object where self.tracer_span is the active span.
-            # This makes self.tracer_span the parent of the new span created by start_as_current_span.
             parent_otel_ctx = trace.set_span_in_context(self.tracer_span)
             with self.tracer.start_as_current_span(
                 f"Execute Task: {self.task}",
-                context=parent_otel_ctx,  # Pass the OTEL Context object here
+                context=parent_otel_ctx,
             ) as span:
                 self.current_span = span
                 self.logger.debug(f"Span created: {span.get_span_context().span_id}")
@@ -285,9 +288,8 @@ class RecursiveAgent:
             self.logger.info(
                 f"Max subtasks is 0 for layer {self.current_layer}. Executing as single task."
             )
-            # If no subtasks allowed at this layer, execute as single task
-            self.result = self._run_single_task()
-            self.context.result = self.result  # Store result in context
+            self.result = self._run_single_task(span=span)
+            self.context.result = self.result
             if self.options.on_task_executed:
                 self.logger.debug(
                     "Executing on_task_executed callback for single task."
@@ -318,21 +320,17 @@ class RecursiveAgent:
                         self.current_span.add_event(
                             f"Task similarity with parent is high ({similarity:.2f}), executing as single task."
                         )
-                    self.result = self._run_single_task()
-                    self.context.result = self.result  # Store result in context
+                    self.result = self._run_single_task(span=span)
+                    self.context.result = self.result
                     self.logger.info(
                         f"_run finished for high-similarity task '{self.task}'. Result: {str(self.result)[:100]}..."
                     )
                     return self.result
 
             self.logger.debug("Splitting task.")
-            split_task_result = (
-                self._split_task()
-            )  # Renamed from self.tasks to avoid confusion
+            split_task_result = self._split_task()
             if span:
-                span.set_attribute(
-                    "task_split_result", ic.format(split_task_result)
-                )  # Changed from self.tasks
+                span.set_attribute("task_split_result", ic.format(split_task_result))
 
             if not split_task_result or not split_task_result.needs_subtasks:
                 self.logger.info(
@@ -340,52 +338,47 @@ class RecursiveAgent:
                 )
                 break
 
-            # Limit number of subtasks based on configuration
             limited_subtasks = split_task_result.subtasks[:max_subtasks]
             self.logger.info(
                 f"Limited subtasks to {len(limited_subtasks)} based on max_subtasks={max_subtasks}."
             )
 
-            # Create child agents with shared context
-            child_agents = []
-            for (
-                subtask_obj
-            ) in limited_subtasks:  # Iterate over subtask objects from SplitTask
+            child_agents: List[RecursiveAgent] = []
+            for subtask_obj in limited_subtasks:
                 self.logger.info(
                     f"Creating child agent for subtask: '{subtask_obj.task}'"
                 )
                 child_context = TaskContext(
                     task=subtask_obj.task, parent_context=self.context
                 )
+                # Determine subtask_uuid
+                subtask_uuid_val = getattr(subtask_obj, "uuid", str(uuid.uuid4()))
 
                 child_agent = RecursiveAgent(
-                    task=subtask_obj.task,  # Use task from subtask_obj
+                    task=subtask_obj.task,
                     u_inst=self.u_inst,
                     tracer=self.tracer,
-                    tracer_span=span,  # Use current span as parent for child's span
-                    uuid=str(
-                        uuid.uuid4()
-                    ),  # Generate new UUID for subtask or use subtask_obj.uuid if it exists
+                    tracer_span=span,  # Use current task's span as parent for child's span
+                    uuid=subtask_uuid_val,
                     agent_options=self.options,
-                    allow_subtasks=True,  # Or determine based on subtask_obj if applicable
+                    allow_subtasks=True,  # Child tasks can be further split by default
                     current_layer=self.current_layer + 1,
                     parent=self,
                     context=child_context,
-                    siblings=child_agents,  # Pass currently created child_agents as siblings
+                    siblings=child_agents,  # Pass currently created children as siblings to next child
                 )
                 child_agents.append(child_agent)
 
-            # Run all child agents and collect results
             subtask_results = []
             subtask_tasks_for_summary = []
             self.logger.info(f"Running {len(child_agents)} child agents.")
             for child_agent in child_agents:
                 self.logger.debug(f"Running child agent for task: '{child_agent.task}'")
-                result = child_agent.run()
+                result = (
+                    child_agent.run()
+                )  # This will create its own span as a child of 'span'
                 child_agent.result = result
-                child_agent.context.result = (
-                    result  # Ensure child context also gets the result
-                )
+                child_agent.context.result = result
                 subtask_results.append(result)
                 subtask_tasks_for_summary.append(child_agent.task)
                 self.logger.debug(
@@ -394,9 +387,9 @@ class RecursiveAgent:
 
             self.logger.info("Summarizing subtask results.")
             self.result = self._summarize_subtask_results(
-                subtask_tasks_for_summary, subtask_results  # Use collected tasks
+                subtask_tasks_for_summary, subtask_results
             )
-            self.context.result = self.result  # Store result in context
+            self.context.result = self.result
 
             if self.options.on_task_executed:
                 self.logger.debug("Executing on_task_executed callback after subtasks.")
@@ -414,8 +407,8 @@ class RecursiveAgent:
         self.logger.info(
             "Exited subtask loop or subtasks not allowed. Executing as single task."
         )
-        self.result = self._run_single_task()
-        self.context.result = self.result  # Store result in context
+        self.result = self._run_single_task(span=span)
+        self.context.result = self.result
         if self.options.on_task_executed:
             self.logger.debug(
                 "Executing on_task_executed callback for final single task execution."
@@ -431,7 +424,7 @@ class RecursiveAgent:
         )
         return self.result
 
-    def _run_single_task(self) -> str:
+    def _run_single_task(self, span: Optional[trace.Span] = None) -> str:
         self.logger.info(f"Running single task: '{self.task}'")
         context_info = self._build_context_information()
 
@@ -467,12 +460,17 @@ class RecursiveAgent:
         # Ensure self.tracer is valid before using it
         tracer_to_use = self.tracer if self.tracer else trace.get_tracer(__name__)
 
-        with tracer_to_use.start_as_current_span(
-            "Single Task Execution"
-        ) as span:  # Ensure span is always created
-            span.set_attribute("task", self.task)
+        # Use the passed span as parent context for the single task execution span
+        parent_otel_ctx_for_single_task = (
+            trace.set_span_in_context(span) if span else otel_context.get_current()
+        )
 
-            while True:  # Loop for multi-turn interaction
+        with tracer_to_use.start_as_current_span(
+            "Single Task LLM Interaction", context=parent_otel_ctx_for_single_task
+        ) as interaction_span:
+            interaction_span.set_attribute("task", self.task)
+
+            while True:
                 self.logger.info("Invoking tool_llm for single task.")
                 current_llm_response = self.tool_llm.invoke(history)
                 self.logger.debug(
@@ -482,14 +480,15 @@ class RecursiveAgent:
                     f"LLM response tool calls: {current_llm_response.tool_calls}"
                 )
 
-                span.set_attribute("response_content", current_llm_response.content)
-                span.set_attribute(
-                    "response_tool_calls",
-                    (
-                        json.dumps(current_llm_response.tool_calls)
-                        if current_llm_response.tool_calls
-                        else "None"
-                    ),
+                interaction_span.add_event(
+                    "LLM Invoked",
+                    {
+                        "history_length": len(history),
+                        "response_content_preview": str(current_llm_response.content)[
+                            :100
+                        ],
+                        "tool_calls_count": len(current_llm_response.tool_calls or []),
+                    },
                 )
 
                 history.append(current_llm_response)
@@ -498,11 +497,14 @@ class RecursiveAgent:
                     self.logger.info(
                         "No tool calls in LLM response. Returning content."
                     )
+                    interaction_span.set_attribute(
+                        "final_result_preview", str(current_llm_response.content)[:100]
+                    )
                     return current_llm_response.content
 
-                needs_llm_reprompt_after_this_batch = False
-                first_error_guiding_human_message_content = None
                 tool_messages_for_this_turn = []
+                guidance_for_llm_reprompt = []
+                any_tool_requires_llm_replan = False
 
                 self.logger.debug(
                     f"Processing {len(current_llm_response.tool_calls)} tool calls."
@@ -512,244 +514,279 @@ class RecursiveAgent:
                     tool_args = tool_call["args"]
                     tool_call_id = tool_call["id"]
                     self.logger.info(
-                        f"Processing tool call: {tool_name} with args: {tool_args}"
+                        f"Processing tool call: {tool_name} with args: {tool_args}, ID: {tool_call_id}"
                     )
 
                     current_tool_output_payload: Any = None
-                    current_tool_human_message_guidance: Optional[str] = None
-                    tool_call_failed_for_reprompt_this_iteration = False
                     tool_executed_successfully_this_iteration = False
+                    this_tool_call_needs_llm_replan = False
+                    human_message_for_this_tool_failure: Optional[str] = None
 
-                    if (
-                        needs_llm_reprompt_after_this_batch
-                    ):  # A previous tool in this batch already failed
-                        skipped_error_message = (
-                            f"Skipped execution of tool '{tool_name}' because a preceding "
-                            f"tool call in this batch resulted in an error requiring a plan revision."
+                    with tracer_to_use.start_as_current_span(
+                        f"Tool Call: {tool_name}",
+                        context=trace.set_span_in_context(interaction_span),
+                    ) as tool_span:
+                        tool_span.set_attributes(
+                            {
+                                "tool.name": tool_name,
+                                "tool.args": json.dumps(tool_args),
+                                "tool.call_id": tool_call_id,
+                            }
                         )
-                        self.logger.warning(skipped_error_message)
-                        current_tool_output_payload = {
-                            "error": "Skipped due to prior error in batch.",
-                            "details": skipped_error_message,
-                        }
-                    else:
+
                         try:
+                            if tool_name not in self.options.tools_dict:
+                                raise KeyError(f"Tool '{tool_name}' not found.")
+
+                            tool_to_execute = self.options.tools_dict[tool_name]
+
                             if tool_name in [
                                 "search",
                                 "web_search",
                                 "brave_web_search",
                             ]:
-                                self.logger.debug(
-                                    f"Tool '{tool_name}' is a search tool."
-                                )
-                                if "query" in tool_args:
+                                if "query" not in tool_args:
+                                    error_detail = f"Search tool '{tool_name}' (ID: {tool_call_id}) called without a 'query' argument. Please provide a query."
+                                    self.logger.error(error_detail)
+                                    current_tool_output_payload = {
+                                        "error": "Missing query argument",
+                                        "details": error_detail,
+                                    }
+                                    human_message_for_this_tool_failure = error_detail
+                                    this_tool_call_needs_llm_replan = True
+                                    tool_span.set_attribute(
+                                        "tool.error", "Missing query argument"
+                                    )
+                                else:
                                     query = tool_args["query"]
                                     similarity = calculate_raw_similarity(
                                         query, self.task
                                     )
-                                    self.logger.debug(
-                                        f"Search query: '{query}', similarity to task '{self.task}': {similarity:.2f}"
+                                    tool_span.set_attributes(
+                                        {
+                                            "search.query": query,
+                                            "search.similarity_to_task": similarity,
+                                        }
                                     )
-                                    with tracer_to_use.start_as_current_span(
-                                        f"{tool_name} (Query Check)"
-                                    ) as search_span:
-                                        search_span.set_attribute("query", query)
-                                        search_span.set_attribute(
-                                            "similarity_to_task", similarity
-                                        )
-                                        search_span.set_attribute(
-                                            "task_for_similarity", self.task
-                                        )
+                                    self.logger.debug(
+                                        f"Search query: '{query}', similarity to task '{self.task}': {similarity:.2f} for tool_call_id {tool_call_id}"
+                                    )
 
-                                    if (
-                                        similarity
-                                        < self.options.similarity_threshold / 1.4
+                                    if similarity < (
+                                        self.options.similarity_threshold / 5
                                     ):
                                         error_detail = (
-                                            f"The search query '{query}' is not sufficiently related to the overall task: '{self.task}'. "
+                                            f"The search query '{query}' for tool '{tool_name}' (ID: {tool_call_id}) is not sufficiently related to the overall task: '{self.task}'. "
                                             f"Similarity score: {similarity:.2f}. "
-                                            f"Please regenerate a query that is more directly related to the task, "
-                                            f"or explain why this query is relevant if you believe it is."
+                                            f"Please regenerate this specific query to be more semantically similar to the task, "
+                                            f"or explain why this query is relevant. Other tool calls in this batch (if any) are being processed independently."
                                         )
                                         self.logger.warning(
-                                            f"Search query not related: {error_detail}"
+                                            f"Search query needs revision for ID {tool_call_id}: {error_detail}"
                                         )
                                         current_tool_output_payload = {
-                                            "error": "Query not related to task.",
-                                            "details": error_detail,
+                                            "error": "Query needs revision due to low similarity.",
+                                            "tool_call_id": tool_call_id,
+                                            "query_provided": query,
+                                            "task_context": self.task,
+                                            "similarity_score": f"{similarity:.2f}",
+                                            "required_action": "Revise this specific query or justify its relevance.",
                                         }
-                                        current_tool_human_message_guidance = (
+                                        human_message_for_this_tool_failure = (
                                             error_detail
                                         )
-                                        tool_call_failed_for_reprompt_this_iteration = (
-                                            True
+                                        this_tool_call_needs_llm_replan = True
+                                        tool_span.set_attribute(
+                                            "tool.error", "Query needs revision"
                                         )
-                                    else:  # Query is good
+                                    else:
                                         self.logger.debug(
-                                            f"Search query '{query}' is good. Executing tool."
+                                            f"Search query '{query}' (ID: {tool_call_id}) is good. Executing tool."
                                         )
-                                        tool_to_execute = self.options.tools_dict[
-                                            tool_name
-                                        ]
                                         current_tool_output_payload = tool_to_execute(
                                             **tool_args
                                         )
                                         tool_executed_successfully_this_iteration = True
-                                        self.logger.debug(
-                                            f"Tool '{tool_name}' executed successfully. Output: {str(current_tool_output_payload)[:100]}..."
-                                        )
-                                else:  # "query" not in tool_args for search tool
-                                    error_detail = f"Search tool '{tool_name}' called without a 'query' argument. Please provide a query."
-                                    self.logger.error(error_detail)
-                                    current_tool_output_payload = {
-                                        "error": "Missing query argument for search tool.",
-                                        "details": error_detail,
-                                    }
-                                    current_tool_human_message_guidance = error_detail
-                                    tool_call_failed_for_reprompt_this_iteration = True
-                            else:  # Not a search tool
+                            else:
                                 self.logger.debug(
-                                    f"Executing non-search tool: '{tool_name}'"
+                                    f"Executing non-search tool: '{tool_name}' (ID: {tool_call_id})"
                                 )
-                                tool_to_execute = self.options.tools_dict[tool_name]
                                 current_tool_output_payload = tool_to_execute(
                                     **tool_args
                                 )
                                 tool_executed_successfully_this_iteration = True
-                                self.logger.debug(
-                                    f"Tool '{tool_name}' executed successfully. Output: {str(current_tool_output_payload)[:100]}..."
-                                )
-                        except KeyError:
-                            error_msg_str = f"Tool '{tool_name}' not found. Available tools are: {list(self.options.tools_dict.keys())}"
+
+                        except KeyError as e:
+                            error_msg_str = f"Tool '{tool_name}' (ID: {tool_call_id}) not found. Available: {list(self.options.tools_dict.keys())}. Error: {str(e)}"
                             self.logger.error(error_msg_str, exc_info=True)
                             current_tool_output_payload = {
                                 "error": "Tool not found",
                                 "details": error_msg_str,
                             }
-                            current_tool_human_message_guidance = (
-                                f"You attempted to use a tool named '{tool_name}' which is not available. "
-                                f"Please choose from the available tools: {list(self.options.tools_dict.keys())} or re-evaluate your approach."
+                            human_message_for_this_tool_failure = (
+                                f"You attempted to use a tool named '{tool_name}' (ID: {tool_call_id}) which is not available. "
+                                f"Please choose from: {list(self.options.tools_dict.keys())} or adjust your plan for this call."
                             )
-                            tool_call_failed_for_reprompt_this_iteration = True
+                            this_tool_call_needs_llm_replan = True
+                            tool_span.record_exception(e)
+                            tool_span.set_attribute("tool.error", "Tool not found")
                         except Exception as e:
-                            error_msg_str = f"Error executing tool {tool_name} with args {tool_args}: {str(e)}"
+                            error_msg_str = f"Error executing tool {tool_name} (ID: {tool_call_id}) with {tool_args}: {str(e)}"
                             self.logger.error(error_msg_str, exc_info=True)
                             current_tool_output_payload = {
                                 "error": "Tool execution failed",
                                 "details": error_msg_str,
                             }
-                            span.record_exception(e)
-                            current_tool_human_message_guidance = (
-                                f"An error occurred while executing the tool '{tool_name}': {str(e)}. "
-                                f"The arguments were: {tool_args}. "
-                                f"Please check the arguments, try a different approach, or ask for clarification if needed."
+                            human_message_for_this_tool_failure = (
+                                f"Error executing '{tool_name}' (ID: {tool_call_id}): {str(e)}. Args: {tool_args}. "
+                                f"Please check args, try a different approach for this call, or clarify."
                             )
-                            tool_call_failed_for_reprompt_this_iteration = True
+                            this_tool_call_needs_llm_replan = True
+                            tool_span.record_exception(e)
+                            tool_span.set_attribute("tool.error", "Execution failed")
 
-                    # Attempt to serialize the payload for the ToolMessage
-                    tool_message_content_final_str: str
-                    try:
-                        tool_message_content_final_str = json.dumps(
-                            current_tool_output_payload
+                        tool_message_content_final_str: str
+                        try:
+                            tool_message_content_final_str = json.dumps(
+                                current_tool_output_payload
+                            )
+                        except TypeError as serialization_error:
+                            self.logger.error(
+                                f"Error serializing output for '{tool_name}' (ID: {tool_call_id}): {serialization_error}",
+                                exc_info=True,
+                            )
+                            tool_span.record_exception(serialization_error)
+                            error_detail_serialization = f"Tool '{tool_name}' (ID: {tool_call_id}) output unserializable: {serialization_error}. Output (partial): {str(current_tool_output_payload)[:200]}"
+                            current_tool_output_payload = {
+                                "error": "Tool output serialization error",
+                                "details": error_detail_serialization,
+                            }
+                            tool_message_content_final_str = json.dumps(
+                                current_tool_output_payload
+                            )
+                            tool_executed_successfully_this_iteration = False
+                            if not this_tool_call_needs_llm_replan:
+                                ser_guidance = f"Tool '{tool_name}' (ID: {tool_call_id}) data unprocessable (serialization issue). Check format or retry this call."
+                                human_message_for_this_tool_failure = (
+                                    (
+                                        human_message_for_this_tool_failure
+                                        + "\nAdditionally: "
+                                        + ser_guidance
+                                    )
+                                    if human_message_for_this_tool_failure
+                                    else ser_guidance
+                                )
+                                this_tool_call_needs_llm_replan = True
+                            tool_span.set_attribute("tool.error", "Serialization error")
+
+                        tool_span.set_attribute(
+                            "tool.executed_successfully",
+                            tool_executed_successfully_this_iteration,
                         )
-                    except TypeError as serialization_error:
-                        self.logger.error(
-                            f"Error serializing tool output for '{tool_name}': {serialization_error}",
-                            exc_info=True,
+                        tool_span.set_attribute(
+                            "tool.output_preview",
+                            str(tool_message_content_final_str)[:200],
                         )
-                        span.record_exception(serialization_error)
-                        error_detail_serialization = f"Tool '{tool_name}' output could not be serialized to JSON: {serialization_error}. Original output was: {str(current_tool_output_payload)[:200]}"
-                        current_tool_output_payload = {  # Overwrite payload with error
-                            "error": "Tool output serialization error",
-                            "details": error_detail_serialization,
-                        }
-                        tool_message_content_final_str = json.dumps(
-                            current_tool_output_payload
-                        )  # Should be safe now
 
-                        tool_executed_successfully_this_iteration = False  # Serialization failure means tool call effectively failed
-                        if (
-                            not tool_call_failed_for_reprompt_this_iteration
-                        ):  # If not already failing for a primary reason
-                            current_tool_human_message_guidance = f"Tool '{tool_name}' produced data that could not be processed due to a serialization issue. Please check the tool's output format or try a different approach."
-                            tool_call_failed_for_reprompt_this_iteration = True
+                        if self.options.on_tool_call_executed:
+                            try:
+                                self.logger.debug(
+                                    f"Executing on_tool_call_executed for '{tool_name}' (ID: {tool_call_id})."
+                                )
+                                self.options.on_tool_call_executed(
+                                    task=self.task,
+                                    uuid=self.uuid,
+                                    tool_name=tool_name,
+                                    tool_args=tool_args,
+                                    tool_response=current_tool_output_payload,
+                                    success=tool_executed_successfully_this_iteration,
+                                    tool_call_id=tool_call_id,
+                                )
+                            except Exception as cb_ex:
+                                self.logger.error(
+                                    f"Error in on_tool_call_executed for {tool_name} (ID: {tool_call_id}): {cb_ex}",
+                                    exc_info=True,
+                                )
+                                interaction_span.record_exception(
+                                    cb_ex,
+                                    {"callback_error": True, "tool_name": tool_name},
+                                )
 
-                    # Call on_tool_call_executed once with the final status and payload
-                    if self.options.on_tool_call_executed:
+                        tool_messages_for_this_turn.append(
+                            ToolMessage(
+                                content=tool_message_content_final_str,
+                                tool_call_id=tool_call_id,
+                            )
+                        )
                         self.logger.debug(
-                            f"Executing on_tool_call_executed callback for tool '{tool_name}'."
-                        )
-                        self.options.on_tool_call_executed(
-                            task=self.task,
-                            uuid=self.uuid,
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                            tool_response=current_tool_output_payload,  # Pass the (possibly error) payload
-                            success=tool_executed_successfully_this_iteration,
+                            f"Appended ToolMessage for tool_call_id: {tool_call_id}"
                         )
 
-                    tool_messages_for_this_turn.append(
-                        ToolMessage(
-                            content=tool_message_content_final_str,
-                            tool_call_id=tool_call_id,
-                        )
-                    )
-                    self.logger.debug(
-                        f"Appended ToolMessage for tool_call_id: {tool_call_id}"
-                    )
-
-                    if (
-                        tool_call_failed_for_reprompt_this_iteration
-                        and not needs_llm_reprompt_after_this_batch
-                    ):
-                        self.logger.warning(
-                            f"Tool call '{tool_name}' failed, setting reprompt flag. Guidance: {current_tool_human_message_guidance}"
-                        )
-                        needs_llm_reprompt_after_this_batch = True
-                        first_error_guiding_human_message_content = (
-                            current_tool_human_message_guidance
-                        )
+                        if this_tool_call_needs_llm_replan:
+                            any_tool_requires_llm_replan = True
+                            if human_message_for_this_tool_failure:
+                                guidance_for_llm_reprompt.append(
+                                    human_message_for_this_tool_failure
+                                )
 
                 history.extend(tool_messages_for_this_turn)
                 self.logger.debug(
                     f"Extended history with {len(tool_messages_for_this_turn)} tool messages."
                 )
-
-                if needs_llm_reprompt_after_this_batch:
-                    self.logger.info("Reprompting LLM due to tool call error(s).")
-                    if first_error_guiding_human_message_content:
-                        history.append(
-                            HumanMessage(
-                                content=first_error_guiding_human_message_content
-                            )
-                        )
-                        self.logger.debug(
-                            f"Added human guidance message for reprompt: {first_error_guiding_human_message_content}"
-                        )
-                    else:
-                        # Fallback if somehow a reprompt was triggered without specific guidance
-                        fallback_msg = "An error occurred with one or more tool calls, or their output was invalid. Please review the tool responses and adjust your plan."
-                        history.append(HumanMessage(content=fallback_msg))
-                        self.logger.warning(
-                            f"Added fallback human guidance message for reprompt: {fallback_msg}"
-                        )
-                    continue  # Go to next iteration of while loop to re-invoke LLM
-
-                # If no reprompt needed, it means all tool calls were successful (or skipped after a success that didn't need reprompt, which is not current logic)
-                # and the LLM didn't return content, so we continue the loop expecting more tool calls or final content.
-                # This 'continue' should effectively not be hit if there are no tool_calls because the first 'if not current_llm_response.tool_calls:' would catch it.
-                # If there *were* tool calls, and they all succeeded, and we are here, it means the LLM expects more turns after tool execution.
-                self.logger.debug(
-                    "Tool calls processed, continuing LLM interaction loop."
+                interaction_span.add_event(
+                    "Tool Processing Complete",
+                    {
+                        "num_tool_messages": len(tool_messages_for_this_turn),
+                        "replan_needed": any_tool_requires_llm_replan,
+                    },
                 )
 
-    def _split_task(self) -> SplitTask:  # Return type hint updated
+                if any_tool_requires_llm_replan:
+                    self.logger.info(
+                        "One or more tool calls require LLM replanning. Reprompting."
+                    )
+                    if guidance_for_llm_reprompt:
+                        if len(guidance_for_llm_reprompt) > 1:
+                            combined_guidance = (
+                                "Multiple tool calls require attention. Please review the following issues and adjust your plan accordingly:\n\n"
+                                + "\n\n".join(guidance_for_llm_reprompt)
+                            )
+                        else:
+                            combined_guidance = (
+                                "A tool call requires attention. Please review the following issue and adjust your plan accordingly:\n\n"
+                                + guidance_for_llm_reprompt[0]
+                            )
+
+                        history.append(HumanMessage(content=combined_guidance))
+                        self.logger.debug(
+                            f"Added human guidance message for reprompt: {combined_guidance}"
+                        )
+                        interaction_span.add_event(
+                            "LLM Replan Initiated", {"guidance": combined_guidance}
+                        )
+                    else:
+                        fallback_msg = "An issue occurred with one or more tool calls. Please review tool responses and adjust your plan."
+                        history.append(HumanMessage(content=fallback_msg))
+                        self.logger.warning(
+                            f"Added fallback human guidance for reprompt: {fallback_msg}"
+                        )
+                        interaction_span.add_event(
+                            "LLM Replan Initiated (Fallback)",
+                            {"guidance": fallback_msg},
+                        )
+                    continue
+
+                self.logger.debug(
+                    "All tool calls processed without requiring immediate LLM replan. Continuing LLM interaction."
+                )
+
+    def _split_task(self) -> SplitTask:
         self.logger.info(f"Splitting task: '{self.task}'")
         task_history = self._build_task_history()
         max_subtasks = self._get_max_subtasks()
         self.logger.debug(f"Max subtasks for splitting: {max_subtasks}")
 
-        system_msg = (
+        system_msg_content = (
             f"Split this task into smaller ones only if necessary. You can create up to {max_subtasks} subtasks. "
             "Do not attempt to answer it yourself.\n\n"
             "Consider these tasks that are already being worked on or have been completed:\n"
@@ -763,119 +800,174 @@ class RecursiveAgent:
         )
 
         if self.u_inst:
-            system_msg += (
+            system_msg_content += (
                 "Also, use this user-provided info to help you, and include any details in your output:\n"
                 f"{self.u_inst}\n"
             )
-        self.logger.debug(f"System message for task splitting LLM: {system_msg}")
+        self.logger.debug(
+            f"System message for task splitting LLM: {system_msg_content}"
+        )
 
-        split_msgs_hist = [SystemMessage(system_msg), HumanMessage(self.task)]
+        system_msg = SystemMessage(content=system_msg_content)
+        split_msgs_hist = [system_msg, HumanMessage(self.task)]
 
         self.logger.debug("Evaluating prompt complexity for task splitting.")
-        evaluation = evaluate_prompt(f"Prompt: {self.task}")
+        evaluation = evaluate_prompt(
+            f"Prompt: {self.task}"
+        )  # TODO: Check if self.u_inst should be part of this eval
         self.logger.debug(f"Prompt evaluation result: {evaluation}")
-        if self.current_span:  # Check if current_span is initialized
-            self.current_span.set_attribute(
-                "prompt_complexity", evaluation.prompt_complexity_score[0]
+
+        current_task_span = self.current_span  # Use the main task span if available
+        if current_task_span:
+            current_task_span.set_attribute(
+                "prompt_complexity.score", evaluation.prompt_complexity_score[0]
             )
-            self.current_span.set_attribute(
-                "domain_knowledge", evaluation.domain_knowledge[0]
+            current_task_span.set_attribute(
+                "prompt_complexity.domain_knowledge", evaluation.domain_knowledge[0]
             )
-            self.current_span.set_attribute(
-                "contextual_knowledge", evaluation.contextual_knowledge[0]
+            current_task_span.set_attribute(
+                "prompt_complexity.contextual_knowledge",
+                evaluation.contextual_knowledge[0],
             )
-            self.current_span.set_attribute("task_type", evaluation.task_type_1[0])
+            current_task_span.set_attribute(
+                "prompt_complexity.task_type", evaluation.task_type_1[0]
+            )
 
         if (
-            evaluation.prompt_complexity_score[0] > 0.5
-            and evaluation.domain_knowledge[0] < 0.8
-        ):
+            evaluation.prompt_complexity_score[0] < 0.5
+            and evaluation.domain_knowledge[0] > 0.8
+        ):  # Adjusted logic based on example
             self.logger.info(
                 "Task complexity/domain knowledge suggests no subtasks needed based on evaluation."
             )
-            split_task_result = SplitTask(  # Renamed variable
-                needs_subtasks=False, subtasks=[], evaluation=evaluation
+            if current_task_span:
+                current_task_span.add_event(
+                    "Skipping split due to low complexity/high domain knowledge"
+                )
+            return SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)
+
+        if current_task_span:
+            current_task_span.add_event(
+                "Attempting Task Split",
+                {"task": self.task, "max_subtasks": max_subtasks},
             )
-            return split_task_result
 
-        if self.current_span:
-            self.current_span.add_event("Split Task", {"task": self.task})
-
-        self.logger.info("Invoking LLM for task splitting (initial response).")
-        response = self.llm.invoke(split_msgs_hist + [AIMessage("1. ")])
-        self.logger.debug(f"LLM initial split response: {response.content}")
+        self.logger.info("Invoking LLM for task splitting (initial textual response).")
+        # Priming with "1. " to encourage a list format
+        response = self.llm.invoke(split_msgs_hist + [AIMessage(content="1. ")])
+        self.logger.debug(f"LLM initial split response content: {response.content}")
+        # Add the LLM's generated list (including our "1. " prefix) to history for the JSON formatting step
         split_msgs_hist.append(AIMessage(content="1. " + response.content))
 
         split_msgs_hist.append(self._construct_subtask_to_json_prompt())
         self.logger.info("Invoking LLM for task splitting (JSON formatting).")
-        structured_response = self.llm.invoke(split_msgs_hist)
+        structured_response_msg = self.llm.invoke(
+            split_msgs_hist
+        )  # This is an AIMessage
         self.logger.debug(
-            f"LLM structured split response: {structured_response.content}"
+            f"LLM structured split response content: {structured_response_msg.content}"
         )
 
+        split_task_result: SplitTask
         try:
-            parsed_split_task = self.task_split_parser.invoke(
-                structured_response
-            )  # Renamed variable
-            # Check if parsed_split_task is a dictionary as expected from JsonOutputParser
-            if isinstance(parsed_split_task, dict):
-                split_task_result = SplitTask(
-                    **parsed_split_task, evaluation=evaluation
-                )  # Create SplitTask instance
-            elif isinstance(
-                parsed_split_task, SplitTask
-            ):  # If parser already returns SplitTask
-                split_task_result = parsed_split_task
-                split_task_result.evaluation = evaluation
+            # JsonOutputParser expects a str or BaseMessage.
+            # structured_response_msg is an AIMessage.
+            parsed_output_from_llm = self.task_split_parser.invoke(
+                structured_response_msg
+            )
+
+            if isinstance(parsed_output_from_llm, dict):
+                # Ensure our locally computed 'evaluation' takes precedence or is added.
+                parsed_output_from_llm["evaluation"] = evaluation
+                split_task_result = SplitTask(**parsed_output_from_llm)
+            elif isinstance(parsed_output_from_llm, SplitTask):
+                split_task_result = parsed_output_from_llm
+                split_task_result.evaluation = (
+                    evaluation  # Override or set the evaluation
+                )
             else:
                 self.logger.error(
-                    f"Unexpected type from task_split_parser: {type(parsed_split_task)}. Content: {parsed_split_task}"
+                    f"Unexpected type from task_split_parser: {type(parsed_output_from_llm)}. Content: {str(parsed_output_from_llm)[:500]}"
                 )
                 split_task_result = SplitTask(
                     needs_subtasks=False, subtasks=[], evaluation=evaluation
                 )
 
-        except Exception as e:
+            if current_task_span:
+                current_task_span.add_event(
+                    "Split Task Parsed",
+                    {
+                        "parsed_ok": True,
+                        "needs_subtasks": split_task_result.needs_subtasks,
+                        "num_subtasks_parsed": len(split_task_result.subtasks),
+                    },
+                )
+
+        except (
+            ValidationError,
+            OutputParserException,
+            TypeError,
+        ) as e:  # More specific exceptions
             self.logger.error(
-                f"Error parsing LLM response for task splitting: {e}", exc_info=True
+                f"Error parsing LLM JSON response for task splitting or instantiating SplitTask: {e}. LLM content: {str(structured_response_msg.content)[:500]}",
+                exc_info=True,
             )
+            if current_task_span:
+                current_task_span.record_exception(e)
+                current_task_span.add_event("Split Task Parsing Failed")
+            split_task_result = SplitTask(
+                needs_subtasks=False, subtasks=[], evaluation=evaluation
+            )
+        except Exception as e:  # Catch-all for unexpected issues
+            self.logger.error(
+                f"Unexpected error during task splitting finalization: {e}. LLM content: {str(structured_response_msg.content)[:500]}",
+                exc_info=True,
+            )
+            if current_task_span:
+                current_task_span.record_exception(e)
+                current_task_span.add_event("Split Task Finalization Failed")
             split_task_result = SplitTask(
                 needs_subtasks=False, subtasks=[], evaluation=evaluation
             )
 
-        self.logger.debug(f"Parsed split task: {split_task_result}")
+        self.logger.debug(f"Parsed split task result: {split_task_result}")
 
-        # Ensure we don't exceed the maximum number of subtasks
-        # This block assumes split_task_result is a SplitTask object
         if split_task_result.subtasks:
             original_subtask_count = len(split_task_result.subtasks)
             split_task_result.subtasks = split_task_result.subtasks[:max_subtasks]
-            split_task_result.needs_subtasks = len(split_task_result.subtasks) > 0
-            if len(split_task_result.subtasks) < original_subtask_count:
+            current_num_subtasks = len(split_task_result.subtasks)
+            split_task_result.needs_subtasks = current_num_subtasks > 0
+            if current_num_subtasks < original_subtask_count:
                 self.logger.info(
-                    f"Trimmed subtasks from {original_subtask_count} to {len(split_task_result.subtasks)} due to max_subtasks limit."
+                    f"Trimmed subtasks from {original_subtask_count} to {current_num_subtasks} due to max_subtasks limit of {max_subtasks}."
                 )
-        else:
+                if current_task_span:
+                    current_task_span.add_event(
+                        "Subtasks Trimmed",
+                        {
+                            "original_count": original_subtask_count,
+                            "new_count": current_num_subtasks,
+                            "max_allowed": max_subtasks,
+                        },
+                    )
+
+        else:  # No subtasks parsed or an error occurred leading to empty subtasks
             split_task_result.needs_subtasks = False
             split_task_result.subtasks = []
 
-        for (
-            subtask_obj
-        ) in split_task_result.subtasks:  # Iterate over TaskObject in subtasks list
-            # Assuming TaskObject needs a UUID, though it's not in its definition.
-            # The 'task' class (lowercase) has uuid. Let's add it here if it's intended.
-            if not hasattr(subtask_obj, "uuid"):
-                # This is a bit of a hack, ideally TaskObject would have uuid or we'd cast to 'task'
-                subtask_obj_dict = subtask_obj.model_dump()
-                subtask_obj_dict["uuid"] = str(uuid.uuid4())
-                # This part is tricky because TaskObject doesn't have uuid.
-                # For now, let's log and not modify the object structure if it doesn't fit.
-                self.logger.debug(
-                    f"Generated UUID for subtask '{subtask_obj.task}': {subtask_obj_dict['uuid']}"
-                )
+        # Assign UUIDs to subtasks if they are TaskObject and don't have one (they shouldn't)
+        # The 'task' class (lowercase, subclass of TaskObject) has uuid, but SplitTask uses List[TaskObject]
+        for i, subtask_obj in enumerate(split_task_result.subtasks):
+            # We'll create 'task' instances (which include UUID) for child agents later.
+            # Here, we're just dealing with TaskObject.
+            # If TaskObject itself needed a UUID directly, it would be:
+            # if not hasattr(subtask_obj, "uuid"):
+            #    subtask_obj.uuid = str(uuid.uuid4()) # This would modify TaskObject schema or require it to allow extra fields.
+            # For now, UUID generation for subtasks is implicitly handled when creating child RecursiveAgents.
+            self.logger.debug(f"Subtask {i+1} for splitting: {subtask_obj.task}")
 
         self.logger.info(
-            f"Task splitting finished. Needs subtasks: {split_task_result.needs_subtasks}. Number of subtasks: {len(split_task_result.subtasks)}"
+            f"Task splitting finished. Needs subtasks: {split_task_result.needs_subtasks}. Number of subtasks generated: {len(split_task_result.subtasks)}"
         )
         return split_task_result
 
@@ -885,41 +977,77 @@ class RecursiveAgent:
             self.logger.warning(
                 f"Current layer {self.current_layer} exceeds max depth {len(self.options.task_limits.limits)}. No subtasks allowed."
             )
-            return 0  # No more subtasks allowed beyond configured depth
+            return 0
         max_s = self.options.task_limits.limits[self.current_layer]
         self.logger.debug(
             f"Max subtasks for current layer {self.current_layer}: {max_s}"
         )
         return max_s
 
-    def _summarize_subtask_results(self, tasks, subtask_results) -> str:
+    def _summarize_subtask_results(
+        self, tasks: List[str], subtask_results: List[str]
+    ) -> str:
         self.logger.info(
             f"Summarizing {len(subtask_results)} subtask results for task: '{self.task}'"
         )
+        if not subtask_results:  # Handle case with no results to summarize
+            self.logger.warning(
+                "No subtask results to summarize. Returning empty string or a note."
+            )
+            return "No subtask results were generated to summarize for this task."
+
         merge_options = MergeOptions(
-            llm=self.llm, context_window=15
-        )  # context_window seems low, but keeping as is
+            llm=self.llm, context_window=15000  # Increased context window for merger
+        )
         merger = self.options.merger(merge_options)
         self.logger.debug(f"Merger initialized with options: {merge_options}")
 
         documents_to_merge = [
             f"QUESTION: {question}\n\nANSWER\n{answer}"
             for (question, answer) in zip(tasks, subtask_results)
+            if answer  # Ensure answer is not None
         ]
-        self.logger.debug(f"Documents to merge: {documents_to_merge}")
+        if not documents_to_merge:
+            self.logger.warning("All subtask results were empty. Returning a note.")
+            return "All subtasks yielded empty results."
+
+        self.logger.debug(
+            f"Documents to merge ({len(documents_to_merge)}): {str(documents_to_merge)[:500]}..."
+        )
 
         merged_content = merger.merge_documents(documents_to_merge)
         self.logger.debug(f"Merged content (raw): {str(merged_content)[:200]}...")
 
         if self.options.align_summaries:
             self.logger.info("Aligning summaries.")
-            alignment_prompt = [
+            # Ensure merged_content is not overly long for the alignment prompt
+            max_merged_content_len = (
+                10000  # Example limit, adjust based on LLM capacity
+            )
+            if len(merged_content) > max_merged_content_len:
+                self.logger.warning(
+                    f"Merged content length ({len(merged_content)}) exceeds limit ({max_merged_content_len}). Truncating for alignment."
+                )
+                merged_content_for_alignment = (
+                    merged_content[:max_merged_content_len]
+                    + "\n... [Content Truncated]"
+                )
+            else:
+                merged_content_for_alignment = merged_content
+
+            alignment_prompt_messages = [
                 HumanMessage(
-                    f"{merged_content}\n\nCompile a comprehensive report to answer this question:\n{self.task}\n\nCustom instructions:\ngo into extreme detail. disregard irrelevant information, but include anything relevant. ensure that your report has a good structure and organization."
+                    f"The following information has been gathered from subtasks:\n\n{merged_content_for_alignment}\n\n"
+                    f"Based on this information, compile a comprehensive and well-structured report that directly answers this main question: '{self.task}'.\n\n"
+                    "Custom instructions for the report:\n"
+                    "- Go into extreme detail where relevant information is provided.\n"
+                    "- Disregard any clearly irrelevant information from the subtasks.\n"
+                    "- Ensure the final report has a good structure, clear organization, and directly addresses the main question.\n"
+                    "- If citations were provided in the subtask answers (e.g., [1], [2]), try to preserve them or synthesize them appropriately in the final report."
                 )
             ]
-            self.logger.debug(f"Alignment prompt: {alignment_prompt}")
-            aligned_response = self.llm.invoke(alignment_prompt)
+            self.logger.debug(f"Alignment prompt messages: {alignment_prompt_messages}")
+            aligned_response = self.llm.invoke(alignment_prompt_messages)
             final_summary = aligned_response.content
             self.logger.info(
                 f"Summarization complete (aligned). Result: {str(final_summary)[:100]}..."
@@ -929,9 +1057,59 @@ class RecursiveAgent:
             self.logger.info(
                 f"Summarization complete (not aligned). Result: {str(merged_content)[:100]}..."
             )
-            return merged_content
+            return merged_content  # Return the direct merged content
 
     def _construct_subtask_to_json_prompt(self):
-        prompt_content = f"Now format it in JSON: {SplitTask.model_json_schema()}"
+        # Providing an example might help the LLM more than just the schema.
+        example_task_object = TaskObject(
+            task="Example subtask", subtasks=0, allow_search=True, allow_tools=True
+        )
+        example_split_task = SplitTask(
+            needs_subtasks=True, subtasks=[example_task_object], evaluation=None
+        )  # Evaluation is optional
+
+        json_schema_str = SplitTask.model_json_schema()
+        # Remove 'evaluation' from the required list in the schema string for the prompt, as it's often better if the LLM doesn't try to generate it.
+        # We set it programmatically.
+        try:
+            schema_dict = json.loads(json.dumps(json_schema_str))
+            if "required" in schema_dict and "evaluation" in schema_dict["required"]:
+                schema_dict["required"].remove("evaluation")
+            # Also remove 'evaluation' from properties to simplify for LLM
+            if (
+                "properties" in schema_dict
+                and "evaluation" in schema_dict["properties"]
+            ):
+                del schema_dict["properties"]["evaluation"]
+            # Remove $defs if TaskEvaluation is complex and not needed for LLM to fill
+            if "$defs" in schema_dict and "TaskEvaluation" in schema_dict["$defs"]:
+                del schema_dict["$defs"]["TaskEvaluation"]
+
+            simplified_schema_str = json.dumps(schema_dict)
+        except json.JSONDecodeError:
+            self.logger.warning(
+                "Could not parse/simplify SplitTask JSON schema for prompt. Using full schema."
+            )
+            simplified_schema_str = json_schema_str
+
+        prompt_content = (
+            f"Now, format the subtask list (or indicate no subtasks are needed) strictly according to the following JSON schema. "
+            f"The 'evaluation' field is optional and you can omit it.\n"
+            f"Schema:\n```json\n{simplified_schema_str}\n```\n"
+            f"Example of desired JSON format for a task that needs subtasks:\n"
+            f"```json\n{{\n"
+            f'  "needs_subtasks": true,\n'
+            f'  "subtasks": [\n'
+            f'    {{ "task": "Subtask 1 description", "subtasks": 0, "allow_search": true, "allow_tools": true }},\n'
+            f'    {{ "task": "Subtask 2 description", "subtasks": 0, "allow_search": true, "allow_tools": false }}\n'
+            f"  ]\n"
+            f"}}\n```\n"
+            f"Example for a task that does NOT need subtasks:\n"
+            f"```json\n{{\n"
+            f'  "needs_subtasks": false,\n'
+            f'  "subtasks": []\n'
+            f"}}\n```\n"
+            "Provide only the JSON object as your response."
+        )
         self.logger.debug(f"Constructed subtask to JSON prompt: {prompt_content}")
         return HumanMessage(prompt_content)

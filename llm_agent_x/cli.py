@@ -111,7 +111,8 @@ def brave_web_search(query: str, num_results: int) -> str:
 
         json_response_data = response.json()
         return json.dumps(json_response_data)
-
+    except e:
+        raise e
     except requests.exceptions.HTTPError as http_err:
         error_message = f"HTTP error occurred: {http_err}"
         details = {
@@ -212,7 +213,7 @@ def on_task_executed(task, uuid, response, parent_agent_uuid):
 
 
 def on_tool_call_executed(
-    task, uuid, tool_name, tool_args, tool_response, success=True
+    task, uuid, tool_name, tool_args, tool_response, success=True, tool_call_id=None
 ):
     tool_task_id = f"{uuid}: {tool_name}"  # Unique ID for the tool call visualization
 
