@@ -11,6 +11,7 @@ from rich.live import Live
 from rich.text import Text
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
+from bs4 import BeautifulSoup  # New import
 
 from . import (
     int_to_base26,
@@ -76,6 +77,25 @@ def render_flowchart():
     return "\n".join(flowchart)
 
 
+def get_page_text_content(soup: BeautifulSoup) -> str:
+    """
+    Extracts text content from a BeautifulSoup object.
+    Tries to be a bit smarter than just soup.get_text() by removing script/style.
+    Still, this is a heuristic and might not be perfect for all pages.
+    """
+    # Remove script and style elements
+    for script_or_style in soup(["script", "style"]):
+        script_or_style.decompose()
+
+    # Get text, try to preserve some structure with spaces
+    text = soup.get_text(separator=" ", strip=True)
+
+    # Optional: Further clean-up (e.g., multiple newlines, excessive whitespace)
+    # text = "\n".join([line for line in text.splitlines() if line.strip()])
+    # text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def brave_web_search(query: str, num_results: int) -> str:
     """
     Perform a web search with the given query and number of results using the Brave Search API, returning JSON-formatted results. **Make sure to be very specific in your search phrase. Ask for specific information, not general information.**
@@ -84,61 +104,237 @@ def brave_web_search(query: str, num_results: int) -> str:
     :param num_results: The desired number of results. This will be passed as the 'count' parameter to the Brave API.
     :return: A JSON-formatted string containing the search results, or a JSON-formatted error message if the API call fails or returns an error.
     """
+    import time
+    import requests
+    import json
+    from os import getenv
+    from bs4 import BeautifulSoup
+
+    # Some constants for request handling
+    SCRAPE_TIMEOUT_SECONDS = 10
+    max_scrape_chars = 5000  # Example max character count for scrape
+    REQUEST_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    def get_page_text_content(element):
+        """
+        Extract and normalize text content from an HTML element.
+
+        :param element: The HTML element to extract content from.
+        :return: A string containing the cleaned-up text content of the element.
+        """
+        return element.get_text(" ", strip=True)
+
     api_key = getenv("BRAVE_API_KEY")
-    if not api_key:
-        # console.print("[red]Error: BRAVE_API_KEY environment variable not set.[/red]") # Using console for error output
+    if not api_key or api_key == "YOUR_ACTUAL_BRAVE_API_KEY_HERE":
         return json.dumps(
-            {"error": "BRAVE_API_KEY environment variable not set.", "results": []}
+            {
+                "error": "BRAVE_API_KEY environment variable not set or is a placeholder.",
+                "results": [],
+            }
         )
 
     base_url = "https://api.search.brave.com/res/v1/web/search"
-
-    headers = {
+    brave_headers = {
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
         "X-Subscription-Token": api_key,
     }
+    params = {"q": query, "count": num_results}
 
-    params = {
-        "q": query,
-        "count": num_results,
-    }
+    response_obj = None
 
-    try:
-        response = requests.get(base_url, headers=headers, params=params)
-        time.sleep(1.5)
-        response.raise_for_status()
+    max_retries = 3  # Maximum number of retries for 429 errors
+    retry_wait_time = 10  # Wait time in seconds before retrying on a 429 error
+    retry_count = 0
 
-        json_response_data = response.json()
-        return json.dumps(json_response_data)
-    except e:
-        raise e
-    except requests.exceptions.HTTPError as http_err:
-        error_message = f"HTTP error occurred: {http_err}"
-        details = {
-            "error": error_message,
-            "status_code": response.status_code,
-            "results": [],
-        }
+    while retry_count <= max_retries:
         try:
-            brave_error = response.json()
-            details["brave_api_error"] = brave_error
-        except json.JSONDecodeError:
-            details["brave_api_response_text"] = response.text
-        # console.print(details, style="red")
-        return json.dumps(details)
-    except requests.exceptions.RequestException as req_err:
-        error_message = f"Request error occurred: {req_err}"
-        # console.print(error_message, style="red")
-        return json.dumps({"error": error_message, "results": []})
-    except json.JSONDecodeError as json_err:
-        error_message = f"JSON decode error: {json_err}. Response text: {response.text if 'response' in locals() else 'N/A'}"
-        # console.print(error_message, style="red")
-        return json.dumps({"error": error_message, "results": []})
-    except Exception as e:
-        error_message = f"An unexpected error occurred: {e}"
-        # console.print(error_message, style="red")
-        return json.dumps({"error": error_message, "results": []})
+            # --- 1. Brave Search API Call ---
+            search_response = requests.get(
+                base_url, headers=brave_headers, params=params, timeout=10
+            )
+            response_obj = search_response
+
+            # Handle 429 Too Many Requests
+            if search_response.status_code == 429:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    print(
+                        f"Rate limit reached. Retrying in {retry_wait_time} seconds... (Retry {retry_count}/{max_retries})"
+                    )
+                    time.sleep(retry_wait_time)
+                    continue  # Retry the request
+                else:
+                    return json.dumps(
+                        {
+                            "error": "Rate limit exceeded. Exhausted all retries.",
+                            "status_code": 429,
+                            "results": [],
+                        }
+                    )
+
+            search_response.raise_for_status()
+            json_response_data = search_response.json()
+
+            extracted_results_for_llm = []
+
+            if json_response_data.get("web") and json_response_data["web"].get(
+                "results"
+            ):
+                search_results_to_process = json_response_data["web"]["results"]
+
+                for i, result in enumerate(search_results_to_process):
+                    title = result.get("title")
+                    url = result.get("url")
+                    snippet = result.get(
+                        "description", ""
+                    )  # Default to empty string if no description
+
+                    content_for_llm = snippet  # Default to snippet
+
+                    if title and url:  # We need a URL to attempt scraping
+                        print(
+                            f"  Processing result {i+1}/{len(search_results_to_process)}: '{title}' ({url})"
+                        )
+                        try:
+                            # --- 2. Scrape Individual Webpage ---
+                            print(f"    Attempting to scrape content from {url}...")
+                            page_response = requests.get(
+                                url,
+                                headers=REQUEST_HEADERS,
+                                timeout=SCRAPE_TIMEOUT_SECONDS,
+                                allow_redirects=True,
+                            )
+                            page_response.raise_for_status()  # Check for HTTP errors for the page itself
+
+                            # Ensure content type is HTML before parsing
+                            content_type = page_response.headers.get(
+                                "Content-Type", ""
+                            ).lower()
+                            if "text/html" in content_type:
+                                # Using lxml is generally faster and more robust
+                                soup = BeautifulSoup(
+                                    page_response.content, "lxml"
+                                )  # or 'html.parser'
+
+                                # More targeted text extraction (example, adjust as needed)
+                                # Try to find common main content containers
+                                main_content_text = ""
+                                main_content_elements = soup.find_all(
+                                    ["article", "main"]
+                                )
+                                if main_content_elements:
+                                    for el in main_content_elements:
+                                        main_content_text += (
+                                            get_page_text_content(el) + " "
+                                        )
+                                    main_content_text = main_content_text.strip()
+
+                                if (
+                                    not main_content_text
+                                ):  # Fallback to body if no specific main content found
+                                    if soup.body:
+                                        main_content_text = get_page_text_content(
+                                            soup.body
+                                        )
+                                    else:  # Fallback if no body tag (highly unlikely for valid HTML)
+                                        main_content_text = get_page_text_content(soup)
+
+                                if main_content_text:
+                                    print(
+                                        f"    Scraped {len(main_content_text)} chars. Max allowed: {max_scrape_chars}"
+                                    )
+                                    if 0 < len(main_content_text) <= max_scrape_chars:
+                                        content_for_llm = main_content_text
+                                        print(
+                                            f"    Using scraped content (length: {len(main_content_text)})."
+                                        )
+                                    elif len(main_content_text) > max_scrape_chars:
+                                        print(
+                                            f"    Scraped content too long ({len(main_content_text)} chars), falling back to snippet."
+                                        )
+                                        content_for_llm = (
+                                            snippet
+                                            + " [Note: Full content exceeded character limit]"
+                                        )
+                                    else:  # Scraped text was empty
+                                        print(
+                                            f"    Scraped content was empty, using snippet."
+                                        )
+                                else:
+                                    print(
+                                        f"    Could not extract meaningful text, using snippet."
+                                    )
+                            else:
+                                print(
+                                    f"    Skipping scrape: Content-Type is '{content_type}', not HTML. Using snippet."
+                                )
+                                content_for_llm = (
+                                    snippet + " [Note: Content was not HTML]"
+                                )
+
+                        except requests.exceptions.Timeout:
+                            print(f"    Scraping timed out for {url}. Using snippet.")
+                            content_for_llm = (
+                                snippet + " [Note: Page timed out during scraping]"
+                            )
+                        except requests.exceptions.HTTPError as e:
+                            print(
+                                f"    HTTP error {e.response.status_code} while scraping {url}. Using snippet."
+                            )
+                            content_for_llm = (
+                                snippet
+                                + f" [Note: HTTP {e.response.status_code} during scraping]"
+                            )
+                        except requests.exceptions.RequestException as e:
+                            print(f"    Error scraping {url}: {e}. Using snippet.")
+                            content_for_llm = snippet + " [Note: Error during scraping]"
+                        except (
+                            Exception
+                        ) as e:  # Catch-all for any other scraping/parsing errors
+                            print(
+                                f"    Unexpected error scraping/parsing {url}: {e}. Using snippet."
+                            )
+                            content_for_llm = (
+                                snippet + " [Note: Unexpected error during scraping]"
+                            )
+
+                        extracted_results_for_llm.append(
+                            {
+                                "title": title,
+                                "url": url,
+                                "content": content_for_llm.strip(),  # Ensure no leading/trailing ws
+                            }
+                        )
+                    else:  # If no title or URL from Brave search
+                        if title and snippet:  # Still add if we have title and snippet
+                            extracted_results_for_llm.append(
+                                {
+                                    "title": title,
+                                    "url": url or "N/A",
+                                    "content": snippet.strip(),
+                                }
+                            )
+
+                return extracted_results_for_llm
+
+            if "errors" in json_response_data:
+                return json.dumps(
+                    {
+                        "error": "API returned errors in response",
+                        "details": json_response_data["errors"],
+                        "results": [],
+                    }
+                )
+            if not extracted_results_for_llm:
+                return []  # No web results found or processed
+
+        except Exception as e:
+            return json.dumps(
+                {"error": f"An unexpected error occurred: {str(e)}", "results": []}
+            )
 
 
 def exec_python(code, globals=None, locals=None):
