@@ -30,7 +30,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer(__name__)
 
-exporter = OTLPSpanExporter(endpoint="http://localhost:6006/v1/traces")
+exporter = OTLPSpanExporter(endpoint=getenv("ARIZE_PHOENIX_ENDPOINT", "http://localhost:6006/v1/traces"))
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
 # Load environment variables

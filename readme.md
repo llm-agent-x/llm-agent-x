@@ -34,14 +34,14 @@ LLM Agent X is a task execution framework that leverages language models to perf
     OPENAI_BASE_URL=https://api.openai.com/v1
     OPENAI_API_KEY=your_openai_api_key
     # Optional: Define a default LLM model
-    # DEFAULT_LLM=gpt-4-0613
+    # DEFAULT_LLM=gpt-4o-mini
     ```
 
 ## Usage
 
 To run the LLM agent, use the following command:
 ```sh
-llm-agent-x "Your task description here" --max_layers 2 --output output.md --model qwen2.5-coder-long:latest
+llm-agent-x "Your task description here" --max_layers 2 --output output.md --model gpt-4o-mini
 ```
 
 ### Arguments
@@ -57,7 +57,7 @@ llm-agent-x "Your task description here" --max_layers 2 --output output.md --mod
 ## Example
 
 ```sh
-llm-agent-x "Research the impact of climate change on polar bears" --max_layers 3 --output climate_change_report.md --model gpt-3.5-turbo
+llm-agent-x "Research the impact of climate change on polar bears" --max_layers 3 --output climate_change_report.md --model gpt-4o-mini
 ```
 
 ## Example flowchart output
@@ -90,6 +90,8 @@ flowchart TD
 ## Dependencies
 
 Project dependencies are managed with Poetry and are listed in the `pyproject.toml` file.
+
+> ⚠️ `torch` is optional in Poetry but **required** at runtime. You must install the correct version for your hardware manually using the appropriate `--index-url`.
 
 ## License
 
