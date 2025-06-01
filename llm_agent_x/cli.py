@@ -1,9 +1,11 @@
 import argparse
 import json
+import math
 import time
 from os import getenv, environ
 from pathlib import Path
 from dotenv import load_dotenv
+import nltk
 import requests
 from rich.console import Console
 from rich.tree import Tree
@@ -15,6 +17,14 @@ from bs4 import BeautifulSoup
 from typing import Dict, Optional  # Import Dict, Optional
 from enum import Enum # Import Enum for TaskType
 from typing import Literal
+
+from sumy.parsers.html import HtmlParser
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer as Summarizer
+from sumy.nlp.stemmers import Stemmer
+from sumy.utils import get_stop_words
+
 
 from llm_agent_x import ( # Changed from . to llm_agent_x
     int_to_base26,
@@ -30,6 +40,8 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+nltk.download('punkt_tab', force=False)
 
 # Setup (only needed once)
 trace.set_tracer_provider(TracerProvider())
@@ -62,7 +74,7 @@ output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 flowchart = ["flowchart TD"]
 task_ids: dict[str, str] = {}
 
-
+LANGUAGE = "english"
 def get_or_set_task_id(id: str) -> str | None:
     if id not in task_ids:
         result = int_to_base26(len(task_ids))
@@ -256,12 +268,22 @@ def brave_web_search(query: str, num_results: int) -> str:
                                         )
                                     elif len(main_content_text) > max_scrape_chars:
                                         print(
-                                            f"    Scraped content too long ({len(main_content_text)} chars), falling back to snippet."
+                                            f"    Scraped content too long ({len(main_content_text)} chars), summarizing."
                                         )
-                                        content_for_llm = (
-                                            snippet
-                                            + " [Note: Full content exceeded character limit]"
-                                        )
+                                        # content_for_llm = (
+                                        #     snippet
+                                        #     + " [Note: Full content exceeded character limit]"
+                                        # )
+                                        SENTENCES_COUNT = math.floor(len(main_content_text) / 150)
+
+                                        parser = PlaintextParser.from_string(main_content_text, Tokenizer(LANGUAGE))
+                                        stemmer = Stemmer(LANGUAGE)
+
+                                        summarizer = Summarizer(stemmer)
+                                        summarizer.stop_words = get_stop_words(LANGUAGE)
+
+                                        content_for_llm = " ".join(summarizer(parser.document, SENTENCES_COUNT))
+
                                     else:  # Scraped text was empty
                                         print(
                                             f"    Scraped content was empty, using snippet."

@@ -597,7 +597,7 @@ class RecursiveAgent:
             # ... other evaluation attributes ...
 
         # Simplified logic from original, assuming it worked:
-        if evaluation.prompt_complexity_score[0] < 0.5 and evaluation.domain_knowledge[0] > 0.8:
+        if evaluation.prompt_complexity_score[0] < 0.1   and evaluation.domain_knowledge[0] > 0.8:
             self.logger.info("Task complexity/domain knowledge suggests no subtasks needed based on evaluation.")
             return SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)
 
@@ -767,7 +767,8 @@ class RecursiveAgent:
             fixer_limits_config_array[self.current_layer] = fixer_max_subtasks_for_its_level
         
         fixer_task_limits = TaskLimit.from_array(fixer_limits_config_array)
-        fixer_options = self.options.model_copy(update={"task_limits": fixer_task_limits}, deep=True)
+        fixer_options = self.options.model_copy() # update={"task_limits": fixer_task_limits})
+        fixer_options.task_limits = fixer_task_limits
 
         fixer_agent_uuid = str(uuid.uuid4())
         self.logger.info(f"Initializing fixer agent (UUID: {fixer_agent_uuid}) for task: '{original_task_str}'.")

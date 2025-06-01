@@ -20,6 +20,9 @@ huggingface-hub = "^0.32.3"
 transformers = "^4.52.4"
 bs4 = "^0.0.2"
 lxml = "^5.4.0"
+sumy = "^0.11.0"
+lxml-html-clean = "^0.4.2"
+redis = "^6.2.0"
 
 [tool.poetry.scripts]
 llm-agent-x = "llm_agent_x.cli:main"
