@@ -605,6 +605,10 @@ class RecursiveAgent:
         response = self.llm.invoke(split_msgs_hist + [AIMessage(content="1. ")]) # Priming
         split_msgs_hist.append(AIMessage(content="1. " + response.content))
 
+        split_msgs_hist.append(HumanMessage(content="Can you make these more specific? Remember, each of these is sent off to another agent, with no context, asynchronously. All they know is what you put in this list."))
+
+        split_msgs_hist.append(self.llm.invoke(split_msgs_hist)) # LLM call to get more specific subtasks
+
         # LLM call to format into JSON
         split_msgs_hist.append(self._construct_subtask_to_json_prompt()) # Renamed for clarity
         structured_response_msg = self.llm.invoke(split_msgs_hist)
