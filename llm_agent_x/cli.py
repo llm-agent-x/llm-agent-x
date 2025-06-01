@@ -11,14 +11,14 @@ from rich.live import Live
 from rich.text import Text
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
-from bs4 import BeautifulSoup  # New import
+from bs4 import BeautifulSoup
 
 from . import (
     int_to_base26,
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
-)  # Adjusted import
+)
 from .backend import AppendMerger, LLMMerger
 
 from opentelemetry import trace
@@ -36,7 +36,7 @@ trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 # Load environment variables
 load_dotenv(
     ".env", override=True
-)  # This might need adjustment if .env is not in the right place relative to cli.py
+)
 # Initialize Console
 console = Console()
 live = None  #  display manager, will be initialized conditionally
