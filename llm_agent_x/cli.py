@@ -12,14 +12,19 @@ from rich.text import Text
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 from bs4 import BeautifulSoup
+from typing import Dict, Optional  # Import Dict, Optional
+from enum import Enum # Import Enum for TaskType
+from typing import Literal
 
-from . import (
+from llm_agent_x import ( # Changed from . to llm_agent_x
     int_to_base26,
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
+    TaskObject, # Import TaskObject
+    TaskFailedException # Import TaskFailedException
 )
-from .backend import AppendMerger, LLMMerger
+from llm_agent_x.backend import AppendMerger, LLMMerger # Changed from .backend to llm_agent_x.backend
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -34,16 +39,14 @@ exporter = OTLPSpanExporter(endpoint=getenv("ARIZE_PHOENIX_ENDPOINT", "http://lo
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
 # Load environment variables
-load_dotenv(
-    ".env", override=True
-)
+load_dotenv(".env", override=True)
+
 # Initialize Console
 console = Console()
-live = None  #  display manager, will be initialized conditionally
-task_tree = Tree(
-    "Agent Execution"
-)  # Root of the real-time task tree, used if live display is active
-task_nodes = {}  # Store references to tree nodes, used if live display is active
+live: Optional[Live] = None  # Initialize live as Optional[Live]
+task_tree = Tree("Agent Execution")
+task_nodes: Dict[str, Tree] = {}  # Explicit type hint for task_nodes
+
 
 # Initialize LLM and Search
 llm = ChatOpenAI(
@@ -383,7 +386,8 @@ def pre_tasks_executed(task, uuid, parent_agent_uuid):
             )
             task_nodes[uuid] = task_tree.add(task_text)
 
-        live.update(task_tree)
+        if live is not None: # Check that live has been initialized before updating.
+            live.update(task_tree)
 
 
 def on_task_executed(task, uuid, response, parent_agent_uuid):
@@ -405,7 +409,8 @@ def on_task_executed(task, uuid, response, parent_agent_uuid):
             console.print(
                 f"[yellow]Warning: Task node {uuid} for task '{task}' not found in tree for completion update.[/yellow]"
             )
-        live.update(task_tree)
+        if live is not None: # Check that live has been initialized before updating.
+            live.update(task_tree)
 
 
 def on_tool_call_executed(
@@ -443,9 +448,16 @@ def on_tool_call_executed(
             console.print(
                 f"[yellow]Warning: Parent task node {uuid} for tool '{tool_name}' not found in tree.[/yellow]"
             )
+        if live is not None: # Check that live has been initialized before updating.
+            live.update(task_tree)
 
-        live.update(task_tree)
 
+#class TaskType(str, Enum):
+#    RESEARCH = "research"
+#    SEARCH = "search"
+#    BASIC = "basic"
+#    TEXT_REASONING = "text/reasoning"
+TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 def main():
     global live  # Allow assignment to the global 'live' variable
@@ -488,8 +500,17 @@ def main():
     parser.add_argument(
         "--no-tree", action="store_true", help="Disable the real-time tree view."
     )
+    parser.add_argument(
+        "--default_subtask_type",
+        type=str,
+        default="basic",
+        choices=["research", "search", "basic", "text/reasoning"],
+        help="The default task type to apply to all subtasks. Should be one of 'research', 'search', 'basic', or 'text/reasoning'.",
+    )
 
     args = parser.parse_args()
+    
+    default_subtask_type: TaskType = args.default_subtask_type # type: ignore
 
     # Update LLM if model argument is different from default used for global llm
     global llm  # Allow modification of global llm
@@ -502,6 +523,21 @@ def main():
         )
 
     tool_llm = llm.bind_tools([brave_web_search])  # , exec_python])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize live display (Rich Tree)
+    if not args.no_tree:
+        console.print("Starting agent with real-time tree view...")
+        live = Live(
+            task_tree,
+            console=console,
+            auto_refresh=True,
+            vertical_overflow="visible",
+        )
+    else:
+        console.print("Starting agent without real-time tree view...")
+        live = None  # Clear live display manager after use
 
     with tracer.start_as_current_span("agent run") as span:
         agent = RecursiveAgent(
@@ -529,24 +565,27 @@ def main():
             ),
         )
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if live is not None:
+                with live: # Execute the agent
+                    response = agent.run()
+            else:
+                response = agent.run()
+                
+        except TaskFailedException as e:
+            console.print_exception() # Output exception to console
+            console.print(f"Task '{args.task}' failed: {e}", style="bold red")
+            response = f"ERROR: Task '{args.task}' failed. See logs for details."
+        except Exception as e:
+            console.print_exception()
+            console.print(f"An unexpected error occurred: {e}", style="bold red")
+            response = f"ERROR: An unexpected error occurred. See logs for details."
 
-        response = ""
-        if not args.no_tree:
-            console.print("Starting agent with real-time tree view...")
-            with Live(
-                task_tree,
-                console=console,
-                auto_refresh=True,
-                vertical_overflow="visible",
-            ) as live_display:
-                live = live_display  # Assign to global variable for callbacks
-                response = agent.run()  # Execute the agent
-            live = None  # Clear live display manager after use
-        else:
-            console.print("Starting agent without real-time tree view...")
-            # 'live' remains None, callbacks will skip tree updates
-            response = agent.run()
+        finally: # Ensure cleanup regardless of result
+            if live is not None:
+                 live.stop()  # Ensure live display is stopped
+            live = None
+
 
         # Save Flowchart
         flowchart_file = output_dir / "flowchart.mmd"

@@ -15,13 +15,14 @@ from langchain_openai import ChatOpenAI
 
 # from langchain_community.utilities import SearxSearchWrapper # Removed, brave search is used
 from icecream import ic
+from typing import Dict, List # Import Dict, List
 
-from . import (
+from llm_agent_x import (  # Changed from . to llm_agent_x
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
 )  # Adjusted import
-from .backend import AppendMerger, LLMMerger  # Adjusted import
+from llm_agent_x.backend import AppendMerger, LLMMerger  # Adjusted import
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -90,6 +91,7 @@ def brave_web_search(query: str, num_results: int) -> str:
         Extract and normalize text content from an HTML element.
 
         :param element: The HTML element to extract content from.
+
         :return: A string containing the cleaned-up text content of the element.
         """
         return element.get_text(" ", strip=True)
@@ -286,13 +288,8 @@ def brave_web_search(query: str, num_results: int) -> str:
                                     "content": snippet.strip(),
                                 }
                             )
-                # Brave search already returns a list of dicts, which is then formatted as JSON string.
-                # The agent expects a JSON string, so we should return json.dumps(extracted_results_for_llm)
-                # However, cli.py's brave_web_search returns the list directly,
-                # and the LLM/tool binding handles serialization if needed.
-                # For consistency with cli.py's brave_web_search, returning the list.
-                # The type hint says "-> str" but the implementation returns a list.
-                # Correcting this to return a JSON string as per the docstring and common tool usage.
+
+                #  The agent expects a JSON string, so we should return json.dumps(extracted_results_for_llm)
                 return json.dumps(extracted_results_for_llm)
 
             if "errors" in json_response_data:
@@ -385,7 +382,17 @@ def main():
     tool_llm = llm.bind_tools([brave_web_search])  # Updated to brave_web_search
 
     with open(args.prompts, "r") as f:
-        prompts = json.loads(f.read())
+        try:
+            prompts: List[str] = json.load(f) # Add prompt type
+            if not isinstance(prompts, list): # if prompts is not a List
+                raise TypeError("Expected prompts to be a List of strings")
+            for prompt in prompts:
+                if not isinstance(prompt, str): # Check each entry in prompt if its a str
+                    raise TypeError("Each entry of Prompts should be a String")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format in prompts file: {e}")
+        except TypeError as e:
+            raise ValueError(f"Issue with List: {e}")
 
     responses = []
     for i, prompt_task in enumerate(
@@ -400,30 +407,30 @@ def main():
             span.set_attribute("task.prompt", prompt_task)
             span.set_attribute("agent.model", args.model)
 
-            agent = RecursiveAgent(
-                task=prompt_task,
-                u_inst=args.u_inst,
-                tracer=tracer,  # Pass tracer
-                tracer_span=span,  # Pass current span
-                agent_options=RecursiveAgentOptions(
-                    # max_layers=args.max_layers, # Removed, task_limit is used
-                    search_tool=brave_web_search,  # Updated
-                    llm=llm,
-                    tool_llm=tool_llm,
-                    tools=[],  # No additional non-search tools by default
-                    allow_search=True,
-                    allow_tools=False,  # Matched cli.py
-                    tools_dict={
-                        "web_search": brave_web_search,  # For compatibility if agent calls "web_search"
-                        "brave_web_search": brave_web_search,
-                        # "exec_python": exec_python, "exec": exec_python # Uncomment if needed
-                    },
-                    task_limits=TaskLimit.from_array(eval(args.task_limit)),
-                    merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
-                    # Callbacks like pre_task_executed are not added to keep eval script simpler
-                ),
-            )
             try:
+                agent = RecursiveAgent(
+                    task=prompt_task,
+                    u_inst=args.u_inst,
+                    tracer=tracer,  # Pass tracer
+                    tracer_span=span,  # Pass current span
+                    agent_options=RecursiveAgentOptions(
+                        # max_layers=args.max_layers, # Removed, task_limit is used
+                        search_tool=brave_web_search,  # Updated
+                        llm=llm,
+                        tool_llm=tool_llm,
+                        tools=[],  # No additional non-search tools by default
+                        allow_search=True,
+                        allow_tools=False,  # Matched cli.py
+                        tools_dict={
+                            "web_search": brave_web_search,  # For compatibility if agent calls "web_search"
+                            "brave_web_search": brave_web_search,
+                            # "exec_python": exec_python, "exec": exec_python # Uncomment if needed
+                        },
+                        task_limits=TaskLimit.from_array(eval(args.task_limit)),
+                        merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
+                        # Callbacks like pre_task_executed are not added to keep eval script simpler
+                    ),
+                )
                 response = agent.run()
                 responses.append(
                     {
