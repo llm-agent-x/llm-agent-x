@@ -86,6 +86,8 @@ class TaskObject(BaseModel):
 class task(TaskObject):  # pylint: disable=invalid-name
     uuid: str
 
+class verification(BaseModel):  # pylint: disable=invalid-name
+    successful: bool
 
 class SplitTask(BaseModel):
     needs_subtasks: bool
@@ -174,6 +176,7 @@ class RecursiveAgent:
         self.tool_llm = self.options.tool_llm
         self.tools = self.options.tools
         self.task_split_parser = JsonOutputParser(pydantic_object=SplitTask)
+        self.task_verification_parser = JsonOutputParser(pydantic_object=verification)
         self.uuid = uuid
         self.current_layer = current_layer
         self.parent = parent
@@ -415,10 +418,11 @@ class RecursiveAgent:
             self.logger.info(f"Checking if we have enough to complete the task")
 
             try:
-                self.fix_task(dict(zip(subtask_tasks_for_summary, subtask_results)))
+                self.verify_result(dict(zip(subtask_tasks_for_summary, subtask_results)))
                 self.status = "succeded"
             except TaskFailedException:
                 self.status = "failed"
+                self.fix()
             
             self.logger.info("Summarizing subtask results.")
             self.result = self._summarize_subtask_results(
@@ -1006,129 +1010,80 @@ class RecursiveAgent:
         )
         return split_task_result
 
-    def fix_task(self, tar: List) -> SplitTask:
+    def _verify_result(self, tar: List) -> SplitTask:
         self.logger.info(f"Splitting task: '{self.task}'")
-        task_history = self._build_task_split_history(tar)
+        task_history = self._build_task_verify_history(tar)
         max_subtasks = int(self._get_max_subtasks()/2)
         self.logger.debug(f"Max subtasks for splitting: {max_subtasks}")
 
         system_msg_content = (
-            f"Split this task into smaller ones only if necessary. You can create up to {max_subtasks} subtasks. "
-            "Do not attempt to answer it yourself.\n\n"
-            "Consider these tasks that are already being worked on or have been completed:\n"
-            f"{task_history}\n\n"
-            "When splitting the current task, make sure to:\n"
-            "1. Avoid overlap with existing tasks\n"
-            "2. Build upon completed parent tasks\n"
-            "3. Complement parallel tasks\n"
-            "4. Split only if the task is too complex for a single response\n"
-            f"5. Create no more than {max_subtasks} subtasks\n\n"
+            "Your job is to verify the results of an autonomous process. You will be given a task, and a result, and your job is to "
+            "decide if the task has been completed successfully. Don't verify the information, just make sure that it is plausible, and "
+            "that it responds to the right question. Just say that it is or isn't successful"
         )
 
-        if self.u_inst:
-            system_msg_content += (
-                "Also, use this user-provided info to help you, and include any details in your output:\n"
-                f"{self.u_inst}\n"
-            )
-        self.logger.debug(
-            f"System message for task splitting LLM: {system_msg_content}"
+        human_msg_1_content = (
+            "Here is the task:\n"
+            f"> {self.task}\n\n"
+            "And here is the result:\n\n\n"
+            "```markdown\n"
+            f"{self.result}\n"
+            "```"
         )
+        # self.logger.debug(
+        #     f"System message for answer verification LLM: {system_msg_content}"
+        # )
 
         system_msg = SystemMessage(content=system_msg_content)
-        split_msgs_hist = [system_msg, HumanMessage(self.task)]
+        verify_msgs_hist = [system_msg, HumanMessage(human_msg_1_content), AIMessage(content="Here is a list of smaller tasks contributing to the task you gave:\n\n1. ")]
 
-        self.logger.debug("Evaluating prompt complexity for task splitting.")
-        evaluation = evaluate_prompt(
-            f"Prompt: {self.task}"
-        )
-        self.logger.debug(f"Prompt evaluation result: {evaluation}")
+        current_task_span = self.current_span 
 
-        current_task_span = self.current_span  # Use the main task span if available
-        if current_task_span:
-            current_task_span.set_attribute(
-                "prompt_complexity.score", evaluation.prompt_complexity_score[0]
-            )
-            current_task_span.set_attribute(
-                "prompt_complexity.domain_knowledge", evaluation.domain_knowledge[0]
-            )
-            current_task_span.set_attribute(
-                "prompt_complexity.contextual_knowledge",
-                evaluation.contextual_knowledge[0],
-            )
-            current_task_span.set_attribute(
-                "prompt_complexity.task_type", evaluation.task_type_1[0]
-            )
-
-        if (
-            evaluation.prompt_complexity_score[0] < 0.5
-            and evaluation.domain_knowledge[0] > 0.8
-        ):  # Adjusted logic based on example
-            self.logger.info(
-                "Task complexity/domain knowledge suggests no subtasks needed based on evaluation."
-            )
-            if current_task_span:
-                current_task_span.add_event(
-                    "Skipping split due to low complexity/high domain knowledge"
-                )
-            return SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)
-
-        if current_task_span:
-            current_task_span.add_event(
-                "Attempting Task Split",
-                {"task": self.task, "max_subtasks": max_subtasks},
-            )
-
-        self.logger.info("Invoking LLM for task splitting (initial textual response).")
+        self.logger.info("Invoking LLM for answer verification (initial textual response).")
         # Priming with "1. " to encourage a list format
-        response = self.llm.invoke(split_msgs_hist + [AIMessage(content="Here is a list of smaller tasks contributing to the task you gave:\n\n1. ")])
-        self.logger.debug(f"LLM initial split response content: {response.content}")
-        # Add the LLM's generated list (including our "1. " prefix) to history for the JSON formatting step
-        split_msgs_hist.append(AIMessage(content="1. " + response.content))
+        response = self.llm.invoke(verify_msgs_hist)
+        
+        verify_msgs_hist.append(response)
 
-        split_msgs_hist.append(self._construct_subtask_to_json_prompt())
-        self.logger.info("Invoking LLM for task splitting (JSON formatting).")
+        self.logger.debug(f"LLM initial verification response content: {response.content}")
+
+        verify_msgs_hist.append(self._construct_verify_answer_prompt())
+        self.logger.info("Invoking LLM for answer verification (JSON formatting).")
+        # This is an AIMessage
         structured_response_msg = self.llm.invoke(
-            split_msgs_hist
-        )  # This is an AIMessage
-        self.logger.debug(
-            f"LLM structured split response content: {structured_response_msg.content}"
+            verify_msgs_hist
         )
 
-        split_task_result: SplitTask
+        verification_result: verification = None
         try:
             # JsonOutputParser expects a str or BaseMessage.
             # structured_response_msg is an AIMessage.
-            parsed_output_from_llm = self.task_split_parser.invoke(
+            parsed_output_from_llm = self.task_verification_parser.invoke(
                 structured_response_msg
             )
 
             if isinstance(parsed_output_from_llm, dict):
                 # Ensure our locally computed 'evaluation' takes precedence or is added.
-                parsed_output_from_llm["evaluation"] = evaluation
-                split_task_result = SplitTask(**parsed_output_from_llm)
+                
+                verification_result = verification_result(**parsed_output_from_llm)
             elif isinstance(parsed_output_from_llm, SplitTask):
-                split_task_result = parsed_output_from_llm
-                split_task_result.evaluation = (
-                    evaluation  # Override or set the evaluation
-                )
+                verification_result = parsed_output_from_llm
             else:
                 self.logger.error(
                     f"Unexpected type from task_split_parser: {type(parsed_output_from_llm)}. Content: {str(parsed_output_from_llm)[:500]}"
                 )
-                split_task_result = SplitTask(
-                    needs_subtasks=False, subtasks=[], evaluation=evaluation
-                )
+                verification_result = verification(successful=True) # We'll assume the task was completed successfully because otherwise we we are judging it based of an invalid JSON result.
 
             if current_task_span:
                 current_task_span.add_event(
-                    "Split Task Parsed",
+                    "Answer verification complete",
                     {
                         "parsed_ok": True,
-                        "needs_subtasks": split_task_result.needs_subtasks,
-                        "num_subtasks_parsed": len(split_task_result.subtasks),
+                        "task_successful": verification_result.successful,
                     },
                 )
 
+            return verification_result.successful
         except (
             ValidationError,
             OutputParserException,
@@ -1141,9 +1096,7 @@ class RecursiveAgent:
             if current_task_span:
                 current_task_span.record_exception(e)
                 current_task_span.add_event("Split Task Parsing Failed")
-            split_task_result = SplitTask(
-                needs_subtasks=False, subtasks=[], evaluation=evaluation
-            )
+            split_task_result = verification(successful=True)
         except Exception as e:  # Catch-all for unexpected issues
             self.logger.error(
                 f"Unexpected error during task splitting finalization: {e}. LLM content: {str(structured_response_msg.content)[:500]}",
@@ -1152,50 +1105,38 @@ class RecursiveAgent:
             if current_task_span:
                 current_task_span.record_exception(e)
                 current_task_span.add_event("Split Task Finalization Failed")
-            split_task_result = SplitTask(
-                needs_subtasks=False, subtasks=[], evaluation=evaluation
-            )
+            split_task_result = verification(successful=True)
 
-        self.logger.debug(f"Parsed split task result: {split_task_result}")
+        return split_task_result.successful
 
-        if split_task_result.subtasks:
-            original_subtask_count = len(split_task_result.subtasks)
-            split_task_result.subtasks = split_task_result.subtasks[:max_subtasks]
-            current_num_subtasks = len(split_task_result.subtasks)
-            split_task_result.needs_subtasks = current_num_subtasks > 0
-            if current_num_subtasks < original_subtask_count:
-                self.logger.info(
-                    f"Trimmed subtasks from {original_subtask_count} to {current_num_subtasks} due to max_subtasks limit of {max_subtasks}."
-                )
-                if current_task_span:
-                    current_task_span.add_event(
-                        "Subtasks Trimmed",
-                        {
-                            "original_count": original_subtask_count,
-                            "new_count": current_num_subtasks,
-                            "max_allowed": max_subtasks,
-                        },
-                    )
+    def verify_result(self, tar: List):
+        successful = self._verify_result(tar)
+        self.status = "success" if successful else "failure"
+        if not successful:
+            raise TaskFailedException("Task was not completed successfully.")
+        
+    def fix(self, tar: List):
+        self._fix(tar)
 
-        else:  # No subtasks parsed or an error occurred leading to empty subtasks
-            split_task_result.needs_subtasks = False
-            split_task_result.subtasks = []
+    def _fix(self, tar: List):
+        self.logger.info(f"Fixing task: '{self.task}'")
 
-        # Assign UUIDs to subtasks if they are TaskObject and don't have one (they shouldn't)
-        # The 'task' class (lowercase, subclass of TaskObject) has uuid, but SplitTask uses List[TaskObject]
-        for i, subtask_obj in enumerate(split_task_result.subtasks):
-            # We'll create 'task' instances (which include UUID) for child agents later.
-            # Here, we're just dealing with TaskObject.
-            # If TaskObject itself needed a UUID directly, it would be:
-            # if not hasattr(subtask_obj, "uuid"):
-            #    subtask_obj.uuid = str(uuid.uuid4()) # This would modify TaskObject schema or require it to allow extra fields.
-            # For now, UUID generation for subtasks is implicitly handled when creating child RecursiveAgents.
-            self.logger.debug(f"Subtask {i+1} for splitting: {subtask_obj.task}")
+        # Create a new single agent to fix the task. allow it int(<max tasks> / 2) subtasks on the first layer, and only 1 layer. Pass in this agent's history as context, including all tool calls, subtasks, and results. Let it do anything that the current agent can.
 
-        self.logger.info(
-            f"Task splitting finished. Needs subtasks: {split_task_result.needs_subtasks}. Number of subtasks generated: {len(split_task_result.subtasks)}"
+        # Initialize agent
+        self.logger.info("Initializing fix agent.")
+        fix_agent = RecursiveAgent(
+            task=self.task,
+            options=self.options,
+            llm=self.llm,
+            tracer=self.tracer,
+            logger=self.logger,
+            tracer_span=self.current_span,
         )
-        return split_task_result
+
+        # Run fix agent
+        self.logger.info("Running fix agent.")
+        fix_agent.run()
 
     def _get_max_subtasks(self) -> int:
         """Get the maximum number of subtasks allowed at the current layer"""
@@ -1284,8 +1225,7 @@ class RecursiveAgent:
                 f"Summarization complete (not aligned). Result: {str(merged_content)[:100]}..."
             )
             return merged_content  # Return the direct merged content
-
-    def _construct_subtask_to_json_prompt(self):
+    def _construct_answer_to_json_prompt(self):
         # Providing an example might help the LLM more than just the schema.
         example_task_object = TaskObject(
             task="Example subtask", subtasks=0, allow_search=True, allow_tools=True
@@ -1334,6 +1274,26 @@ class RecursiveAgent:
             f"```json\n{{\n"
             f'  "needs_subtasks": false,\n'
             f'  "subtasks": []\n'
+            f"}}\n```\n"
+            "Provide only the JSON object as your response."
+        )
+        self.logger.debug(f"Constructed subtask to JSON prompt: {prompt_content}")
+        return HumanMessage(prompt_content)
+
+    def _construct_verify_answer_prompt(self):
+        # Providing an example might help the LLM more than just the schema.
+        example_verification_object = verification(
+            successful=True,
+        )
+        json_schema_str = verification.model_json_schema()
+        
+
+        prompt_content = (
+            f"Now, make that into a json object. Use the `successful` field to indicate if the task was completed successfully. "
+            f"Schema:\n```json\n{json_schema_str}\n```\n"
+            "Example:\n"
+            f"```json\n{{\n"
+            f'  "successful": true\n'
             f"}}\n```\n"
             "Provide only the JSON object as your response."
         )
