@@ -212,7 +212,7 @@ class RecursiveAgent:
             "parent_contexts": parent_contexts,
             "sibling_contexts": sibling_contexts,
         }
-        self.logger.debug(f"Context information built: {context_info}")
+        # self.logger.debug(f"Context information built: {context_info}")
         return context_info
 
     def _build_task_split_history(self) -> str:
@@ -467,7 +467,7 @@ class RecursiveAgent:
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_message_content),
         ]
-        self.logger.debug(f"Initial history for single task LLM: {history}")
+        # self.logger.debug(f"Initial history for single task LLM: {history}")
 
         tracer_to_use = self.tracer if self.tracer else trace.get_tracer(__name__)
         parent_otel_ctx_for_single_task = trace.set_span_in_context(span) if span else otel_context.get_current()

@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import sys
 import time
 from os import getenv, environ
 from pathlib import Path
@@ -14,17 +15,17 @@ from rich.text import Text
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 from bs4 import BeautifulSoup
-from typing import Dict, Optional  # Import Dict, Optional
+from typing import Dict, List, Optional  # Import Dict, Optional
 from enum import Enum # Import Enum for TaskType
 from typing import Literal
-
+import hashlib
 from sumy.parsers.html import HtmlParser
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer as Summarizer
 from sumy.nlp.stemmers import Stemmer
 from sumy.utils import get_stop_words
-
+import redis
 
 from llm_agent_x import ( # Changed from . to llm_agent_x
     int_to_base26,
@@ -75,6 +76,13 @@ flowchart = ["flowchart TD"]
 task_ids: dict[str, str] = {}
 
 LANGUAGE = "english"
+
+redis_host = getenv("REDIS_HOST", "localhost")  # Default to localhost if not set
+redis_port = int(getenv("REDIS_PORT", 6379))  # Default to 6379 if not set
+redis_db = int(getenv("REDIS_DB", 0))  # Default to 0 if not set
+redis_expiry = int(getenv("REDIS_EXPIRY", 3600))  # Cache expiry in seconds (default 1 hour)
+
+
 def get_or_set_task_id(id: str) -> str | None:
     if id not in task_ids:
         result = int_to_base26(len(task_ids))
@@ -110,21 +118,40 @@ def get_page_text_content(soup: BeautifulSoup) -> str:
     # text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-
-def brave_web_search(query: str, num_results: int) -> str:
+def brave_web_search(query: str, num_results: int) -> List[Dict[str, str]]:
     """
-    Perform a web search with the given query and number of results using the Brave Search API, returning JSON-formatted results. **Make sure to be very specific in your search phrase. Ask for specific information, not general information.**
+    Perform a web search with the given query and number of results using the Brave Search API, returning JSON-formatted results. 
+    Make sure to be very specific in your search phrase. Ask for specific information, not general information.
 
     :param query: The search query.
     :param num_results: The desired number of results. This will be passed as the 'count' parameter to the Brave API.
-    :return: A JSON-formatted string containing the search results, or a JSON-formatted error message if the API call fails or returns an error.
+    :return: A JSON-formatted list of dictionaries containing the search results (title, url, content),
+             or an empty list if the API call fails, returns an error, or no results are found.
     """
-    import time
-    import requests
-    import json
-    from os import getenv
-    from bs4 import BeautifulSoup
 
+    
+
+    try:
+        r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+        r.ping()  # Check connection
+        print("Redis connection successful.")
+    except redis.exceptions.ConnectionError as e:
+        print(f"Redis connection failed: {e}.  Caching disabled.")
+        r = None  # Disable caching if connection fails
+
+    # --- 1. Cache Key Generation ---
+    cache_key = hashlib.md5(f"{query}_{num_results}".encode("utf-8")).hexdigest()
+
+    # --- 2. Attempt Cache Retrieval ---
+    if r:
+        cached_result = r.get(cache_key)
+        if cached_result:
+            print("Cache hit!")
+            try:
+                return json.loads(cached_result.decode("utf-8"))
+            except json.JSONDecodeError:
+                print("Error decoding JSON from cache.  Ignoring cached result.")
+                pass  # Fall through to API call
     # Some constants for request handling
     SCRAPE_TIMEOUT_SECONDS = 10
     max_scrape_chars = 5000  # Example max character count for scrape
@@ -143,12 +170,8 @@ def brave_web_search(query: str, num_results: int) -> str:
 
     api_key = getenv("BRAVE_API_KEY")
     if not api_key or api_key == "YOUR_ACTUAL_BRAVE_API_KEY_HERE":
-        return json.dumps(
-            {
-                "error": "BRAVE_API_KEY environment variable not set or is a placeholder.",
-                "results": [],
-            }
-        )
+        print("BRAVE_API_KEY environment variable not set or is a placeholder.")
+        return []  # Return empty list instead of JSON error
 
     base_url = "https://api.search.brave.com/res/v1/web/search"
     brave_headers = {
@@ -182,13 +205,8 @@ def brave_web_search(query: str, num_results: int) -> str:
                     time.sleep(retry_wait_time)
                     continue  # Retry the request
                 else:
-                    return json.dumps(
-                        {
-                            "error": "Rate limit exceeded. Exhausted all retries.",
-                            "status_code": 429,
-                            "results": [],
-                        }
-                    )
+                    print("Rate limit exceeded. Exhausted all retries.")
+                    return [] # Return empty list instead of JSON error
 
             search_response.raise_for_status()
             json_response_data = search_response.json()
@@ -343,24 +361,34 @@ def brave_web_search(query: str, num_results: int) -> str:
                                 }
                             )
 
+                # --- 4. Cache the Result (if successful) ---
+                if r and extracted_results_for_llm:
+                    try:
+                        r.setex(
+                            cache_key,
+                            redis_expiry,
+                            json.dumps(extracted_results_for_llm),
+                        )
+                        print("Result cached in Redis.")
+                    except Exception as e:
+                        print(f"Error caching result: {e}")
+
                 return extracted_results_for_llm
 
             if "errors" in json_response_data:
-                return json.dumps(
-                    {
-                        "error": "API returned errors in response",
-                        "details": json_response_data["errors"],
-                        "results": [],
-                    }
+                print(
+                    "API returned errors in response",
                 )
+                return []
             if not extracted_results_for_llm:
                 return []  # No web results found or processed
 
         except Exception as e:
-            return json.dumps(
-                {"error": f"An unexpected error occurred: {str(e)}", "results": []}
-            )
+            print(f"An unexpected error occurred: {str(e)}")
+            return [] #Return empty list instead of JSON error
 
+
+    return [] # Return empty list if all retries fail
 
 def exec_python(code, globals=None, locals=None):
     """
