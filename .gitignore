@@ -8,3 +8,4 @@ output/*
 dist/
 llm_agent_x.log
 openai_proxy/openai-caching-proxy-worker
+openai-caching-proxy-worker
