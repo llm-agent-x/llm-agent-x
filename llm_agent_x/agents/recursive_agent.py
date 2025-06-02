@@ -594,9 +594,7 @@ class RecursiveAgent:
         evaluation = evaluate_prompt(f"Prompt: {self.task}") # Assuming evaluate_prompt is defined elsewhere
         if self.current_span:
             self.current_span.set_attribute("prompt_complexity.score", evaluation.prompt_complexity_score[0])
-            # ... other evaluation attributes ...
 
-        # Simplified logic from original, assuming it worked:
         if evaluation.prompt_complexity_score[0] < 0.1   and evaluation.domain_knowledge[0] > 0.8:
             self.logger.info("Task complexity/domain knowledge suggests no subtasks needed based on evaluation.")
             return SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)

@@ -35,8 +35,7 @@ from llm_agent_x import ( # Changed from . to llm_agent_x
     TaskObject, # Import TaskObject
     TaskFailedException # Import TaskFailedException
 )
-from llm_agent_x.backend import AppendMerger, LLMMerger # Changed from .backend to llm_agent_x.backend
-
+from llm_agent_x.backend import AppendMerger, LLMMerger, AlgorithmicMerger # Changed from .backend to llm_agent_x.backend
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -544,7 +543,7 @@ def main():
         "--merger",
         type=str,
         default="ai",
-        choices=["ai", "append"],
+        choices=["ai", "append", "algorithmic"],
         help="Merger type: 'ai' or 'append'.",
     )
     parser.add_argument(
@@ -611,7 +610,7 @@ def main():
                     # "exec_python": exec_python, "exec": exec_python # Uncomment if exec_python is to be used
                 },
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
-                merger={"ai": LLMMerger, "append": AppendMerger}[args.merger],
+                merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],
             ),
         )
 
