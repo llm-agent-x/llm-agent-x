@@ -1,5 +1,44 @@
 [
-    "Research the impact of climate change on polar bears",
-    "Research the history of the usage of statistics in gambling.",
-    "Research the impact of the internet on the more questionable industries of the media."
+  {
+    "id": "quantum_computing_algorithms",
+    "task_limit": "[3,2,0]",
+    "task": "Compare and contrast the potential advantages and limitations of Shor's algorithm and Grover's algorithm in the context of breaking modern cryptographic systems. Include an analysis of their computational complexity and the current state of research on quantum error correction relevant to their implementation.",
+    "u_inst": "Assume the target audience is a researcher with a background in computer science but not necessarily quantum computing. Provide clear definitions of relevant quantum computing concepts. Cite academic sources and research papers."
+  },
+  {
+    "id": "novel_drug_discovery",
+    "task_limit": "[3,2,0]",
+    "task": "Analyze the current state of AI-driven drug discovery, focusing on generative models like GANs and diffusion models for designing novel drug candidates. Evaluate their efficacy in predicting drug-target interactions and optimizing drug properties such as ADMET (Absorption, Distribution, Metabolism, Excretion, Toxicity). Discuss the challenges in validating these AI-generated candidates through in-vitro and in-vivo experiments.",
+    "u_inst": "Emphasize the limitations and ethical considerations associated with using AI in drug discovery, such as data bias and the potential for generating toxic compounds. Provide specific examples of successful AI-designed drugs that have reached clinical trials. Cite reputable scientific journals and pharmaceutical industry reports."
+  },
+  {
+    "id": "climate_change_geoengineering",
+    "task_limit": "[3,2,0]",
+    "task": "Assess the potential benefits and risks of various geoengineering techniques (e.g., solar radiation management, carbon capture) as strategies to mitigate climate change. Analyze their potential impacts on different regions of the world, considering both environmental and socioeconomic factors. Evaluate the ethical and governance challenges associated with their deployment.",
+    "u_inst": "Focus on the current scientific consensus on the feasibility and potential side effects of each technique. Provide a balanced discussion of opposing viewpoints from climate scientists, policymakers, and environmental advocacy groups. Cite reports from the IPCC and peer-reviewed publications in climate science."
+  },
+  {
+    "id": "blockchain_supply_chain",
+    "task_limit": "[3,2,0]",
+    "task": "Investigate the application of blockchain technology in improving supply chain transparency and traceability. Analyze the challenges in integrating blockchain with existing supply chain systems and the potential for enhancing efficiency, reducing fraud, and promoting sustainability. Evaluate the scalability, security, and regulatory aspects of using blockchain in global supply chains.",
+    "u_inst": "Provide examples of successful blockchain implementations in various industries (e.g., food, pharmaceuticals, fashion). Discuss the role of smart contracts and IoT devices in automating supply chain processes. Cite industry reports, academic papers, and case studies."
+  },
+  {
+    "id": "fusion_energy_viability",
+    "task_limit": "[3,2,0]",
+    "task": "Evaluate the current prospects for achieving commercially viable fusion energy. Analyze the progress made in magnetic confinement fusion (e.g., ITER, tokamaks) and inertial confinement fusion (e.g., laser-driven fusion) and their respective challenges in achieving energy breakeven and sustained operation. Discuss the advancements in materials science and plasma physics necessary for fusion energy to become a reality.",
+    "u_inst": "Compare and contrast the different approaches to fusion energy and their technological hurdles. Provide a timeline for when fusion energy might become a significant source of electricity, according to current projections. Cite research papers, reports from fusion energy laboratories, and expert opinions in the field."
+  },
+  {
+    "id": "aging_longevity_interventions",
+    "task_limit": "[3,2,0]",
+    "task": "Research and synthesize the most promising interventions aimed at slowing down or reversing the aging process and promoting longevity. Analyze the scientific evidence supporting the efficacy of these interventions (e.g., senolytics, mTOR inhibitors, gene therapy) in model organisms and humans. Discuss the ethical considerations and potential societal impacts of significantly extending human lifespan.",
+    "u_inst": "Focus on interventions that have shown reproducible results in multiple studies and have a strong biological rationale. Provide a critical assessment of the limitations of current research and the challenges in translating findings from animal models to humans. Cite peer-reviewed publications, clinical trial data, and expert opinions from biogerontologists and medical ethicists."
+  },
+  {
+    "id": "neuromorphic_computing_applications",
+    "task_limit": "[3,2,0]",
+    "task": "Explore the potential applications of neuromorphic computing, which mimics the structure and function of the human brain, in areas such as artificial intelligence, robotics, and sensor processing. Compare and contrast neuromorphic architectures with traditional von Neumann architectures in terms of energy efficiency, speed, and suitability for different types of workloads. Discuss the challenges in developing software and algorithms for neuromorphic systems.",
+    "u_inst": "Provide specific examples of neuromorphic chips (e.g., Intel's Loihi, IBM's TrueNorth) and their use in solving real-world problems. Analyze the limitations of neuromorphic computing and its potential for complementing or replacing traditional computing in certain applications. Cite research papers, conference proceedings, and expert interviews in the field of neuromorphic engineering."
+  }
 ]
