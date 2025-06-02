@@ -93,6 +93,9 @@ redis_port = int(getenv("REDIS_PORT", 6379))
 redis_db = int(getenv("REDIS_DB", 0))
 redis_expiry = int(getenv("REDIS_EXPIRY", 3600))
 redis_client: Optional[redis.Redis] = None
+
+outputs = []
+
 try:
     redis_client = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
     redis_client.ping()
@@ -501,6 +504,10 @@ def main():
                 console.log("Starting agent run...")
                 response_obj = agent.run()
                 agent_response_text = str(response_obj)
+                outputs.append({
+                    "filename": f"agent_response_{prompt_id}.json",
+                    "content": agent_response_text
+                })
                 agent_run_successful = True
                 console.log(f"Agent run successful. Response preview: {agent_response_text[:100]}...")
             except TaskFailedException as e:
@@ -563,6 +570,13 @@ def main():
         json.dump(all_evaluations_data, f_out, indent=2)
     console.print(f"\n[bold blue]All evaluation results saved to: {eval_output_path}[/bold blue]")
 
+    for output in outputs:
+        output_path = eval_output_path / f"{output["filename"]}.md"
+        if not output_path.parent.exists():
+            output_path.parent.mkdir(parents=True)
+        with output_path.open("w") as f_out:
+            f_out.write(output["content"])
+        console.print(f"\n[bold blue]Output saved to: {output_path}[/bold blue]")
     # --- Print Summary ---
     if all_evaluations_data:
         num_evaluated = len(all_evaluations_data)
