@@ -217,7 +217,7 @@ def evaluate_response_with_llm(
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 def main():
-    # global agent_llm, judge_llm_instance, live_display, task_tree, flowchart
+    global agent_llm #, judge_llm_instance, live_display, task_tree, flowchart
 
     parser = argparse.ArgumentParser(description="Run the LLM agent evaluation.")
     parser.add_argument("prompts_file", type=str, help="Path to the JSON file containing prompts for evaluation.")
