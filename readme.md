@@ -53,6 +53,7 @@ llm-agent-x "Your task description here" --max_layers 2 --output output.md --mod
 - `--model`: The name of the LLM to use (default: value from `DEFAULT_LLM` environment variable, or the hardcoded default in `cli.py` if `DEFAULT_LLM` is not set).
 - `--task_limit`: Array defining task limits per layer (default: "[3,2,2,0]").
 - `--merger`: Strategy for merging results, 'ai' or 'append' (default: 'ai').
+- `--enable-python-execution`: Enable the `exec_python` tool for the agent. If enabled, the agent can choose to execute Python code, potentially in a Docker sandbox if configured (see Python Execution Sandbox section). Defaults to False.
 
 ## Example
 
@@ -131,9 +132,10 @@ PYTHON_SANDBOX_API_URL=http://127.0.0.1:5000
 
 ### Using with the Agent
 To allow the agent to use the `exec_python` tool (and potentially the sandbox):
-1.  Ensure the `exec_python` tool is enabled in `llm_agent_x/cli.py` within the `tools_dict` and `allow_tools=True`. (This was done as part of the feature implementation).
-2.  Make sure the Docker sandbox container is running.
-3.  The agent's underlying LLM must be prompted in a way that it understands when and how to use the `exec_python` tool with the `use_docker_sandbox=True` parameter, and how to specify `files_to_upload` and `cloud_pickle_files_to_load` if needed. This typically involves providing clear instructions and examples in the prompt or task description given to the agent.
+1.  Ensure the `exec_python` tool is enabled in `llm_agent_x/cli.py` by the logic controlled by the `--enable-python-execution` flag. (This was done as part of the feature implementation).
+2.  Make sure the Docker sandbox container is running if you intend to use `use_docker_sandbox=True`.
+3.  To make the `exec_python` tool available to the agent, use the `--enable-python-execution` command-line flag when running `llm-agent-x`.
+4.  If enabled, the agent's underlying LLM must be prompted in a way that it understands when and how to use the `exec_python` tool (including its parameters like `use_docker_sandbox`, `files_to_upload`, and `cloud_pickle_files_to_load`). This typically involves providing clear instructions and examples in the prompt or task description given to the agent.
 
 **Example `exec_python` call (if used directly):**
 ```python

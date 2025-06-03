@@ -103,6 +103,11 @@ def main():
         choices=["research", "search", "basic", "text/reasoning"],
         help="The default task type to apply to all subtasks. Should be one of 'research', 'search', 'basic', or 'text/reasoning'.",
     )
+    parser.add_argument(
+        "--enable-python-execution",
+        action="store_true",
+        help="Enable the exec_python tool for the agent. (Requires Docker for sandbox mode)",
+    )
 
     args = parser.parse_args()
     
@@ -120,7 +125,19 @@ def main():
             temperature=0.5,
         )
 
-    tool_llm = llm.bind_tools([brave_web_search])  # , exec_python])
+    # Prepare tools based on the CLI flag
+    available_tools = [brave_web_search]
+    tools_dict_for_agent = {
+        "web_search": brave_web_search,
+        "brave_web_search": brave_web_search,
+    }
+
+    if args.enable_python_execution:
+        available_tools.append(exec_python)
+        tools_dict_for_agent["exec_python"] = exec_python
+        tools_dict_for_agent["exec"] = exec_python # Alias
+
+    tool_llm = llm.bind_tools(available_tools)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,15 +166,11 @@ def main():
                 on_task_executed=on_task_executed,
                 on_tool_call_executed=on_tool_call_executed,
                 llm=llm,
-                tool_llm=tool_llm,
-                tools=[],
-                allow_search=True,
-                allow_tools=True,
-                tools_dict={
-                    "web_search": brave_web_search,
-                    "brave_web_search": brave_web_search,
-                    "exec_python": exec_python, "exec": exec_python
-                },
+                tool_llm=tool_llm, # This tool_llm is now correctly bound
+                tools=[], # This 'tools' list in RecursiveAgentOptions seems to be different from the bound tools. Keep as is unless its purpose is clarified.
+                allow_search=True, # Assuming brave_web_search is always allowed if available
+                allow_tools=True if args.enable_python_execution else False,
+                tools_dict=tools_dict_for_agent,
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],
             ),
