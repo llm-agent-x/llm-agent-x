@@ -23,7 +23,7 @@ from llm_agent_x.constants import LANGUAGE, redis_db, redis_expiry, redis_host
 
 def brave_web_search(query: str, num_results: int) -> List[Dict[str, str]]:
     """
-    Perform a web search with the given query and number of results using the Brave Search API, returning JSON-formatted results. 
+    Perform a web search with the given query and number of results using the Brave Search API, returning JSON-formatted results.
     Make sure to be very specific in your search phrase. Ask for specific information, not general information.
 
     :param query: The search query.
@@ -31,8 +31,6 @@ def brave_web_search(query: str, num_results: int) -> List[Dict[str, str]]:
     :return: A JSON-formatted list of dictionaries containing the search results (title, url, content),
              or an empty list if the API call fails, returns an error, or no results are found.
     """
-
-
 
     try:
         r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
@@ -109,7 +107,7 @@ def brave_web_search(query: str, num_results: int) -> List[Dict[str, str]]:
                     continue  # Retry the request
                 else:
                     print("Rate limit exceeded. Exhausted all retries.")
-                    return [] # Return empty list instead of JSON error
+                    return []  # Return empty list instead of JSON error
 
             search_response.raise_for_status()
             json_response_data = search_response.json()
@@ -195,15 +193,21 @@ def brave_web_search(query: str, num_results: int) -> List[Dict[str, str]]:
                                         #     snippet
                                         #     + " [Note: Full content exceeded character limit]"
                                         # )
-                                        SENTENCES_COUNT = math.floor(len(main_content_text) / 150)
+                                        SENTENCES_COUNT = math.floor(
+                                            len(main_content_text) / 150
+                                        )
 
-                                        parser = PlaintextParser.from_string(main_content_text, Tokenizer(LANGUAGE))
+                                        parser = PlaintextParser.from_string(
+                                            main_content_text, Tokenizer(LANGUAGE)
+                                        )
                                         stemmer = Stemmer(LANGUAGE)
 
                                         summarizer = Summarizer(stemmer)
                                         summarizer.stop_words = get_stop_words(LANGUAGE)
 
-                                        content_for_llm = " ".join(summarizer(parser.document, SENTENCES_COUNT))
+                                        content_for_llm = " ".join(
+                                            summarizer(parser.document, SENTENCES_COUNT)
+                                        )
 
                                     else:  # Scraped text was empty
                                         print(
@@ -288,7 +292,6 @@ def brave_web_search(query: str, num_results: int) -> List[Dict[str, str]]:
 
         except Exception as e:
             print(f"An unexpected error occurred: {str(e)}")
-            return [] #Return empty list instead of JSON error
+            return []  # Return empty list instead of JSON error
 
-
-    return [] # Return empty list if all retries fail
+    return []  # Return empty list if all retries fail

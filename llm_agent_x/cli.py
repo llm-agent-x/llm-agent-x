@@ -7,35 +7,46 @@ import nltk
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 from typing import Optional  # Import Dict, Optional
-from enum import Enum # Import Enum for TaskType
+from enum import Enum  # Import Enum for TaskType
 from typing import Literal
 from sumy.parsers.html import HtmlParser
 
-from llm_agent_x import ( # Changed from . to llm_agent_x
+from llm_agent_x import (  # Changed from . to llm_agent_x
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
-    TaskObject, # Import TaskObject
-    TaskFailedException # Import TaskFailedException
+    TaskObject,  # Import TaskObject
+    TaskFailedException,  # Import TaskFailedException
 )
-from llm_agent_x.backend import AppendMerger, LLMMerger, AlgorithmicMerger # Changed from .backend to llm_agent_x.backend
+from llm_agent_x.backend import (
+    AppendMerger,
+    LLMMerger,
+    AlgorithmicMerger,
+)  # Changed from .backend to llm_agent_x.backend
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
-from llm_agent_x.backend.callbacks.mermaidjs_callbacks import pre_tasks_executed, on_task_executed, on_tool_call_executed, save_flowchart
+from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
+    pre_tasks_executed,
+    on_task_executed,
+    on_tool_call_executed,
+    save_flowchart,
+)
 from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.tools.brave_web_search import brave_web_search
 
-nltk.download('punkt_tab', force=False)
+nltk.download("punkt_tab", force=False)
 
 # Setup (only needed once)
 trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer(__name__)
 
-exporter = OTLPSpanExporter(endpoint=getenv("ARIZE_PHOENIX_ENDPOINT", "http://localhost:6006/v1/traces"))
+exporter = OTLPSpanExporter(
+    endpoint=getenv("ARIZE_PHOENIX_ENDPOINT", "http://localhost:6006/v1/traces")
+)
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
 # Load environment variables
@@ -53,6 +64,7 @@ search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:80
 output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
+
 
 def main():
     global live  # Allow assignment to the global 'live' variable
@@ -104,10 +116,8 @@ def main():
     )
 
     args = parser.parse_args()
-    
-    default_subtask_type: TaskType = args.default_subtask_type # type: ignore
 
-
+    default_subtask_type: TaskType = args.default_subtask_type  # type: ignore
 
     # Update LLM if model argument is different from default used for global llm
     global llm  # Allow modification of global llm
@@ -152,19 +162,23 @@ def main():
                     "brave_web_search": brave_web_search,
                 },
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
-                merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],
+                merger={
+                    "ai": LLMMerger,
+                    "append": AppendMerger,
+                    "algorithmic": AlgorithmicMerger,
+                }[args.merger],
             ),
         )
 
         try:
             if live is not None:
-                with live: # Execute the agent
+                with live:  # Execute the agent
                     response = agent.run()
             else:
                 response = agent.run()
-                
+
         except TaskFailedException as e:
-            console.print_exception() # Output exception to console
+            console.print_exception()  # Output exception to console
             console.print(f"Task '{args.task}' failed: {e}", style="bold red")
             response = f"ERROR: Task '{args.task}' failed. See logs for details."
         except Exception as e:
@@ -172,11 +186,10 @@ def main():
             console.print(f"An unexpected error occurred: {e}", style="bold red")
             response = f"ERROR: An unexpected error occurred. See logs for details."
 
-        finally: # Ensure cleanup regardless of result
+        finally:  # Ensure cleanup regardless of result
             if live is not None:
-                 live.stop()  # Ensure live display is stopped
+                live.stop()  # Ensure live display is stopped
             live = None
-
 
         save_flowchart(output_dir)
 

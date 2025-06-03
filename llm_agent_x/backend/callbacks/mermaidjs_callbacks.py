@@ -7,6 +7,7 @@ from llm_agent_x import int_to_base26
 from rich.text import Text
 
 from llm_agent_x.console import console, task_tree, live
+
 task_nodes: Dict[str, Tree] = {}  # Explicit type hint for task_nodes
 
 
@@ -50,7 +51,7 @@ def pre_tasks_executed(task, uuid, parent_agent_uuid):
             )
             task_nodes[uuid] = task_tree.add(task_text)
 
-        if live is not None: # Check that live has been initialized before updating.
+        if live is not None:  # Check that live has been initialized before updating.
             live.update(task_tree)
 
 
@@ -73,7 +74,7 @@ def on_task_executed(task, uuid, response, parent_agent_uuid):
             console.print(
                 f"[yellow]Warning: Task node {uuid} for task '{task}' not found in tree for completion update.[/yellow]"
             )
-        if live is not None: # Check that live has been initialized before updating.
+        if live is not None:  # Check that live has been initialized before updating.
             live.update(task_tree)
 
 
@@ -112,7 +113,7 @@ def on_tool_call_executed(
             console.print(
                 f"[yellow]Warning: Parent task node {uuid} for tool '{tool_name}' not found in tree.[/yellow]"
             )
-        if live is not None: # Check that live has been initialized before updating.
+        if live is not None:  # Check that live has been initialized before updating.
             live.update(task_tree)
 
 
@@ -126,8 +127,8 @@ def render_flowchart():
 
 
 def save_flowchart(output_dir: Path):
-        # Save Flowchart
-        flowchart_file = output_dir / "flowchart.mmd"
-        with flowchart_file.open("w") as flowchart_o:
-            flowchart_o.write(render_flowchart())
-        console.print(f"Flowchart saved to {flowchart_file}")
+    # Save Flowchart
+    flowchart_file = output_dir / "flowchart.mmd"
+    with flowchart_file.open("w") as flowchart_o:
+        flowchart_o.write(render_flowchart())
+    console.print(f"Flowchart saved to {flowchart_file}")
