@@ -35,6 +35,7 @@ from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
 )
 from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
+from llm_agent_x.llm_manager import llm, model_tree, tool_llm
 from llm_agent_x.tools.brave_web_search import brave_web_search
 from llm_agent_x.cli_args_parser import parser
 
@@ -52,40 +53,35 @@ trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 # Load environment variables
 
 
-
 # Initialize LLM and Search
-llm = ChatOpenAI(
-    base_url=openai_base_url,
-    api_key=openai_api_key,
-    model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
-    temperature=0.5,
-)
+# llm = ChatOpenAI(
+#     base_url=openai_base_url,
+#     api_key=openai_api_key,
+#     model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
+#     temperature=0.5,
+# )
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 
-
 def main():
     global live
-
 
     args = parser.parse_args()
 
     default_subtask_type: TaskType = args.default_subtask_type  # type: ignore
 
     # Update LLM if model argument is different from default used for global llm
-    global llm  # Allow modification of global llm
-    if args.model != getenv("DEFAULT_LLM", "gpt-4o-mini"):
-        llm = ChatOpenAI(
-            base_url=openai_base_url,
-            api_key=openai_api_key,
-            model=args.model,
-            temperature=0.5,
-        )
-
-    tool_llm = llm.bind_tools([brave_web_search])
+    # global llm  # Allow modification of global llm
+    # if args.model != getenv("DEFAULT_LLM", "gpt-4o-mini"):
+    #     llm = ChatOpenAI(
+    #         base_url=openai_base_url,
+    #         api_key=openai_api_key,
+    #         model=args.model,
+    #         temperature=0.5,
+    #     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,8 +104,7 @@ def main():
                 pre_task_executed=pre_tasks_executed,
                 on_task_executed=on_task_executed,
                 on_tool_call_executed=on_tool_call_executed,
-                llm=llm,
-                tool_llm=tool_llm,
+                llm=(model_tree),
                 tools=[],
                 allow_search=True,
                 allow_tools=False,
