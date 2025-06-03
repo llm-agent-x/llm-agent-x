@@ -28,6 +28,7 @@ from llm_agent_x.backend.callbacks.mermaidjs_callbacks import pre_tasks_executed
 from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.tools.brave_web_search import brave_web_search
+from llm_agent_x.tools.exec_python import exec_python
 
 nltk.download('punkt_tab', force=False)
 
@@ -151,11 +152,11 @@ def main():
                 tool_llm=tool_llm,
                 tools=[],
                 allow_search=True,
-                allow_tools=False,  # Set to True if you want tools like exec_python to be considered by the agent's planning
+                allow_tools=True,
                 tools_dict={
                     "web_search": brave_web_search,
                     "brave_web_search": brave_web_search,
-                    # "exec_python": exec_python, "exec": exec_python # Uncomment if exec_python is to be used
+                    "exec_python": exec_python, "exec": exec_python
                 },
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],

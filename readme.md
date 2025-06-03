@@ -96,3 +96,74 @@ Project dependencies are managed with Poetry and are listed in the `pyproject.to
 ## License
 
 This project is licensed under the MIT License.
+
+## Python Execution Sandbox (Optional)
+
+LLM Agent X includes an optional Dockerized sandbox environment for executing Python code. This provides isolation and allows for pre-loading files and cloudpickle objects into the execution namespace.
+
+### Features
+-   **Isolated Execution**: Code runs inside a Docker container.
+-   **File Uploads**: Upload scripts or data files directly to the sandbox's workspace.
+-   **Cloudpickle Support**: Load `.pkl` files (created with `cloudpickle`) into the Python execution scope.
+-   **REST API**: The sandbox is controlled via a simple REST API.
+
+### Building the Sandbox Image
+From the root of the repository:
+```sh
+docker build -t python-sandbox .
+```
+
+### Running the Sandbox Container
+To run the sandbox container and make it accessible on port 5000:
+```sh
+docker run -d -p 5000:5000 --rm python-sandbox
+```
+The `--rm` flag automatically removes the container when it exits.
+The `-d` flag runs it in detached mode.
+
+### Configuration
+The `exec_python` tool will interact with this sandbox if `use_docker_sandbox=True` is passed to it.
+By default, it expects the sandbox API to be at `http://localhost:5000`.
+You can configure this URL by setting the `PYTHON_SANDBOX_API_URL` environment variable for the environment running `llm-agent-x` (not for the Docker container itself). For example, in your `.env` file:
+```env
+PYTHON_SANDBOX_API_URL=http://127.0.0.1:5000
+```
+
+### Using with the Agent
+To allow the agent to use the `exec_python` tool (and potentially the sandbox):
+1.  Ensure the `exec_python` tool is enabled in `llm_agent_x/cli.py` within the `tools_dict` and `allow_tools=True`. (This was done as part of the feature implementation).
+2.  Make sure the Docker sandbox container is running.
+3.  The agent's underlying LLM must be prompted in a way that it understands when and how to use the `exec_python` tool with the `use_docker_sandbox=True` parameter, and how to specify `files_to_upload` and `cloud_pickle_files_to_load` if needed. This typically involves providing clear instructions and examples in the prompt or task description given to the agent.
+
+**Example `exec_python` call (if used directly):**
+```python
+from llm_agent_x.tools.exec_python import exec_python
+
+# Assuming sandbox is running and test_script.py exists locally
+# and data.pkl was generated using cloudpickle.
+
+# 1. Create dummy files for demonstration
+with open("test_script.py", "w") as f:
+    f.write("my_obj = LOADED_PICKLES.get('data.pkl')\nprint(f'Loaded data: {my_obj}')\nprint('Hello from sandbox script!')")
+
+import cloudpickle
+with open("data.pkl", "wb") as f:
+    cloudpickle.dump({"key": "value"}, f)
+
+# 2. Execute using the sandbox
+result = exec_python(
+    code="with open('/workspace/test_script.py', 'r') as f: exec(f.read())", # Execute the uploaded script
+    use_docker_sandbox=True,
+    files_to_upload=["test_script.py", "data.pkl"],
+    cloud_pickle_files_to_load=["data.pkl"] # Path relative to sandbox workspace
+)
+print(result)
+
+# Expected output (or similar):
+# {'stdout': "Loaded data: {'key': 'value'}\nHello from sandbox script!\n", 'stderr': '', 'error': None}
+
+# Don't forget to clean up dummy files
+import os
+os.remove("test_script.py")
+os.remove("data.pkl")
+```
