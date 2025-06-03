@@ -645,7 +645,6 @@ class RecursiveAgent:
                     f"Tool Interaction Loop Iteration {loop_count}"
                 )
 
-                # Use full history for token counting, but preview for logging
                 full_prompt_str_for_tokens = "\n".join(
                     [str(m.content) for m in history]
                 )
@@ -692,152 +691,174 @@ class RecursiveAgent:
                         "LLM Responded Without Tool Calls - Final Answer",
                         {"final_answer_preview": final_result_content[:200]},
                     )
-                    break
+                    break # Exit loop
 
-                tool_messages_for_this_turn = []
-                guidance_for_llm_reprompt = []
-                any_tool_requires_llm_replan = False
+                # If there are tool calls, process them in a dedicated span
+                with self.tracer.start_as_current_span(
+                    "Processing Tool Calls Batch", context=trace.set_span_in_context(single_task_span)
+                ) as batch_tool_span:
+                    tool_calls_in_batch = current_llm_response.tool_calls or []
+                    batch_tool_span.set_attribute("tool_calls.count_in_batch", len(tool_calls_in_batch))
+                    
+                    tool_messages_for_this_turn = []
+                    guidance_for_llm_reprompt = []
+                    any_tool_requires_llm_replan = False
 
-                for tool_call in current_llm_response.tool_calls:
-                    tool_name = tool_call["name"]
-                    tool_args = tool_call["args"]
-                    tool_call_id = tool_call["id"]
-                    tool_executed_successfully_this_iteration = False
-                    this_tool_call_needs_llm_replan = False
-                    human_message_for_this_tool_failure = None
-                    current_tool_output_payload = None
+                    for tool_call_idx, tool_call in enumerate(tool_calls_in_batch):
+                        tool_name = tool_call["name"]
+                        tool_args = tool_call["args"]
+                        tool_call_id = tool_call["id"]
+                        
+                        # Create a span for each individual tool call
+                        with self.tracer.start_as_current_span(
+                            f"Process Tool Call: {tool_name}", context=trace.set_span_in_context(batch_tool_span)
+                        ) as individual_tool_span:
+                            individual_tool_span.set_attributes({
+                                "tool.name": tool_name,
+                                "tool.args": json.dumps(tool_args, default=str),
+                                "tool.call_id": tool_call_id,
+                                "tool.index_in_batch": tool_call_idx,
+                            })
 
-                    single_task_span.add_event(
-                        "Tool Call Processing Start",
-                        {
-                            "tool_name": tool_name,
-                            "tool_args": json.dumps(tool_args, default=str),
-                            "tool_call_id": tool_call_id,
-                        },
-                    )
+                            tool_executed_successfully_this_iteration = False
+                            this_tool_call_needs_llm_replan = False
+                            human_message_for_this_tool_failure = None
+                            current_tool_output_payload = None
+                            
+                            individual_tool_span.add_event("Tool execution attempt initiated")
 
-                    try:
-                        if tool_name not in self.options.tools_dict:
-                            raise KeyError(f"Tool '{tool_name}' not found.")
-                        tool_to_execute = self.options.tools_dict[tool_name]
+                            try:
+                                if tool_name not in self.options.tools_dict:
+                                    raise KeyError(f"Tool '{tool_name}' not found.")
+                                tool_to_execute = self.options.tools_dict[tool_name]
 
-                        if tool_name == "search" and "query" in tool_args:
-                            query = tool_args["query"]
-                            sim = calculate_raw_similarity(query, self.task)
-                            single_task_span.add_event(
-                                "Search Tool Query Similarity Check",
-                                {"query": query, "similarity_score": sim},
-                            )
-                            if sim < (self.options.similarity_threshold / 5):
-                                error_detail = f"Search query '{query}' too dissimilar (score: {sim:.2f}). Revise."
-                                current_tool_output_payload = {"error": error_detail}
-                                human_message_for_this_tool_failure = error_detail
+                                if tool_name == "search" and "query" in tool_args:
+                                    query = tool_args["query"]
+                                    sim = calculate_raw_similarity(query, self.task)
+                                    individual_tool_span.add_event(
+                                        "Search Tool Query Similarity Check",
+                                        {"query": query, "similarity_score": sim, "threshold": self.options.similarity_threshold / 5},
+                                    )
+                                    if sim < (self.options.similarity_threshold / 5):
+                                        error_detail = f"Search query '{query}' too dissimilar (score: {sim:.2f}) to main task. Revise query."
+                                        current_tool_output_payload = {"error": error_detail, "guidance": "The search query was too different from the main task. Please rephrase your search to be more relevant or break down the problem differently."}
+                                        human_message_for_this_tool_failure = f"Search query '{query}' for tool '{tool_name}' was too dissimilar to the main task. Please adjust your plan or query."
+                                        this_tool_call_needs_llm_replan = True
+                                        individual_tool_span.add_event(
+                                            "Search Tool Query Dissimilar",
+                                            {"error_detail": error_detail},
+                                        )
+                                        individual_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, "Search query dissimilar"))
+                                    else:
+                                        individual_tool_span.add_event("Executing search tool with accepted query")
+                                        current_tool_output_payload = tool_to_execute(**tool_args)
+                                        tool_executed_successfully_this_iteration = True
+                                else:
+                                    individual_tool_span.add_event(f"Executing non-search tool: {tool_name}")
+                                    current_tool_output_payload = tool_to_execute(**tool_args)
+                                    tool_executed_successfully_this_iteration = True
+                                
+                                individual_tool_span.add_event(
+                                    "Tool execution completed",
+                                    {"output_preview": str(current_tool_output_payload)[:200]}
+                                )
+                                if tool_executed_successfully_this_iteration:
+                                     individual_tool_span.set_status(trace.Status(trace.StatusCode.OK))
+
+
+                            except Exception as e:
+                                error_msg_str = f"Error with tool {tool_name} (ID: {tool_call_id}): {e}"
+                                self.logger.error(error_msg_str, exc_info=True)
+                                current_tool_output_payload = {
+                                    "error": "Tool execution failed",
+                                    "details": error_msg_str,
+                                }
+                                human_message_for_this_tool_failure = f"Error with tool '{tool_name}': {e}. Adjust your plan."
                                 this_tool_call_needs_llm_replan = True
-                                single_task_span.add_event(
-                                    "Search Tool Query Dissimilar",
-                                    {"error_detail": error_detail},
-                                )
-                            else:
-                                current_tool_output_payload = tool_to_execute(
-                                    **tool_args
-                                )
-                                tool_executed_successfully_this_iteration = True
-                        else:
-                            current_tool_output_payload = tool_to_execute(**tool_args)
-                            tool_executed_successfully_this_iteration = True
-                    except Exception as e:
-                        error_msg_str = (
-                            f"Error with tool {tool_name} (ID: {tool_call_id}): {e}"
-                        )
-                        self.logger.error(error_msg_str, exc_info=True)
-                        current_tool_output_payload = {
-                            "error": "Tool execution failed",
-                            "details": error_msg_str,
-                        }
-                        human_message_for_this_tool_failure = (
-                            f"Error with '{tool_name}': {e}. Adjust plan."
-                        )
-                        this_tool_call_needs_llm_replan = True
-                        single_task_span.record_exception(
-                            e,
-                            attributes={
-                                "tool_name": tool_name,
-                                "tool_call_id": tool_call_id,
-                            },
-                        )
+                                
+                                individual_tool_span.record_exception(e)
+                                individual_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, f"Tool {tool_name} execution failed: {str(e)}"))
 
-                    tool_message_content_final_str = json.dumps(
-                        current_tool_output_payload, default=str
-                    )
-                    tool_messages_for_this_turn.append(
-                        ToolMessage(
-                            content=tool_message_content_final_str,
-                            tool_call_id=tool_call_id,
-                        )
-                    )
-
-                    single_task_span.add_event(
-                        "Tool Call Processing End",
-                        {
-                            "tool_name": tool_name,
-                            "tool_call_id": tool_call_id,
-                            "tool_response_preview": tool_message_content_final_str[
-                                :200
-                            ],
-                            "tool_success": tool_executed_successfully_this_iteration,
-                            "requires_llm_replan": this_tool_call_needs_llm_replan,
-                        },
-                    )
-
-                    if self.options.on_tool_call_executed:
-                        self.options.on_tool_call_executed(
-                            self.task,
-                            self.uuid,
-                            tool_name,
-                            tool_args,
-                            current_tool_output_payload,
-                            tool_executed_successfully_this_iteration,
-                            tool_call_id,
-                        )
-
-                    if this_tool_call_needs_llm_replan:
-                        any_tool_requires_llm_replan = True
-                        if human_message_for_this_tool_failure:
-                            guidance_for_llm_reprompt.append(
-                                human_message_for_this_tool_failure
+                            tool_message_content_final_str = json.dumps(current_tool_output_payload, default=str)
+                            tool_messages_for_this_turn.append(
+                                ToolMessage(content=tool_message_content_final_str, tool_call_id=tool_call_id)
                             )
+                            individual_tool_span.add_event(
+                                "ToolMessage prepared",
+                                {"content_preview": tool_message_content_final_str[:200]}
+                            )
+
+                            individual_tool_span.set_attributes({
+                                "tool.execution_successful": tool_executed_successfully_this_iteration,
+                                "tool.requires_llm_replan": this_tool_call_needs_llm_replan,
+                                "tool.response_preview": tool_message_content_final_str[:200] # Redundant with event but useful as attribute
+                            })
+
+                            if self.options.on_tool_call_executed:
+                                individual_tool_span.add_event("Invoking on_tool_call_executed callback")
+                                try:
+                                    self.options.on_tool_call_executed(
+                                        self.task, self.uuid, tool_name, tool_args,
+                                        current_tool_output_payload, tool_executed_successfully_this_iteration, tool_call_id
+                                    )
+                                    individual_tool_span.add_event("on_tool_call_executed callback finished successfully")
+                                except Exception as cb_ex:
+                                    individual_tool_span.record_exception(cb_ex, {"callback_name": "on_tool_call_executed"})
+                                    self.logger.error(f"Error in on_tool_call_executed callback: {cb_ex}", exc_info=True)
+
+
+                            if this_tool_call_needs_llm_replan:
+                                any_tool_requires_llm_replan = True
+                                if human_message_for_this_tool_failure:
+                                    guidance_for_llm_reprompt.append(human_message_for_this_tool_failure)
+                    
+                    # After loop of tool calls, still inside "Processing Tool Calls Batch" span
+                    batch_tool_span.set_attribute("any_tool_requires_llm_replan_after_batch", any_tool_requires_llm_replan)
+                    if guidance_for_llm_reprompt:
+                        batch_tool_span.set_attribute("llm_reprompt_guidance_messages_count", len(guidance_for_llm_reprompt))
+                        batch_tool_span.add_event("LLM reprompt guidance prepared", {"guidance_preview": "\n".join(guidance_for_llm_reprompt)[:300]})
+                    
+                    if not any_tool_requires_llm_replan:
+                         batch_tool_span.set_status(trace.Status(trace.StatusCode.OK))
+                    else:
+                         batch_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, "One or more tools require LLM replan"))
+
 
                 history.extend(tool_messages_for_this_turn)
 
                 if any_tool_requires_llm_replan:
                     replan_message_content = (
-                        "Review tool issues and adjust plan:\n"
-                        + "\n".join(guidance_for_llm_reprompt)
+                        "One or more tool actions resulted in errors or require a change of plan. "
+                        "Review the previous tool outputs and your reasoning. Adjust your plan and continue towards the main goal.\n"
+                        "Specific issues encountered:\n" + "\n".join([f"- {g}" for g in guidance_for_llm_reprompt])
                         if guidance_for_llm_reprompt
-                        else "One or more tool calls had issues. Please review the tool responses and adjust your plan."
+                        else "One or more tool calls had issues. Please review the tool responses and adjust your plan. Re-evaluate your approach to the main task."
                     )
                     history.append(HumanMessage(content=replan_message_content))
-                    single_task_span.add_event(
-                        "LLM Re-Plan Requested",
-                        {"reason": replan_message_content[:200]},
+                    single_task_span.add_event( # This event is on the main single_task_span
+                        "LLM Re-Plan Requested After Tool Batch",
+                        {"replan_reason_preview": replan_message_content[:300]},
                     )
-                    continue
+                    continue # Continue the main while loop for LLM to re-plan
 
             if loop_count >= max_loops:
                 single_task_span.add_event(
                     "Max Tool Loop Iterations Reached", {"max_loops": max_loops}
                 )
-                if history and isinstance(
-                    history[-1], AIMessage
-                ):  # Check if history is not empty and last is AIMessage
+                single_task_span.set_status(trace.Status(trace.StatusCode.ERROR, "Max tool loop iterations reached"))
+                if history and isinstance(history[-1], AIMessage):
                     final_result_content = str(history[-1].content)
+                elif history and isinstance(history[-1], ToolMessage): # If loop ended after tool messages but before AI
+                    final_result_content = "Max tool loop iterations reached. Last action was a tool call. No final AI response generated."
+            else: # Loop broke due to no tool calls, meaning LLM provided final answer
+                single_task_span.set_status(trace.Status(trace.StatusCode.OK))
+
 
             single_task_span.add_event(
                 "Single Task Execution End",
                 {"final_result_preview": final_result_content[:200]},
             )
             return final_result_content
-
     def _split_task(self) -> SplitTask:
         agent_span = self.current_span
         parent_context_for_split = (
