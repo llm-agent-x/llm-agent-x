@@ -15,4 +15,4 @@ class AppendMerger:
         if not documents:
             return ""
 
-        "\n\n".join(documents)
+        return "\n\n".join(documents)
