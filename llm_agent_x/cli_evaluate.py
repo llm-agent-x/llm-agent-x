@@ -45,6 +45,11 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 
+from llm_agent_x.backend.callbacks.mermaidjs_callbacks import pre_tasks_executed, on_task_executed, on_tool_call_executed
+from llm_agent_x.console import console, task_tree, live
+from llm_agent_x.constants import openai_api_key, openai_base_url
+from llm_agent_x.tools.brave_web_search import brave_web_search
+
 nltk.download('punkt', quiet=True) # Changed from punkt_tab, ensure 'punkt' tokenizer is available
 
 # --- OpenTelemetry Setup ---
@@ -68,8 +73,8 @@ console = Console()
 # --- LLM and Search Initialization ---
 # Agent LLM
 agent_llm = ChatOpenAI(
-    base_url=getenv("OPENAI_BASE_URL"),
-    api_key=getenv("OPENAI_API_KEY"),
+    base_url=openai_base_url,
+    api_key=openai_api_key,
     model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
     temperature=0.5,
 )
@@ -103,130 +108,6 @@ try:
 except redis.exceptions.ConnectionError as e:
     print(f"Redis connection failed: {e}. Caching disabled.")
     redis_client = None
-
-# --- Helper Functions (mostly from cli.py) ---
-def get_or_set_task_id(task_uuid: str) -> str: # Renamed param for clarity
-    if task_uuid not in task_ids:
-        result = int_to_base26(len(task_ids))
-        task_ids[task_uuid] = result
-        return result
-    else:
-        return task_ids[task_uuid]
-
-def add_to_flowchart(line: str):
-    flowchart.append(f"    {line}")
-
-def render_flowchart():
-    return "\n".join(flowchart)
-
-def get_page_text_content_soup(soup: BeautifulSoup) -> str: # Renamed to avoid conflict
-    for script_or_style in soup(["script", "style"]):
-        script_or_style.decompose()
-    text = soup.get_text(separator=" ", strip=True)
-    return text
-
-def brave_web_search(query: str, num_results: int = 3) -> List[Dict[str, str]]:
-    # --- Brave Search (copied and adapted from cli.py) ---
-    # Ensure redis_client is used if available
-    global redis_client
-
-    cache_key = hashlib.md5(f"brave_search_{query}_{num_results}".encode("utf-8")).hexdigest()
-    if redis_client:
-        cached_result = redis_client.get(cache_key)
-        if cached_result:
-            console.log(f"Cache hit for Brave search query: {query}")
-            try:
-                return json.loads(cached_result.decode("utf-8"))
-            except json.JSONDecodeError:
-                console.log("Error decoding JSON from cache. Ignoring cached result.")
-
-    SCRAPE_TIMEOUT_SECONDS = 10
-    max_scrape_chars = 5000
-    REQUEST_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-
-    api_key = getenv("BRAVE_API_KEY")
-    if not api_key or api_key == "YOUR_ACTUAL_BRAVE_API_KEY_HERE":
-        console.log("[bold red]BRAVE_API_KEY environment variable not set or is a placeholder.[/bold red]")
-        return []
-
-    base_url = "https://api.search.brave.com/res/v1/web/search"
-    brave_headers = {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": api_key,
-    }
-    params = {"q": query, "count": num_results}
-    extracted_results_for_llm = []
-
-    try:
-        search_response = requests.get(base_url, headers=brave_headers, params=params, timeout=15)
-        search_response.raise_for_status()
-        json_response_data = search_response.json()
-
-        if json_response_data.get("web") and json_response_data["web"].get("results"):
-            search_results_to_process = json_response_data["web"]["results"]
-            for i, result in enumerate(search_results_to_process[:num_results]): # Respect num_results
-                title = result.get("title")
-                url = result.get("url")
-                snippet = result.get("description", "")
-                content_for_llm = snippet
-
-                if url:
-                    try:
-                        page_response = requests.get(url, headers=REQUEST_HEADERS, timeout=SCRAPE_TIMEOUT_SECONDS, allow_redirects=True)
-                        page_response.raise_for_status()
-                        content_type = page_response.headers.get("Content-Type", "").lower()
-
-                        if "text/html" in content_type:
-                            soup = BeautifulSoup(page_response.content, "lxml")
-                            main_content_text = ""
-                            main_content_elements = soup.find_all(["article", "main", {"role": "main"}])
-                            if main_content_elements:
-                                for el in main_content_elements:
-                                    main_content_text += get_page_text_content_soup(el) + " "
-                            if not main_content_text.strip() and soup.body:
-                                main_content_text = get_page_text_content_soup(soup.body)
-                            
-                            main_content_text = main_content_text.strip()
-
-                            if main_content_text:
-                                if len(main_content_text) > max_scrape_chars:
-                                    # Summarize if too long
-                                    sentences_count = max(5, math.floor(max_scrape_chars / 200)) # Heuristic for sentence count
-                                    parser = PlaintextParser.from_string(main_content_text, Tokenizer(LANGUAGE))
-                                    stemmer = Stemmer(LANGUAGE)
-                                    summarizer = Summarizer(stemmer)
-                                    summarizer.stop_words = get_stop_words(LANGUAGE)
-                                    summary_sentences = summarizer(parser.document, sentences_count)
-                                    content_for_llm = " ".join(str(s) for s in summary_sentences)
-                                    content_for_llm += " [Content summarized due to length]"
-                                else:
-                                    content_for_llm = main_content_text
-                        else:
-                            content_for_llm += f" [Note: Content was not HTML, type: {content_type}]"
-                    except Exception as e:
-                        content_for_llm += f" [Note: Error scraping page {url}: {str(e)[:100]}]"
-                
-                extracted_results_for_llm.append({
-                    "title": title or "N/A",
-                    "url": url or "N/A",
-                    "content": content_for_llm.strip()
-                })
-        
-        if redis_client and extracted_results_for_llm:
-            redis_client.setex(cache_key, redis_expiry, json.dumps(extracted_results_for_llm))
-            console.log(f"Brave search result for '{query}' cached.")
-
-    except requests.exceptions.RequestException as e:
-        console.log(f"[bold red]Brave Search API request failed: {e}[/bold red]")
-        return [{"error": str(e)}] # Return error structure
-    except Exception as e:
-        console.log(f"[bold red]An unexpected error occurred in brave_web_search: {e}[/bold red]")
-        return [{"error": str(e)}]
-
-    return extracted_results_for_llm
 
 
 def exec_python(code: str, globals_dict: Optional[Dict] = None, locals_dict: Optional[Dict] = None) -> Any:
@@ -362,9 +243,6 @@ def main():
     parser.add_argument(
         "--no_live_tree", action="store_true", help="Disable the real-time Rich tree view during agent runs."
     )
-    parser.add_argument(
-        "--save_flowcharts", action="store_true", help="Save individual Mermaid flowcharts for each evaluation run."
-    )
     # Kept for compatibility with cli.py structure, though not directly used by RecursiveAgent
     parser.add_argument(
         "--default_subtask_type", type=str, default="basic",
@@ -383,13 +261,13 @@ def main():
     # --- Initialize/Update LLMs based on args ---
     if args.agent_model != agent_llm.model_name:
         agent_llm = ChatOpenAI(
-            base_url=getenv("OPENAI_BASE_URL"), api_key=getenv("OPENAI_API_KEY"),
+            base_url=openai_base_url, api_key=openai_api_key,
             model=args.agent_model, temperature=0.5
         )
         console.log(f"Agent LLM set to: {args.agent_model}")
 
     judge_llm_instance = ChatOpenAI(
-        base_url=getenv("OPENAI_BASE_URL"), api_key=getenv("OPENAI_API_KEY"),
+        base_url=openai_base_url, api_key=openai_api_key,
         model=args.judge_model, temperature=0.2 # Judge should be more deterministic
     )
     console.log(f"Judge LLM set to: {args.judge_model}")
@@ -549,13 +427,6 @@ def main():
                 "judge_evaluation": judge_evaluation_dict,
             })
             all_evaluations_data.append(current_eval_data)
-
-            if args.save_flowcharts:
-                flowchart_content = render_flowchart()
-                flowchart_file = output_dir / f"flowchart_{prompt_id.replace('/', '_')}.mmd"
-                with flowchart_file.open("w") as fc_out:
-                    fc_out.write(flowchart_content)
-                console.log(f"Flowchart saved to {flowchart_file}")
 
     if live_display:
         live_display.stop() # Stop live display after all evaluations

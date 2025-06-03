@@ -119,19 +119,14 @@ def main():
             temperature=0.5,
         )
 
-    tool_llm = llm.bind_tools([brave_web_search])  # , exec_python])
+    tool_llm = llm.bind_tools([brave_web_search])
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize live display (Rich Tree)
     if not args.no_tree:
         console.print("Starting agent with real-time tree view...")
-        live = Live(
-            task_tree,
-            console=console,
-            auto_refresh=True,
-            vertical_overflow="visible",
-        )
+        live = live
     else:
         console.print("Starting agent without real-time tree view...")
         live = None  # Clear live display manager after use
@@ -151,11 +146,10 @@ def main():
                 tool_llm=tool_llm,
                 tools=[],
                 allow_search=True,
-                allow_tools=False,  # Set to True if you want tools like exec_python to be considered by the agent's planning
+                allow_tools=False,
                 tools_dict={
                     "web_search": brave_web_search,
                     "brave_web_search": brave_web_search,
-                    # "exec_python": exec_python, "exec": exec_python # Uncomment if exec_python is to be used
                 },
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],
