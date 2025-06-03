@@ -167,7 +167,7 @@ def _serialize_lc_messages_for_preview(
 class RecursiveAgent:
     def __init__(
         self,
-        task: str,
+        task: Any, # Changed from str to Any to allow TaskObject
         u_inst: str,
         tracer: Optional[trace.Tracer] = None,
         tracer_span: Optional[trace.Span] = None,
@@ -178,11 +178,10 @@ class RecursiveAgent:
         parent: Optional["RecursiveAgent"] = None,
         context: Optional[TaskContext] = None,
         siblings: Optional[List["RecursiveAgent"]] = None,
+        task_type_override: Optional[str] = None, # New parameter
     ):
         self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{uuid}")
-        self.logger.info(
-            f"Initializing RecursiveAgent for task: '{task}' at layer {current_layer} with UUID: {uuid}"
-        )
+        # Logging of initial task will be done after task string is determined
 
         if agent_options is None:
             self.logger.info("No agent_options provided, using default configuration.")
@@ -190,8 +189,41 @@ class RecursiveAgent:
                 task_limits=TaskLimit.from_constant(max_tasks=3, max_depth=2)
             )
 
-        self.task = task
+        # Determine actual task string and task type
+        actual_task_string: str
+        determined_task_type: str
+
+        if task_type_override:
+            determined_task_type = task_type_override
+            if isinstance(task, TaskObject):
+                actual_task_string = task.task
+            elif isinstance(task, str):
+                actual_task_string = task
+            else:
+                self.logger.warning(f"Task is of unexpected type {type(task)} with task_type_override. Converting to string.")
+                actual_task_string = str(task)
+            self.logger.info(f"Task type overridden to '{determined_task_type}'.")
+        elif isinstance(task, TaskObject):
+            actual_task_string = task.task
+            determined_task_type = task.type
+            self.logger.info(f"Initialized with TaskObject. Task type set to '{determined_task_type}'.")
+        elif isinstance(task, str):
+            actual_task_string = task
+            determined_task_type = 'research' # Default for string tasks
+            self.logger.info(f"Initialized with string task. Task type defaulted to '{determined_task_type}'.")
+        else: # Fallback for unexpected task types
+            self.logger.warning(f"Task is of unexpected type: {type(task)}. Defaulting task_type to 'research' and converting task to string.")
+            actual_task_string = str(task)
+            determined_task_type = 'research'
+
+        self.task = actual_task_string
+        self.task_type = determined_task_type
         self.u_inst = u_inst
+
+        self.logger.info(
+            f"Initializing RecursiveAgent for task: '{self.task}' (Type: {self.task_type}) at layer {current_layer} with UUID: {uuid}"
+        )
+
         self.tracer = tracer if tracer else trace.get_tracer(__name__)
         self.tracer_span = tracer_span
         self.options = agent_options
@@ -515,8 +547,13 @@ class RecursiveAgent:
                 child_context = TaskContext(
                     task=subtask_obj.task, parent_context=self.context
                 )
+                # Ensure subtask_obj is a TaskObject as expected by this point
+                # The subtasks list from SplitTask should contain TaskObject instances
+                child_task_string = subtask_obj.task
+                child_task_type = subtask_obj.type
+
                 child_agent = RecursiveAgent(
-                    task=subtask_obj.task,
+                    task=child_task_string, # Pass the task string
                     u_inst=self.u_inst,
                     tracer=self.tracer,
                     tracer_span=span,
@@ -527,6 +564,7 @@ class RecursiveAgent:
                     parent=self,
                     context=child_context,
                     siblings=child_agents[:],
+                    task_type_override=child_task_type # Pass the type from TaskObject
                 )
                 child_agents.append(child_agent)
                 child_contexts_for_siblings.append(child_context)
@@ -640,14 +678,30 @@ class RecursiveAgent:
                 },
             )
 
-            system_prompt_content = (
-                f"Your task is to answer the following question, using any tools that you deem necessary. "
-                f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
-                f"If you use the web search tool, make sure you include citations (just use a pair of square "
-                f"brackets and a number in text, and at the end, include a citations section).\n\n"
-                f"Relevant contextual history from other tasks (if any):\n{full_context_str}"
-            )
-            human_message_content = self.task
+            current_task_type = getattr(self, 'task_type', 'research') # Get task_type, default to research
+
+            if current_task_type in ["basic", "task"]:
+                self.logger.info(f"Adjusting system prompt for '{current_task_type}' task type.")
+                system_prompt_content = (
+                    f"You are a helpful assistant. Your current task is to directly execute or answer the following. "
+                    f"Provide a direct, concise answer or the direct output of any tools used. Avoid narrative summaries unless the output itself is narrative. "
+                    f"If you use tools, present their output clearly. For code execution, provide the results of the execution (e.g. stdout, stderr, or the final value of a variable). "
+                    f"For search, provide the information found. "
+                    f"Focus on actionable results or direct answers.\n\n"
+                    f"Current Task: {self.task}\n\n"
+                    f"Relevant contextual history from other tasks (if any):\n{full_context_str}"
+                )
+            else: # Default to 'research' or other types
+                self.logger.info(f"Using standard system prompt for '{current_task_type}' task type.")
+                system_prompt_content = (
+                    f"Your task is to answer the following question, using any tools that you deem necessary. "
+                    f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
+                    f"If you use the web search tool, make sure you include citations (just use a pair of square "
+                    f"brackets and a number in text, and at the end, include a citations section).\n\n"
+                    f"Relevant contextual history from other tasks (if any):\n{full_context_str}"
+                )
+
+            human_message_content = self.task # This remains unchanged as per the plan
             if self.u_inst:
                 human_message_content += (
                     f"\n\nFollow these specific instructions: {self.u_inst}"
@@ -1491,6 +1545,7 @@ class RecursiveAgent:
                 parent=self.parent,
                 context=fixer_agent_context,
                 siblings=self.siblings,
+                task_type_override=self.task_type # Pass original agent's task_type
             )
 
             try:
@@ -1566,6 +1621,50 @@ class RecursiveAgent:
     def _summarize_subtask_results(
         self, tasks: List[str], subtask_results: List[str]
     ) -> str:
+        # ADD THIS BLOCK AT THE BEGINNING OF THE METHOD
+        # Ensure json is imported at the top of the file: import json
+        current_task_type = getattr(self, 'task_type', 'research') # Default to 'research' if not set
+        if current_task_type in ["basic", "task"]:
+            self.logger.info(f"Task type is '{current_task_type}'. Providing status update instead of full summary for task: '{self.task}'.")
+            agent_span = self.current_span # Ensure agent_span is defined for the event
+            if agent_span:
+                summary_span = self.tracer.start_span("Summarize Subtasks Operation (Status Update)", context=trace.set_span_in_context(agent_span))
+            else: # Fallback if no agent_span
+                summary_span = self.tracer.start_span("Summarize Subtasks Operation (Status Update)")
+
+            if not subtask_results:
+                summary_span.add_event("Summarization End: No Results to report for basic/task type.")
+                summary_span.end()
+                return "No subtask results to report."
+
+            status_update_parts = [f"Status update for task: {self.task}"]
+            if not tasks and len(subtask_results) == 1: # Only a single result, no specific task questions
+                status_update_parts.append("Result:")
+                status_update_parts.append(str(subtask_results[0]))
+            elif not tasks and len(subtask_results) > 1: # Multiple results, no specific task questions
+                status_update_parts.append("Results:")
+                # Try to format as JSON if possible, else just join
+                try:
+                    status_update_parts.append(json.dumps(subtask_results, indent=2))
+                except TypeError:
+                    status_update_parts.append("\n".join(map(str, subtask_results)))
+            else: # Results are tied to specific subtask descriptions
+                for i, (task_item, result_item) in enumerate(zip(tasks, subtask_results)):
+                    status_update_parts.append(f"Sub-action {i+1}: {task_item}")
+                    status_update_parts.append(f"  Result: {str(result_item)}")
+
+            final_status_update = "\n".join(status_update_parts)
+            summary_span.add_event(
+                "Summarization End: Provided status update for basic/task type.",
+                {"status_update_preview": final_status_update[:200]}
+            )
+            summary_span.end()
+            return final_status_update
+        else:
+            self.logger.info(f"Task type is '{current_task_type}'. Proceeding with standard summarization for task: '{self.task}'.")
+        # END OF ADDED BLOCK - Original method continues from here
+
+        # Original method content starts here...
         agent_span = self.current_span
         parent_context_for_summary = (
             trace.set_span_in_context(agent_span)
