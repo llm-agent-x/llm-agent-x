@@ -45,15 +45,10 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 
-from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
-    pre_tasks_executed,
-    on_task_executed,
-    on_tool_call_executed,
-)
 from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.tools.brave_web_search import brave_web_search
-
+from llm_agent_x.llm_manager import model_tree
 nltk.download(
     "punkt", quiet=True
 )  # Changed from punkt_tab, ensure 'punkt' tokenizer is available
@@ -79,25 +74,10 @@ load_dotenv(".env", override=True)
 console = Console()
 
 # --- LLM and Search Initialization ---
-# Agent LLM
-agent_llm = ChatOpenAI(
-    base_url=openai_base_url,
-    api_key=openai_api_key,
-    model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
-    temperature=0.5,
-)
 # Judge LLM (can be configured separately)
 judge_llm_instance = None  # To be initialized in main
 
-search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 output_dir = Path(getenv("OUTPUT_DIR", "./output_eval/"))  # Changed default output dir
-
-# --- Flowchart & Rich Tree State (to be reset per evaluation) ---
-flowchart: List[str] = []
-task_ids: Dict[str, str] = {}
-task_tree: Optional[Tree] = None  # Will be re-initialized if live tree is active
-task_nodes: Dict[str, Tree] = {}
-live_display: Optional[Live] = None  # Renamed from 'live' to avoid conflict
 
 # --- Caching ---
 LANGUAGE = "english"
@@ -412,9 +392,6 @@ def main():
         if user_instructions:
             console.print(f"[cyan]User Instructions:[/cyan] {user_instructions}")
 
-        # Reset state for callbacks and flowchart for this evaluation run
-        task_ids.clear()
-        task_nodes.clear()
         flowchart = ["flowchart TD"]
         if task_tree:  # If live tree is active
             task_tree.children.clear()  # Clear children from previous run
@@ -458,7 +435,7 @@ def main():
                     if not args.no_live_tree or args.save_flowcharts
                     else None
                 ),
-                llm=agent_llm,
+                llm=model_tree,
                 tool_llm=agent_tool_llm,
                 tools_dict={  # Ensure tools are correctly mapped
                     "brave_web_search": brave_web_search,
