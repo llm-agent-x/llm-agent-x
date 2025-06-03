@@ -41,9 +41,6 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--llm-tree", type=bool, default=False, help="Whether to use the LLM tree."
-)
-parser.add_argument(
     "--align_summaries",
     type=bool,
     default=True,
