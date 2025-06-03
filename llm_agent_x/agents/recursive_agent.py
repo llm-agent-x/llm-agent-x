@@ -2,6 +2,7 @@ import json
 import uuid
 from difflib import SequenceMatcher
 from typing import Any, Callable, Literal, Optional, List, Dict
+from llm_agent_x.backend.dot_tree import DotTree
 from llm_agent_x.backend.exceptions import TaskFailedException
 from opentelemetry import trace, context as otel_context
 from pydantic import BaseModel, validator, ValidationError
@@ -22,6 +23,7 @@ from llm_agent_x.complexity_model import TaskEvaluation, evaluate_prompt
 import logging
 import tiktoken
 from llm_agent_x.tools.summarize import summarize
+from langchain_core.runnables.base import Runnable
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -120,7 +122,6 @@ class RecursiveAgentOptions(BaseModel):
     on_tool_call_executed: Any = None
     task_tree: list[Any] = []
     llm: Any = None
-    tool_llm: Any = None
     tools: list = []
     allow_search: bool = True
     allow_tools: bool = False
@@ -196,8 +197,7 @@ class RecursiveAgent:
         self.tracer_span = tracer_span # This is the PARENT span for the current agent's operations
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
-        self.llm = self.options.llm
-        self.tool_llm = self.options.tool_llm
+        self.llm: DotTree = self.options.llm
         self.tools = self.options.tools
         self.task_split_parser = JsonOutputParser(pydantic_object=SplitTask)
         self.task_verification_parser = JsonOutputParser(pydantic_object=verification)
@@ -664,7 +664,7 @@ class RecursiveAgent:
                     },
                 )
 
-                current_llm_response = self.tool_llm.invoke(history)
+                current_llm_response = self.llm.resolve("llm.tools").value.invoke(history)
 
                 response_content_str = str(current_llm_response.content)
                 completion_tokens = self._get_token_count(response_content_str)
@@ -937,7 +937,7 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_1,
                 },
             )
-            response1 = self.llm.invoke(primed_hist_1)  # Pass primed history
+            response1 = self.llm.resolve("llm").value.invoke(primed_hist_1)  # Pass primed history
             response_content_1 = "1. " + str(
                 response1.content
             )  # Prepend the prime for full response
@@ -974,7 +974,7 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_2,
                 },
             )
-            response2 = self.llm.invoke(
+            response2 = self.llm.resolve("llm").value.invoke(
                 hist_for_refine
             )  # Use the history including the refine human message
             completion_tokens_2 = self._get_token_count(str(response2.content))
@@ -1004,7 +1004,7 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_3,
                 },
             )
-            structured_response_msg = self.llm.invoke(hist_for_json)
+            structured_response_msg = self.llm.resolve("llm").value.invoke(hist_for_json)
             completion_tokens_3 = self._get_token_count(
                 str(structured_response_msg.content)
             )
@@ -1162,7 +1162,7 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens,
                 },
             )
-            structured_response_msg = self.llm.invoke(
+            structured_response_msg = self.llm.resolve("llm").value.invoke(
                 verify_msgs_hist_for_llm
             )  # LLM completes the primed JSON
 
@@ -1505,8 +1505,9 @@ class RecursiveAgent:
                 else:
                     merged_content.append(document)
 
+            llm = self.llm.resolve("llm.small.tiny").value
             merge_options = MergeOptions(
-                llm=self.llm, context_window=15000
+                llm=llm, context_window=15000
             )  # Assuming self.llm is not None
             merger = self.options.merger(merge_options)
             merged_content_str = "\n".join(merged_content)
@@ -1559,7 +1560,7 @@ class RecursiveAgent:
                     },
                 )
                 # Ensure self.llm is not None before invoking
-                if not self.llm:
+                if not llm:
                     self.logger.error(
                         "LLM for alignment summary is None. Cannot proceed with alignment."
                     )
@@ -1569,7 +1570,7 @@ class RecursiveAgent:
                     )
                     # Keep final_summary as merged_content if alignment LLM is missing
                 else:
-                    aligned_response = self.llm.invoke(alignment_prompt_messages)
+                    aligned_response = llm.invoke(alignment_prompt_messages)
                     final_summary = str(aligned_response.content)
                     completion_tokens = self._get_token_count(final_summary)
                     summary_span.add_event(

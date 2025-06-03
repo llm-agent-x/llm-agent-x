@@ -39,6 +39,10 @@ parser.add_argument(
     choices=["ai", "append", "algorithmic"],
     help="Merger type: 'ai' or 'append'.",
 )
+
+parser.add_argument(
+    "--llm-tree", type=bool, default=False, help="Whether to use the LLM tree."
+)
 parser.add_argument(
     "--align_summaries",
     type=bool,

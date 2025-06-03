@@ -25,15 +25,17 @@ class DotTree:
         return self._value
 
     def resolve(self, key_path):
-        """Optional: manually resolve a path, falling back to parents if needed."""
+        """
+        Resolves the path, but if it doesn't fully exist,
+        returns the nearest existing ancestor node.
+        """
         parts = key_path.split('.')
         node = self
+        last_valid_node = self
         for part in parts:
             if part in node._children:
                 node = node._children[part]
+                last_valid_node = node
             else:
-                return None
-        return node._value
-
-    def __getitem__(self, key):
-        return self.resolve(key)
+                return last_valid_node
+        return node
