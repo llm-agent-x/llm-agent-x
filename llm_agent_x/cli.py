@@ -71,11 +71,6 @@ TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 def main():
     global live
-    parser.add_argument(
-        "--enable-python-execution",
-        action="store_true",
-        help="Enable the exec_python tool for the agent. (Requires Docker for sandbox mode)",
-    )
 
     args = parser.parse_args()
 
