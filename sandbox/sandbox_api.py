@@ -88,6 +88,8 @@ async def execute_code(code: str):
     Files uploaded to /workspace can also be accessed by the code if it knows their path.
     Returns:
         JSON: Contains 'stdout', 'stderr', and 'error' (if any) from the execution.
+        You can use the preloaded `final_response` function to construct a custom response,
+        which will, if called, overwrite the captured stdout and stderr.
     """
     if not code:
         return {"error": "Missing 'code' in JSON payload"}, 400
@@ -98,6 +100,7 @@ async def execute_code(code: str):
     execution_globals = {
         "LOADED_PICKLES": LOADED_PICKLES,
         **globals(),  # Includes other globals from this script if necessary
+        "final_response": final_response,
     }
 
     # Capture stdout and stderr
@@ -110,11 +113,15 @@ async def execute_code(code: str):
         exec(code, execution_globals)
         stdout_val = captured_stdout.getvalue()
         stderr_val = captured_stderr.getvalue()
-        return {
+        response = {
             "stdout": stdout_val,
             "stderr": stderr_val,
             "message": "Code executed successfully.",
-        }, 200
+        }
+        if "final_response" in execution_globals:
+            # response.update(execution_globals["final_response"])
+            response = execution_globals["final_response"]
+        return response, 200
     except Exception as e:
         stdout_val = captured_stdout.getvalue()
         stderr_val = captured_stderr.getvalue()
@@ -127,3 +134,18 @@ async def execute_code(code: str):
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+
+
+def final_response(stdout=None, stderr=None, error=None, message=None, trace=None):
+    """
+    Returns a dict that can be used to construct the final response from the /execute endpoint.
+    Note that this dict is merged with the captured stdout and stderr, so if you want to ignore
+    the captured output, set stdout and stderr to None.
+    """
+    return {
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": error,
+        "message": message,
+        "trace": trace,
+    }
