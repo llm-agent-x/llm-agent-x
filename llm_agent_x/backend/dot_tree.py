@@ -4,10 +4,12 @@ class DotTree:
         self._value = value
 
     def update(self, key_path, value):
-        parts = key_path.split('.')
+        parts = key_path.split(".")
         node = self
         for part in parts[:-1]:
-            if part not in node._children or not isinstance(node._children[part], DotTree):
+            if part not in node._children or not isinstance(
+                node._children[part], DotTree
+            ):
                 node._children[part] = DotTree()
             node = node._children[part]
         node._children[parts[-1]] = DotTree(value)
@@ -29,7 +31,7 @@ class DotTree:
         Resolves the path, but if it doesn't fully exist,
         returns the nearest existing ancestor node.
         """
-        parts = key_path.split('.')
+        parts = key_path.split(".")
         node = self
         last_valid_node = self
         for part in parts:

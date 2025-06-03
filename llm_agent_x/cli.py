@@ -53,7 +53,6 @@ trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 # Load environment variables
 
 
-
 # Initialize LLM and Search
 # llm = ChatOpenAI(
 #     base_url=openai_base_url,
@@ -70,7 +69,6 @@ TaskType = Literal["research", "search", "basic", "text/reasoning"]
 def main():
     global live
 
-
     args = parser.parse_args()
 
     default_subtask_type: TaskType = args.default_subtask_type  # type: ignore
@@ -84,7 +82,6 @@ def main():
     #         model=args.model,
     #         temperature=0.5,
     #     )
-
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

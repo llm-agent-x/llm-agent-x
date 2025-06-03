@@ -49,6 +49,7 @@ from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.tools.brave_web_search import brave_web_search
 from llm_agent_x.llm_manager import model_tree
+
 nltk.download(
     "punkt", quiet=True
 )  # Changed from punkt_tab, ensure 'punkt' tokenizer is available

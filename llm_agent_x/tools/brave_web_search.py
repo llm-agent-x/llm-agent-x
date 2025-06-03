@@ -13,9 +13,7 @@ from llm_agent_x.constants import redis_port, redis_db, redis_expiry, redis_host
 from llm_agent_x.tools.summarize import summarize
 
 
-REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
 def get_page_text_content(element):
@@ -57,7 +55,11 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(base_url, headers=brave_headers, params={"q": query, "count": num_results})
+            response = await client.get(
+                base_url,
+                headers=brave_headers,
+                params={"q": query, "count": num_results},
+            )
             if response.status_code == 429:
                 print("Rate limit exceeded.")
                 return []
@@ -83,7 +85,9 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
                         soup = BeautifulSoup(resp.text, "lxml")
                         main_elements = soup.find_all(["article", "main"])
                         if main_elements:
-                            text = " ".join(get_page_text_content(el) for el in main_elements)
+                            text = " ".join(
+                                get_page_text_content(el) for el in main_elements
+                            )
                         elif soup.body:
                             text = get_page_text_content(soup.body)
                         else:
@@ -101,11 +105,7 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
                     print(f"Error fetching {url}: {e}")
                     content_for_llm = snippet + " [Note: Scrape failed]"
 
-                return {
-                    "title": title,
-                    "url": url,
-                    "content": content_for_llm.strip()
-                }
+                return {"title": title, "url": url, "content": content_for_llm.strip()}
 
             tasks = [fetch_and_process(r) for r in results]
             extracted = await asyncio.gather(*tasks)
@@ -126,5 +126,5 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
 
 
 # Synchronous wrapper
-def brave_web_search(query: str, num_results: int=5) -> List[Dict[str, str]]:
+def brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
     return asyncio.run(_brave_web_search(query, num_results))

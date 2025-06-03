@@ -170,8 +170,8 @@ class RecursiveAgent:
         self,
         task: str,
         u_inst: str,
-        tracer: Optional[trace.Tracer] = None, 
-        tracer_span: Optional[trace.Span] = None, 
+        tracer: Optional[trace.Tracer] = None,
+        tracer_span: Optional[trace.Span] = None,
         uuid: str = str(uuid.uuid4()),
         agent_options: Optional[RecursiveAgentOptions] = None,
         allow_subtasks: bool = True,
@@ -193,8 +193,10 @@ class RecursiveAgent:
 
         self.task = task
         self.u_inst = u_inst
-        self.tracer = tracer if tracer else trace.get_tracer(__name__) 
-        self.tracer_span = tracer_span # This is the PARENT span for the current agent's operations
+        self.tracer = tracer if tracer else trace.get_tracer(__name__)
+        self.tracer_span = (
+            tracer_span  # This is the PARENT span for the current agent's operations
+        )
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
         self.llm: DotTree = self.options.llm
@@ -208,9 +210,12 @@ class RecursiveAgent:
         self.context = context or TaskContext(task=task)
         self.result: Optional[str] = None
         self.status: str = "pending"
-        self.current_span: Optional[trace.Span] = None # This will be this agent's OWN main span
+        self.current_span: Optional[trace.Span] = (
+            None  # This will be this agent's OWN main span
+        )
 
         # self.logger.debug(f"Agent initialized with options: {self.options.model_dump_json(exclude={'token_counter', 'pre_task_executed', 'on_task_executed', 'on_tool_call_executed'}, indent=2)}")
+
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
             try:
@@ -664,7 +669,9 @@ class RecursiveAgent:
                     },
                 )
 
-                current_llm_response = self.llm.resolve("llm.tools").value.invoke(history)
+                current_llm_response = self.llm.resolve("llm.tools").value.invoke(
+                    history
+                )
 
                 response_content_str = str(current_llm_response.content)
                 completion_tokens = self._get_token_count(response_content_str)
@@ -691,15 +698,18 @@ class RecursiveAgent:
                         "LLM Responded Without Tool Calls - Final Answer",
                         {"final_answer_preview": final_result_content[:200]},
                     )
-                    break # Exit loop
+                    break  # Exit loop
 
                 # If there are tool calls, process them in a dedicated span
                 with self.tracer.start_as_current_span(
-                    "Processing Tool Calls Batch", context=trace.set_span_in_context(single_task_span)
+                    "Processing Tool Calls Batch",
+                    context=trace.set_span_in_context(single_task_span),
                 ) as batch_tool_span:
                     tool_calls_in_batch = current_llm_response.tool_calls or []
-                    batch_tool_span.set_attribute("tool_calls.count_in_batch", len(tool_calls_in_batch))
-                    
+                    batch_tool_span.set_attribute(
+                        "tool_calls.count_in_batch", len(tool_calls_in_batch)
+                    )
+
                     tool_messages_for_this_turn = []
                     guidance_for_llm_reprompt = []
                     any_tool_requires_llm_replan = False
@@ -708,24 +718,29 @@ class RecursiveAgent:
                         tool_name = tool_call["name"]
                         tool_args = tool_call["args"]
                         tool_call_id = tool_call["id"]
-                        
+
                         # Create a span for each individual tool call
                         with self.tracer.start_as_current_span(
-                            f"Process Tool Call: {tool_name}", context=trace.set_span_in_context(batch_tool_span)
+                            f"Process Tool Call: {tool_name}",
+                            context=trace.set_span_in_context(batch_tool_span),
                         ) as individual_tool_span:
-                            individual_tool_span.set_attributes({
-                                "tool.name": tool_name,
-                                "tool.args": json.dumps(tool_args, default=str),
-                                "tool.call_id": tool_call_id,
-                                "tool.index_in_batch": tool_call_idx,
-                            })
+                            individual_tool_span.set_attributes(
+                                {
+                                    "tool.name": tool_name,
+                                    "tool.args": json.dumps(tool_args, default=str),
+                                    "tool.call_id": tool_call_id,
+                                    "tool.index_in_batch": tool_call_idx,
+                                }
+                            )
 
                             tool_executed_successfully_this_iteration = False
                             this_tool_call_needs_llm_replan = False
                             human_message_for_this_tool_failure = None
                             current_tool_output_payload = None
-                            
-                            individual_tool_span.add_event("Tool execution attempt initiated")
+
+                            individual_tool_span.add_event(
+                                "Tool execution attempt initiated"
+                            )
 
                             try:
                                 if tool_name not in self.options.tools_dict:
@@ -737,34 +752,60 @@ class RecursiveAgent:
                                     sim = calculate_raw_similarity(query, self.task)
                                     individual_tool_span.add_event(
                                         "Search Tool Query Similarity Check",
-                                        {"query": query, "similarity_score": sim, "threshold": self.options.similarity_threshold / 5},
+                                        {
+                                            "query": query,
+                                            "similarity_score": sim,
+                                            "threshold": self.options.similarity_threshold
+                                            / 5,
+                                        },
                                     )
                                     if sim < (self.options.similarity_threshold / 5):
                                         error_detail = f"Search query '{query}' too dissimilar (score: {sim:.2f}) to main task. Revise query."
-                                        current_tool_output_payload = {"error": error_detail, "guidance": "The search query was too different from the main task. Please rephrase your search to be more relevant or break down the problem differently."}
+                                        current_tool_output_payload = {
+                                            "error": error_detail,
+                                            "guidance": "The search query was too different from the main task. Please rephrase your search to be more relevant or break down the problem differently.",
+                                        }
                                         human_message_for_this_tool_failure = f"Search query '{query}' for tool '{tool_name}' was too dissimilar to the main task. Please adjust your plan or query."
                                         this_tool_call_needs_llm_replan = True
                                         individual_tool_span.add_event(
                                             "Search Tool Query Dissimilar",
                                             {"error_detail": error_detail},
                                         )
-                                        individual_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, "Search query dissimilar"))
+                                        individual_tool_span.set_status(
+                                            trace.Status(
+                                                trace.StatusCode.ERROR,
+                                                "Search query dissimilar",
+                                            )
+                                        )
                                     else:
-                                        individual_tool_span.add_event("Executing search tool with accepted query")
-                                        current_tool_output_payload = tool_to_execute(**tool_args)
+                                        individual_tool_span.add_event(
+                                            "Executing search tool with accepted query"
+                                        )
+                                        current_tool_output_payload = tool_to_execute(
+                                            **tool_args
+                                        )
                                         tool_executed_successfully_this_iteration = True
                                 else:
-                                    individual_tool_span.add_event(f"Executing non-search tool: {tool_name}")
-                                    current_tool_output_payload = tool_to_execute(**tool_args)
+                                    individual_tool_span.add_event(
+                                        f"Executing non-search tool: {tool_name}"
+                                    )
+                                    current_tool_output_payload = tool_to_execute(
+                                        **tool_args
+                                    )
                                     tool_executed_successfully_this_iteration = True
-                                
+
                                 individual_tool_span.add_event(
                                     "Tool execution completed",
-                                    {"output_preview": str(current_tool_output_payload)[:200]}
+                                    {
+                                        "output_preview": str(
+                                            current_tool_output_payload
+                                        )[:200]
+                                    },
                                 )
                                 if tool_executed_successfully_this_iteration:
-                                     individual_tool_span.set_status(trace.Status(trace.StatusCode.OK))
-
+                                    individual_tool_span.set_status(
+                                        trace.Status(trace.StatusCode.OK)
+                                    )
 
                             except Exception as e:
                                 error_msg_str = f"Error with tool {tool_name} (ID: {tool_call_id}): {e}"
@@ -775,54 +816,105 @@ class RecursiveAgent:
                                 }
                                 human_message_for_this_tool_failure = f"Error with tool '{tool_name}': {e}. Adjust your plan."
                                 this_tool_call_needs_llm_replan = True
-                                
-                                individual_tool_span.record_exception(e)
-                                individual_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, f"Tool {tool_name} execution failed: {str(e)}"))
 
-                            tool_message_content_final_str = json.dumps(current_tool_output_payload, default=str)
+                                individual_tool_span.record_exception(e)
+                                individual_tool_span.set_status(
+                                    trace.Status(
+                                        trace.StatusCode.ERROR,
+                                        f"Tool {tool_name} execution failed: {str(e)}",
+                                    )
+                                )
+
+                            tool_message_content_final_str = json.dumps(
+                                current_tool_output_payload, default=str
+                            )
                             tool_messages_for_this_turn.append(
-                                ToolMessage(content=tool_message_content_final_str, tool_call_id=tool_call_id)
+                                ToolMessage(
+                                    content=tool_message_content_final_str,
+                                    tool_call_id=tool_call_id,
+                                )
                             )
                             individual_tool_span.add_event(
                                 "ToolMessage prepared",
-                                {"content_preview": tool_message_content_final_str[:200]}
+                                {
+                                    "content_preview": tool_message_content_final_str[
+                                        :200
+                                    ]
+                                },
                             )
 
-                            individual_tool_span.set_attributes({
-                                "tool.execution_successful": tool_executed_successfully_this_iteration,
-                                "tool.requires_llm_replan": this_tool_call_needs_llm_replan,
-                                "tool.response_preview": tool_message_content_final_str[:200] # Redundant with event but useful as attribute
-                            })
+                            individual_tool_span.set_attributes(
+                                {
+                                    "tool.execution_successful": tool_executed_successfully_this_iteration,
+                                    "tool.requires_llm_replan": this_tool_call_needs_llm_replan,
+                                    "tool.response_preview": tool_message_content_final_str[
+                                        :200
+                                    ],  # Redundant with event but useful as attribute
+                                }
+                            )
 
                             if self.options.on_tool_call_executed:
-                                individual_tool_span.add_event("Invoking on_tool_call_executed callback")
+                                individual_tool_span.add_event(
+                                    "Invoking on_tool_call_executed callback"
+                                )
                                 try:
                                     self.options.on_tool_call_executed(
-                                        self.task, self.uuid, tool_name, tool_args,
-                                        current_tool_output_payload, tool_executed_successfully_this_iteration, tool_call_id
+                                        self.task,
+                                        self.uuid,
+                                        tool_name,
+                                        tool_args,
+                                        current_tool_output_payload,
+                                        tool_executed_successfully_this_iteration,
+                                        tool_call_id,
                                     )
-                                    individual_tool_span.add_event("on_tool_call_executed callback finished successfully")
+                                    individual_tool_span.add_event(
+                                        "on_tool_call_executed callback finished successfully"
+                                    )
                                 except Exception as cb_ex:
-                                    individual_tool_span.record_exception(cb_ex, {"callback_name": "on_tool_call_executed"})
-                                    self.logger.error(f"Error in on_tool_call_executed callback: {cb_ex}", exc_info=True)
-
+                                    individual_tool_span.record_exception(
+                                        cb_ex,
+                                        {"callback_name": "on_tool_call_executed"},
+                                    )
+                                    self.logger.error(
+                                        f"Error in on_tool_call_executed callback: {cb_ex}",
+                                        exc_info=True,
+                                    )
 
                             if this_tool_call_needs_llm_replan:
                                 any_tool_requires_llm_replan = True
                                 if human_message_for_this_tool_failure:
-                                    guidance_for_llm_reprompt.append(human_message_for_this_tool_failure)
-                    
-                    # After loop of tool calls, still inside "Processing Tool Calls Batch" span
-                    batch_tool_span.set_attribute("any_tool_requires_llm_replan_after_batch", any_tool_requires_llm_replan)
-                    if guidance_for_llm_reprompt:
-                        batch_tool_span.set_attribute("llm_reprompt_guidance_messages_count", len(guidance_for_llm_reprompt))
-                        batch_tool_span.add_event("LLM reprompt guidance prepared", {"guidance_preview": "\n".join(guidance_for_llm_reprompt)[:300]})
-                    
-                    if not any_tool_requires_llm_replan:
-                         batch_tool_span.set_status(trace.Status(trace.StatusCode.OK))
-                    else:
-                         batch_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, "One or more tools require LLM replan"))
+                                    guidance_for_llm_reprompt.append(
+                                        human_message_for_this_tool_failure
+                                    )
 
+                    # After loop of tool calls, still inside "Processing Tool Calls Batch" span
+                    batch_tool_span.set_attribute(
+                        "any_tool_requires_llm_replan_after_batch",
+                        any_tool_requires_llm_replan,
+                    )
+                    if guidance_for_llm_reprompt:
+                        batch_tool_span.set_attribute(
+                            "llm_reprompt_guidance_messages_count",
+                            len(guidance_for_llm_reprompt),
+                        )
+                        batch_tool_span.add_event(
+                            "LLM reprompt guidance prepared",
+                            {
+                                "guidance_preview": "\n".join(
+                                    guidance_for_llm_reprompt
+                                )[:300]
+                            },
+                        )
+
+                    if not any_tool_requires_llm_replan:
+                        batch_tool_span.set_status(trace.Status(trace.StatusCode.OK))
+                    else:
+                        batch_tool_span.set_status(
+                            trace.Status(
+                                trace.StatusCode.ERROR,
+                                "One or more tools require LLM replan",
+                            )
+                        )
 
                 history.extend(tool_messages_for_this_turn)
 
@@ -830,35 +922,42 @@ class RecursiveAgent:
                     replan_message_content = (
                         "One or more tool actions resulted in errors or require a change of plan. "
                         "Review the previous tool outputs and your reasoning. Adjust your plan and continue towards the main goal.\n"
-                        "Specific issues encountered:\n" + "\n".join([f"- {g}" for g in guidance_for_llm_reprompt])
+                        "Specific issues encountered:\n"
+                        + "\n".join([f"- {g}" for g in guidance_for_llm_reprompt])
                         if guidance_for_llm_reprompt
                         else "One or more tool calls had issues. Please review the tool responses and adjust your plan. Re-evaluate your approach to the main task."
                     )
                     history.append(HumanMessage(content=replan_message_content))
-                    single_task_span.add_event( # This event is on the main single_task_span
+                    single_task_span.add_event(  # This event is on the main single_task_span
                         "LLM Re-Plan Requested After Tool Batch",
                         {"replan_reason_preview": replan_message_content[:300]},
                     )
-                    continue # Continue the main while loop for LLM to re-plan
+                    continue  # Continue the main while loop for LLM to re-plan
 
             if loop_count >= max_loops:
                 single_task_span.add_event(
                     "Max Tool Loop Iterations Reached", {"max_loops": max_loops}
                 )
-                single_task_span.set_status(trace.Status(trace.StatusCode.ERROR, "Max tool loop iterations reached"))
+                single_task_span.set_status(
+                    trace.Status(
+                        trace.StatusCode.ERROR, "Max tool loop iterations reached"
+                    )
+                )
                 if history and isinstance(history[-1], AIMessage):
                     final_result_content = str(history[-1].content)
-                elif history and isinstance(history[-1], ToolMessage): # If loop ended after tool messages but before AI
+                elif history and isinstance(
+                    history[-1], ToolMessage
+                ):  # If loop ended after tool messages but before AI
                     final_result_content = "Max tool loop iterations reached. Last action was a tool call. No final AI response generated."
-            else: # Loop broke due to no tool calls, meaning LLM provided final answer
+            else:  # Loop broke due to no tool calls, meaning LLM provided final answer
                 single_task_span.set_status(trace.Status(trace.StatusCode.OK))
-
 
             single_task_span.add_event(
                 "Single Task Execution End",
                 {"final_result_preview": final_result_content[:200]},
             )
             return final_result_content
+
     def _split_task(self) -> SplitTask:
         agent_span = self.current_span
         parent_context_for_split = (
@@ -937,7 +1036,9 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_1,
                 },
             )
-            response1 = self.llm.resolve("llm").value.invoke(primed_hist_1)  # Pass primed history
+            response1 = self.llm.resolve("llm").value.invoke(
+                primed_hist_1
+            )  # Pass primed history
             response_content_1 = "1. " + str(
                 response1.content
             )  # Prepend the prime for full response
@@ -1004,7 +1105,9 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_3,
                 },
             )
-            structured_response_msg = self.llm.resolve("llm").value.invoke(hist_for_json)
+            structured_response_msg = self.llm.resolve("llm").value.invoke(
+                hist_for_json
+            )
             completion_tokens_3 = self._get_token_count(
                 str(structured_response_msg.content)
             )
@@ -1167,9 +1270,7 @@ class RecursiveAgent:
             )  # LLM completes the primed JSON
 
             llm_completion_part = str(structured_response_msg.content)
-            full_llm_response_content_for_parser = (
-                llm_completion_part
-            )
+            full_llm_response_content_for_parser = llm_completion_part
             completion_tokens = self._get_token_count(llm_completion_part)
             verify_span.add_event(
                 "LLM Invocation End (Verification)",
@@ -1492,7 +1593,9 @@ class RecursiveAgent:
             for document in documents_to_merge:
                 if self._get_token_count(document) > 5000:
                     num_sentences = int(
-                        len(document.split()) / 5000 * self.options.summary_sentences_factor
+                        len(document.split())
+                        / 5000
+                        * self.options.summary_sentences_factor
                     )
                     summary_span.add_event(
                         "Summarizing Long Document",
