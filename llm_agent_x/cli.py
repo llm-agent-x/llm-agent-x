@@ -37,7 +37,10 @@ from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.llm_manager import llm, model_tree, tool_llm
 from llm_agent_x.tools.brave_web_search import brave_web_search
+
 from llm_agent_x.cli_args_parser import parser
+from llm_agent_x.tools.exec_python import exec_python
+
 
 nltk.download("punkt_tab", force=False)
 
@@ -68,20 +71,30 @@ TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 def main():
     global live
+    parser.add_argument(
+        "--enable-python-execution",
+        action="store_true",
+        help="Enable the exec_python tool for the agent. (Requires Docker for sandbox mode)",
+    )
 
     args = parser.parse_args()
 
     default_subtask_type: TaskType = args.default_subtask_type  # type: ignore
 
-    # Update LLM if model argument is different from default used for global llm
-    # global llm  # Allow modification of global llm
-    # if args.model != getenv("DEFAULT_LLM", "gpt-4o-mini"):
-    #     llm = ChatOpenAI(
-    #         base_url=openai_base_url,
-    #         api_key=openai_api_key,
-    #         model=args.model,
-    #         temperature=0.5,
-    #     )
+    # Prepare tools based on the CLI flag
+    available_tools = [brave_web_search]
+    tools_dict_for_agent = {
+        "web_search": brave_web_search,
+        "brave_web_search": brave_web_search,
+    }
+
+    if args.enable_python_execution:
+        available_tools.append(exec_python)
+        tools_dict_for_agent["exec_python"] = exec_python
+        tools_dict_for_agent["exec"] = exec_python # Alias
+
+    tool_llm = llm.bind_tools(available_tools)
+    model_tree.resolve("llm.tools").value.bind_tools([exec_python])
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,11 +120,8 @@ def main():
                 llm=(model_tree),
                 tools=[],
                 allow_search=True,
-                allow_tools=False,
-                tools_dict={
-                    "web_search": brave_web_search,
-                    "brave_web_search": brave_web_search,
-                },
+                allow_tools=True if args.enable_python_execution else False,
+                tools_dict=tools_dict_for_agent,
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={
                     "ai": LLMMerger,
