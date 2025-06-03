@@ -1,6 +1,7 @@
 import requests
 import os
 import json
+import cloudpickle
 
 # Configuration for the Dockerized sandbox API
 SANDBOX_API_URL = os.getenv("PYTHON_SANDBOX_API_URL", "http://localhost:5000")
@@ -128,7 +129,6 @@ if __name__ == '__main__':
         f.write("Hello from exec_python test!")
 
     # Create a dummy pickle file (requires cloudpickle to be installed where this is run)
-    import cloudpickle
     data_to_pickle = {"key": "value", "number": 123}
     with open("test_data.pkl", "wb") as f:
         cloudpickle.dump(data_to_pickle, f)
