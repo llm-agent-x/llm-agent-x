@@ -1,5 +1,9 @@
 from os import getenv
 
+from dotenv import load_dotenv
+
+load_dotenv(".env", override=True)
+
 
 LANGUAGE = "english"
 redis_db = int(getenv("REDIS_DB", 0))  # Default to 0 if not set

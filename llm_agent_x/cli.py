@@ -2,7 +2,6 @@ import argparse
 import sys
 from os import getenv, environ
 from pathlib import Path
-from dotenv import load_dotenv
 import nltk
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
@@ -50,7 +49,7 @@ exporter = OTLPSpanExporter(
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
 # Load environment variables
-load_dotenv(".env", override=True)
+
 
 
 # Initialize LLM and Search
