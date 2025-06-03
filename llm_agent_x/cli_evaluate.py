@@ -442,7 +442,8 @@ def main():
     console.print(f"\n[bold blue]All evaluation results saved to: {eval_output_path}[/bold blue]")
 
     for output in outputs:
-        output_path = eval_output_path / f"{output["filename"]}.md"
+        filename_noprefix = output["filename"]
+        output_path = eval_output_path / f"{filename_noprefix}.md"
         if not output_path.parent.exists():
             output_path.parent.mkdir(parents=True)
         with output_path.open("w") as f_out:
