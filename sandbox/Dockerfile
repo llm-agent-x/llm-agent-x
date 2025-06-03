@@ -8,7 +8,7 @@ RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir Flask cloudpickle requests
+RUN pip install --no-cache-dir fastapi cloudpickle requests
 
 # Create a workspace directory for user files
 RUN mkdir /workspace && chown appuser:appuser /workspace
