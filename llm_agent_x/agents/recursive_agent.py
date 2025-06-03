@@ -1,19 +1,27 @@
 import json
 import uuid
 from difflib import SequenceMatcher
-from typing import Any, Callable, Literal, Optional, List, Dict  # Added Dict
+from typing import Any, Callable, Literal, Optional, List, Dict
 from llm_agent_x.backend.exceptions import TaskFailedException
-from opentelemetry import trace, context as otel_context  # Modified import
+from opentelemetry import trace, context as otel_context
 from pydantic import BaseModel, validator, ValidationError
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import (
+    SystemMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    BaseMessage,
+)
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.exceptions import (
     OutputParserException,
-)  # Import for specific exception handling
+)
 from llm_agent_x.backend.mergers.LLMMerger import MergeOptions, LLMMerger
 from icecream import ic
 from llm_agent_x.complexity_model import TaskEvaluation, evaluate_prompt
 import logging
+import tiktoken
+from llm_agent_x.tools.summarize import summarize
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -28,23 +36,18 @@ logger.addHandler(handler)
 
 
 class TaskLimitConfig:
-    """Configuration for task limits at each layer"""
-
     @staticmethod
     def constant(max_tasks: int, max_depth: int) -> List[int]:
-        """Create a constant limit configuration"""
         return [max_tasks] * max_depth
 
     @staticmethod
     def array(task_limits: List[int]) -> List[int]:
-        """Use an explicit array of limits"""
         return task_limits
 
     @staticmethod
     def falloff(
         initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
     ) -> List[int]:
-        """Create limits using a falloff function"""
         return [falloff_func(i) for i in range(max_depth)]
 
 
@@ -69,7 +72,6 @@ class TaskLimit(BaseModel):
     def from_falloff(
         cls, initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
     ):
-
         return cls(
             limits=TaskLimitConfig.falloff(initial_tasks, max_depth, falloff_func)
         )
@@ -78,7 +80,7 @@ class TaskLimit(BaseModel):
 class TaskObject(BaseModel):
     task: str
     type: Literal["research", "search", "basic", "text/reasoning"]
-    subtasks: int  # Max number of subtasks this task object can be broken into
+    subtasks: int
     allow_search: bool
     allow_tools: bool
 
@@ -94,7 +96,7 @@ class verification(BaseModel):  # pylint: disable=invalid-name
 class SplitTask(BaseModel):
     needs_subtasks: bool
     subtasks: list[TaskObject]
-    evaluation: Optional[TaskEvaluation] = None  # Set default to None
+    evaluation: Optional[TaskEvaluation] = None
 
     def __bool__(self):
         return self.needs_subtasks
@@ -115,9 +117,7 @@ class RecursiveAgentOptions(BaseModel):
     search_tool: Any = None
     pre_task_executed: Any = None
     on_task_executed: Any = None
-    on_tool_call_executed: Any = (
-        None  # Expects: (task, uuid, tool_name, tool_args, tool_response, success, tool_call_id)
-    )
+    on_tool_call_executed: Any = None
     task_tree: list[Any] = []
     llm: Any = None
     tool_llm: Any = None
@@ -128,33 +128,56 @@ class RecursiveAgentOptions(BaseModel):
     similarity_threshold: float = 0.8
     merger: Any = LLMMerger
     align_summaries: bool = True
+    token_counter: Optional[Callable[[str], int]] = None  # For token counting
 
     class Config:
         arbitrary_types_allowed = True
 
 
 def calculate_raw_similarity(text1: str, text2: str) -> float:
-    """
-    Calculate the similarity ratio between two texts using SequenceMatcher.
-    Returns a float between 0 and 1, where 1 means the texts are identical.
-    """
     return SequenceMatcher(None, text1, text2).ratio()
+
+
+# Helper to serialize Langchain messages for tracing previews and token counting
+def _serialize_lc_messages_for_preview(
+    messages: List[BaseMessage], max_len: int = 500
+) -> str:
+    if not messages:
+        return "[]"
+
+    content_parts = []
+    for msg in messages:
+        role = msg.type.upper()  # e.g., HUMAN, AI, SYSTEM, TOOL
+        content_str = str(msg.content)
+
+        # Add tool call info if present
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            content_str += f" (Tool Calls: {len(msg.tool_calls)})"
+        elif hasattr(msg, "tool_call_id") and msg.tool_call_id:  # For ToolMessage
+            content_str += f" (Tool Call ID: {msg.tool_call_id})"
+
+        content_parts.append(f"{role}: {content_str}")
+
+    full_str = "\n".join(content_parts)
+    if len(full_str) > max_len:
+        return full_str[: max_len - 3] + "..."
+    return full_str
 
 
 class RecursiveAgent:
     def __init__(
         self,
         task: str,
-        u_inst: str,  # User instructions for this specific task instance
-        tracer: trace.Tracer = None,
-        tracer_span: trace.Span = None,
-        uuid: str = str(uuid.uuid4()),  # pylint: disable=redefined-outer-name
-        agent_options: RecursiveAgentOptions = None,
+        u_inst: str,
+        tracer: Optional[trace.Tracer] = None, 
+        tracer_span: Optional[trace.Span] = None, 
+        uuid: str = str(uuid.uuid4()),
+        agent_options: Optional[RecursiveAgentOptions] = None,
         allow_subtasks: bool = True,
         current_layer: int = 0,
         parent: Optional["RecursiveAgent"] = None,
         context: Optional[TaskContext] = None,
-        siblings: List["RecursiveAgent"] = None,
+        siblings: Optional[List["RecursiveAgent"]] = None,
     ):
         self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{uuid}")
         self.logger.info(
@@ -169,8 +192,8 @@ class RecursiveAgent:
 
         self.task = task
         self.u_inst = u_inst
-        self.tracer = tracer
-        self.tracer_span = tracer_span
+        self.tracer = tracer if tracer else trace.get_tracer(__name__) 
+        self.tracer_span = tracer_span # This is the PARENT span for the current agent's operations
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
         self.llm = self.options.llm
@@ -183,180 +206,356 @@ class RecursiveAgent:
         self.parent = parent
         self.siblings = siblings or []
         self.context = context or TaskContext(task=task)
-        self.result: Optional[str] = None  # Ensure result is initialized
-        self.status: str = (
-            "pending"  # Track agent status: pending, succeeded, failed, fixed_and_verified
-        )
-        self.current_span = None
+        self.result: Optional[str] = None
+        self.status: str = "pending"
+        self.current_span: Optional[trace.Span] = None # This will be this agent's OWN main span
 
-        self.logger.debug(f"Agent initialized with options: {agent_options}")
+        # self.logger.debug(f"Agent initialized with options: {self.options.model_dump_json(exclude={'token_counter', 'pre_task_executed', 'on_task_executed', 'on_tool_call_executed'}, indent=2)}")
+    def _get_token_count(self, text: str) -> int:
+        if self.options.token_counter:
+            try:
+                return self.options.token_counter(text)
+            except Exception as e:
+                self.logger.warning(
+                    f"Token counter failed for text: '{text[:50]}...': {e}",
+                    exc_info=False,
+                )
+                return 0
+        return 0
 
     def _build_context_information(self) -> dict:
-        self.logger.debug("Building context information.")
         parent_contexts = []
-        current_p_context = self.context.parent_context  # Renamed to avoid clash
+        current_p_context = self.context.parent_context
         while current_p_context:
-            if current_p_context.result:  # Only include if parent has a result
+            if current_p_context.result:
                 parent_contexts.append(
                     {"task": current_p_context.task, "result": current_p_context.result}
                 )
             current_p_context = current_p_context.parent_context
-        parent_contexts.reverse()  # Show chronological order
+        parent_contexts.reverse()
 
         sibling_contexts = []
-        # Use self.siblings which are RecursiveAgent instances
         for sibling_agent in self.siblings:
             if sibling_agent.result and sibling_agent != self:
-                # Access task and result directly from sibling agent instance
                 sibling_contexts.append(
                     {"task": sibling_agent.task, "result": sibling_agent.result}
                 )
-
-        context_info = {
+        return {
             "parent_contexts": parent_contexts,
             "sibling_contexts": sibling_contexts,
         }
-        # self.logger.debug(f"Context information built: {context_info}")
-        return context_info
 
-    def _build_task_split_history(self) -> str:
-        self.logger.debug("Building task history prompt for splitting.")
-        context_info = self._build_context_information()
+    def _format_history_parts(
+        self,
+        context_info: dict,
+        purpose: str,
+        subtask_results_map: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
         history = []
-
         if context_info["parent_contexts"]:
-            history.append("Previous parent tasks and their results:")
+            history.append(f"Previous parent tasks and their results (for {purpose}):")
             for ctx in context_info["parent_contexts"]:
                 history.append(
                     f"- Parent Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
-                )  # Show some result
-
+                )
         if context_info["sibling_contexts"]:
             history.append(
-                "\nParallel tasks already being worked on (or completed) by siblings and their results:"
+                f"\nParallel sibling tasks and their results (for {purpose}):"
             )
             for ctx in context_info["sibling_contexts"]:
                 history.append(
                     f"- Sibling Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
                 )
-
-        task_history_str = "\n".join(history)
-        self.logger.debug(f"Task split history string built: {task_history_str}")
-        return task_history_str
-
-    def _build_task_verify_history(
-        self, subtask_results_map: Optional[Dict[str, str]] = None
-    ) -> str:
-        self.logger.debug("Building task verification prompt history.")
-        context_info = self._build_context_information()
-        history = []
-
-        if context_info["parent_contexts"]:
-            history.append("Context from parent tasks and their results:")
-            for ctx in context_info["parent_contexts"]:
-                history.append(
-                    f"- Parent Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
-                )
-
-        if context_info["sibling_contexts"]:
-            history.append("\nContext from parallel (sibling) tasks and their results:")
-            for ctx in context_info["sibling_contexts"]:
-                history.append(
-                    f"- Sibling Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
-                )
-
-        if subtask_results_map:
+        if purpose == "verification" and subtask_results_map:
             history.append(
-                "\nThe current main task involved the following subtasks and their results:"
+                "\nThe current main task involved these subtasks and their results:"
             )
             for sub_task, sub_result in subtask_results_map.items():
                 history.append(
                     f"- Subtask: {sub_task}\n  - Result: {str(sub_result)[:200]}..."
                 )
+        return history
 
-        task_history_str = "\n".join(history)
-        self.logger.debug(f"Task verification history string built: {task_history_str}")
-        return task_history_str
+    def _build_task_split_history(self) -> str:
+        context_info = self._build_context_information()
+        return "\n".join(self._format_history_parts(context_info, "splitting"))
+
+    def _build_task_verify_history(
+        self, subtask_results_map: Optional[Dict[str, str]] = None
+    ) -> str:
+        context_info = self._build_context_information()
+        return "\n".join(
+            self._format_history_parts(
+                context_info, "verification", subtask_results_map
+            )
+        )
 
     def run(self):
         self.logger.info(
-            f"Starting run for task: '{self.task}' (UUID: {self.uuid}, Status: {self.status})"
+            f"Attempting to start run for task: '{self.task}' (UUID: {self.uuid}, Status: {self.status})"
         )
-        if self.tracer and self.tracer_span:
-            self.logger.debug("Tracer and tracer_span available, creating new span.")
+
+        parent_otel_ctx = otel_context.get_current()
+        if self.tracer_span:
             parent_otel_ctx = trace.set_span_in_context(self.tracer_span)
-            with self.tracer.start_as_current_span(
-                f"Execute Task: {self.task}",
-                context=parent_otel_ctx,
-                attributes={"agent.uuid": self.uuid, "agent.layer": self.current_layer},
-            ) as span:
-                self.current_span = span
-                span.add_event(
-                    "Run Start", {"task": self.task, "layer": self.current_layer}
-                )
-                result = self._run(span=span)
+
+        with self.tracer.start_as_current_span(
+            f"RecursiveAgent Task: {self.task[:50]}...",
+            context=parent_otel_ctx,
+            attributes={
+                "agent.task.full": self.task,
+                "agent.uuid": self.uuid,
+                "agent.layer": self.current_layer,
+                "agent.initial_status": self.status,
+                "agent.allow_subtasks_flag": self.allow_subtasks,
+            },
+        ) as span:
+            self.current_span = span
+            span.add_event(
+                "Agent Run Start",
+                attributes={
+                    "task": self.task,
+                    "user_instructions_preview": str(self.u_inst)[:200],
+                    "current_layer": self.current_layer,
+                },
+            )
+
+            try:
+                result = self._run()
                 span.set_attribute("agent.final_status", self.status)
                 span.add_event(
-                    "Run End",
-                    {"result_preview": str(result)[:100], "status": self.status},
+                    "Agent Run End",
+                    attributes={
+                        "result_preview": str(result)[:200],
+                        "final_status": self.status,
+                    },
                 )
                 self.logger.info(
                     f"Run finished for task: '{self.task}'. Result: {str(result)[:100]}... Status: {self.status}"
                 )
                 return result
-        else:
-            self.logger.debug("No tracer or tracer_span, running without new span.")
-            result = self._run()
-            self.logger.info(
-                f"Run finished for task: '{self.task}'. Result: {str(result)[:100]}... Status: {self.status}"
-            )
-            return result
+            except Exception as e:
+                self.logger.error(
+                    f"Critical error in agent run for task '{self.task}': {e}",
+                    exc_info=True,
+                )
+                if span:  # Ensure span exists before using it
+                    span.record_exception(e)
+                    self.status = "failed_critically"
+                    span.set_attribute("agent.final_status", self.status)
+                    span.set_status(
+                        trace.Status(trace.StatusCode.ERROR, description=str(e))
+                    )
+                raise TaskFailedException(
+                    f"Agent run for '{self.task}' failed critically: {e}"
+                ) from e
 
-    def _run(self, span=None) -> str:
+    def _run(self) -> str:
+        span = self.current_span
+        if not span:
+            self.logger.warning(
+                "_run called without an active self.current_span. Tracing will be limited for this operation."
+            )
+            # Fallback: Create a temporary span if absolutely necessary, though it might orphan this part of the trace
+            # For robustness, one might add:
+            # with self.tracer.start_as_current_span(f"Orphaned _run: {self.task[:50]}") as temp_span:
+            #     return self.__execute_run_logic(temp_span)
+            # For now, we proceed, but this indicates a potential setup issue if span is None.
+            # Let's assume span exists for the main logic flow.
+            # If not, the following add_event calls would fail.
+            # A safer approach is to ensure self.current_span is always valid or handle its absence gracefully.
+            # For this refactor, we assume `run` sets `self.current_span`.
+
         self.logger.info(
             f"Starting _run for task: '{self.task}' at layer {self.current_layer}"
         )
         if span:
-            span.add_event("Internal Run Start", {"task": self.task})
+            span.add_event("Internal Execution Start", {"task": self.task})
 
         if self.options.pre_task_executed:
+            if span:
+                span.add_event("Pre-Task Callback Executing")
             self.options.pre_task_executed(
                 task=self.task,
                 uuid=self.uuid,
                 parent_agent_uuid=(self.parent.uuid if self.parent else None),
             )
+            if span:
+                span.add_event("Pre-Task Callback Executed")
 
         max_subtasks_for_this_layer = self._get_max_subtasks()
         if max_subtasks_for_this_layer == 0:
-            self.logger.info(
-                f"Max subtasks is 0 for layer {self.current_layer}. Executing as single task."
-            )
-            self.result = self._run_single_task(span=span)
-            self.context.result = self.result  # Update context
-            # Verification for single task
+            if span:
+                span.add_event("Executing as Single Task: Max Subtasks at Layer is 0")
+            self.result = self._run_single_task()
+            self.context.result = self.result
             try:
-                self.logger.info(
-                    f"Verifying result of single task execution: '{self.task}'."
-                )
-                self.verify_result(None)  # No subtasks, so pass None
-                self.logger.info(
-                    f"Single task '{self.task}' successfully verified. Status: {self.status}"
-                )
+                self.verify_result(None)
             except TaskFailedException:
-                self.logger.warning(
-                    f"Single task '{self.task}' failed verification. Attempting to fix."
+                if span:
+                    span.add_event("Single Task Verification Failed, Attempting Fix")
+                self._fix(None)
+
+            if self.options.on_task_executed:
+                if span:
+                    span.add_event("On-Task-Executed Callback Executing")
+                self.options.on_task_executed(
+                    self.task,
+                    self.uuid,
+                    self.result,
+                    self.parent.uuid if self.parent else None,
                 )
-                self._fix(
-                    None
-                )  # No subtasks, so pass None for failed_subtask_results_map
-                if self.status == "failed":
-                    self.logger.error(
-                        f"Fix attempt for single task '{self.task}' also failed."
+                if span:
+                    span.add_event("On-Task-Executed Callback Executed")
+            return self.result
+
+        while self.allow_subtasks:
+            if span:
+                span.add_event("Subtask Processing Loop Iteration Start")
+            if self.parent:
+                similarity = calculate_raw_similarity(self.task, self.parent.task)
+                if span:
+                    span.add_event(
+                        "Parent Similarity Check",
+                        {
+                            "similarity_score": similarity,
+                            "threshold": self.options.similarity_threshold,
+                        },
                     )
-                elif self.status == "fixed_and_verified":
-                    self.logger.info(
-                        f"Single task '{self.task}' was successfully fixed and verified."
+                if similarity >= self.options.similarity_threshold:
+                    if span:
+                        span.add_event(
+                            "Executing as Single Task: High Parent Similarity",
+                            {"similarity": similarity},
+                        )
+                    self.result = self._run_single_task()
+                    self.context.result = self.result
+                    try:
+                        self.verify_result(None)
+                    except TaskFailedException:
+                        if span:
+                            span.add_event(
+                                "High Similarity Single Task Verification Failed, Attempting Fix"
+                            )
+                        self._fix(None)
+                    if self.options.on_task_executed:
+                        self.options.on_task_executed(
+                            self.task,
+                            self.uuid,
+                            self.result,
+                            self.parent.uuid if self.parent else None,
+                        )
+                    return self.result
+
+            split_task_result = self._split_task()
+
+            if span:
+                span.add_event(
+                    "Task Splitting Outcome",
+                    {
+                        "needs_subtasks": split_task_result.needs_subtasks,
+                        "generated_subtasks_count": len(split_task_result.subtasks),
+                        "evaluation_score": (
+                            split_task_result.evaluation.prompt_complexity_score[0]
+                            if split_task_result.evaluation
+                            else "N/A"
+                        ),
+                    },
+                )
+
+            if not split_task_result or not split_task_result.needs_subtasks:
+                if span:
+                    span.add_event(
+                        "Executing as Single Task: Splitting Indicated No Subtasks"
                     )
+                break
+
+            limited_subtasks = split_task_result.subtasks[:max_subtasks_for_this_layer]
+            if span:
+                span.add_event(
+                    "Subtasks Limited",
+                    {
+                        "original_count": len(split_task_result.subtasks),
+                        "limited_count": len(limited_subtasks),
+                        "max_allowed": max_subtasks_for_this_layer,
+                    },
+                )
+
+            child_agents: List[RecursiveAgent] = []
+            child_contexts_for_siblings: List[TaskContext] = []
+
+            for subtask_obj in limited_subtasks:
+                child_task_uuid = str(uuid.uuid4())
+                child_context = TaskContext(
+                    task=subtask_obj.task, parent_context=self.context
+                )
+                child_agent = RecursiveAgent(
+                    task=subtask_obj.task,
+                    u_inst=self.u_inst,
+                    tracer=self.tracer,
+                    tracer_span=span,
+                    uuid=child_task_uuid,
+                    agent_options=self.options,
+                    allow_subtasks=True,
+                    current_layer=self.current_layer + 1,
+                    parent=self,
+                    context=child_context,
+                    siblings=child_agents[:],
+                )
+                child_agents.append(child_agent)
+                child_contexts_for_siblings.append(child_context)
+
+            for i, child_agent_to_update in enumerate(child_agents):
+                child_agent_to_update.context.siblings = [
+                    ctx for j, ctx in enumerate(child_contexts_for_siblings) if i != j
+                ]
+
+            subtask_results = []
+            subtask_tasks_for_summary = []
+            if span:
+                span.add_event("Executing Child Agents", {"count": len(child_agents)})
+            for i, child_agent in enumerate(child_agents):
+                if span:
+                    span.add_event(
+                        f"Child Agent {i+1} Run Start",
+                        {
+                            "child_task": child_agent.task,
+                            "child_uuid": child_agent.uuid,
+                        },
+                    )
+                child_result = child_agent.run()
+                subtask_results.append(
+                    child_result
+                    if child_result is not None
+                    else "Error or no result from subtask."
+                )
+                subtask_tasks_for_summary.append(child_agent.task)
+                if span:
+                    span.add_event(
+                        f"Child Agent {i+1} Run End",
+                        {
+                            "child_task": child_agent.task,
+                            "child_result_preview": str(child_result)[:100],
+                            "child_status": child_agent.status,
+                        },
+                    )
+
+            if span:
+                span.add_event("All Child Agents Completed")
+            self.result = self._summarize_subtask_results(
+                subtask_tasks_for_summary, subtask_results
+            )
+            self.context.result = self.result
+
+            subtask_results_map = dict(zip(subtask_tasks_for_summary, subtask_results))
+            try:
+                self.verify_result(subtask_results_map)
+            except TaskFailedException:
+                if span:
+                    span.add_event(
+                        "Subtask Combined Result Verification Failed, Attempting Fix"
+                    )
+                self._fix(subtask_results_map)
 
             if self.options.on_task_executed:
                 self.options.on_task_executed(
@@ -367,187 +566,18 @@ class RecursiveAgent:
                 )
             return self.result
 
-        # Loop for allowing subtask generation, this loop typically runs once unless logic is added for re-splitting.
-        while (
-            self.allow_subtasks
-        ):  # allow_subtasks is an agent-level flag, usually True initially.
-            self.logger.debug(
-                "Subtasks allowed, entering subtask generation/execution phase."
-            )
-            if self.parent:
-                similarity = calculate_raw_similarity(self.task, self.parent.task)
-                if similarity >= self.options.similarity_threshold:
-                    self.logger.info(
-                        f"Task similarity with parent ({similarity:.2f}) is high. Executing as single task."
-                    )
-                    if span:
-                        span.add_event(
-                            "High Similarity Execution", {"similarity": similarity}
-                        )
-                    self.result = self._run_single_task(span=span)
-                    self.context.result = self.result
-                    # Verification for high-similarity single task
-                    try:
-                        self.verify_result(None)
-                    except TaskFailedException:
-                        self._fix(None)
-                    if self.options.on_task_executed:
-                        self.options.on_task_executed(
-                            self.task,
-                            self.uuid,
-                            self.result,
-                            self.parent.uuid if self.parent else None,
-                        )
-                    return self.result  # Exit _run
-
-            split_task_result = self._split_task()
-            if span:
-                span.set_attribute(
-                    "task_split.needs_subtasks", split_task_result.needs_subtasks
-                )
-                span.set_attribute(
-                    "task_split.num_subtasks_generated", len(split_task_result.subtasks)
-                )
-
-            if not split_task_result or not split_task_result.needs_subtasks:
-                self.logger.info(
-                    "Task does not need subtasks or splitting failed. Executing as single task."
-                )
-                # allow_subtasks = False # To break loop, but will execute single task logic below anyway
-                break  # Break from while self.allow_subtasks loop
-
-            limited_subtasks = split_task_result.subtasks[:max_subtasks_for_this_layer]
-            self.logger.info(
-                f"Proceeding with {len(limited_subtasks)} subtasks (limited from {len(split_task_result.subtasks)} by max_subtasks={max_subtasks_for_this_layer})."
-            )
-            if span:
-                span.set_attribute(
-                    "task_split.num_subtasks_active", len(limited_subtasks)
-                )
-
-            child_agents: List[RecursiveAgent] = []
-            child_contexts_for_siblings: List[TaskContext] = (
-                []
-            )  # To correctly pass siblings to children
-
-            for subtask_obj in limited_subtasks:
-                child_task_uuid = str(uuid.uuid4())  # Each child gets a new UUID
-                child_context = TaskContext(
-                    task=subtask_obj.task, parent_context=self.context
-                )
-
-                # Create child agent
-                child_agent = RecursiveAgent(
-                    task=subtask_obj.task,
-                    u_inst=self.u_inst,  # Pass parent's user instructions, or derive specific ones
-                    tracer=self.tracer,
-                    tracer_span=span,  # Current span is parent for child's span
-                    uuid=child_task_uuid,
-                    agent_options=self.options,
-                    allow_subtasks=True,  # Children can further split based on their layer's limits
-                    current_layer=self.current_layer + 1,
-                    parent=self,
-                    context=child_context,
-                    siblings=child_agents[
-                        :
-                    ],  # Pass a copy of already created siblings for this batch
-                )
-                child_agents.append(child_agent)
-                child_contexts_for_siblings.append(
-                    child_context
-                )  # Track contexts for sibling linking
-
-            # Update sibling contexts for all children created in this batch
-            for i, child_agent_to_update in enumerate(child_agents):
-                # Siblings are other children in this batch, excluding self
-                child_agent_to_update.context.siblings = [
-                    ctx for j, ctx in enumerate(child_contexts_for_siblings) if i != j
-                ]
-
-            subtask_results = []
-            subtask_tasks_for_summary = []
-            for child_agent in child_agents:
-                child_result = child_agent.run()
-                # After child_agent.run(), its child_agent.result and child_agent.status are set.
-                # We primarily care about child_agent.result for summarization.
-                # If a child task failed critically and couldn't be fixed, its result might be an error message or None.
-                subtask_results.append(
-                    child_result
-                    if child_result is not None
-                    else "Error or no result from subtask."
-                )
-                subtask_tasks_for_summary.append(child_agent.task)
-                # Child agent's context.result should have been updated internally by its run
-
-            self.result = self._summarize_subtask_results(
-                subtask_tasks_for_summary, subtask_results
-            )
-            self.context.result = (
-                self.result
-            )  # Update own context with summarized result
-
-            subtask_results_map = dict(zip(subtask_tasks_for_summary, subtask_results))
-            try:
-                self.logger.info(
-                    f"Verifying combined result from subtasks for task: '{self.task}'."
-                )
-                self.verify_result(subtask_results_map)
-                self.logger.info(
-                    f"Task '{self.task}' (with subtasks) successfully verified. Status: {self.status}"
-                )
-            except TaskFailedException:
-                self.logger.warning(
-                    f"Task '{self.task}' (with subtasks) failed verification. Attempting to fix."
-                )
-                self._fix(
-                    subtask_results_map
-                )  # _fix will update self.status and self.result
-                if self.status == "failed":
-                    self.logger.error(
-                        f"Fix attempt for task '{self.task}' (with subtasks) also failed."
-                    )
-                elif self.status == "fixed_and_verified":
-                    self.logger.info(
-                        f"Task '{self.task}' (with subtasks) was successfully fixed and verified."
-                    )
-
-            if self.options.on_task_executed:
-                self.options.on_task_executed(
-                    self.task,
-                    self.uuid,
-                    self.result,
-                    self.parent.uuid if self.parent else None,
-                )
-            return self.result  # Exit _run after handling subtasks
-
-        # This part is reached if subtasks are not allowed from start, or if splitting decided against it,
-        # or if similarity to parent was high (that case returns early, but for safety).
-        self.logger.info(
-            "Proceeding to execute task as a single unit (no subtasks generated or allowed at this step)."
-        )
-        self.result = self._run_single_task(span=span)
+        if span:
+            span.add_event("Executing as Single Task: Fallback or Subtask Loop Exit")
+        self.result = self._run_single_task()
         self.context.result = self.result
         try:
-            self.logger.info(
-                f"Verifying result of final single task execution: '{self.task}'."
-            )
             self.verify_result(None)
-            self.logger.info(
-                f"Final single task '{self.task}' successfully verified. Status: {self.status}"
-            )
         except TaskFailedException:
-            self.logger.warning(
-                f"Final single task '{self.task}' failed verification. Attempting to fix."
-            )
+            if span:
+                span.add_event(
+                    "Fallback Single Task Verification Failed, Attempting Fix"
+                )
             self._fix(None)
-            if self.status == "failed":
-                self.logger.error(
-                    f"Fix attempt for final single task '{self.task}' also failed."
-                )
-            elif self.status == "fixed_and_verified":
-                self.logger.info(
-                    f"Final single task '{self.task}' was successfully fixed and verified."
-                )
 
         if self.options.on_task_executed:
             self.options.on_task_executed(
@@ -558,632 +588,1014 @@ class RecursiveAgent:
             )
         return self.result
 
-    def _run_single_task(self, span: Optional[trace.Span] = None) -> str:
-        self.logger.info(f"Running single task: '{self.task}'")
-        context_info = self._build_context_information()
-
-        context_str_parts = []
-        if context_info["parent_contexts"]:
-            context_str_parts.append("Parent task history:")
-            for ctx in context_info["parent_contexts"]:
-                context_str_parts.append(
-                    f"  Parent task: {ctx['task']}\n  Result: {str(ctx['result'])[:200]}..."
-                )
-
-        if context_info["sibling_contexts"]:
-            context_str_parts.append("Parallel sibling tasks in progress/completed:")
-            for ctx in context_info["sibling_contexts"]:
-                context_str_parts.append(
-                    f"  Task: {ctx['task']}\n  Result: {str(ctx['result'])[:200]}..."
-                )
-
-        full_context_str = "\n".join(context_str_parts)
-        if full_context_str:
-            full_context_str = (
-                f"\n\nRelevant context from other tasks:\n{full_context_str}"
-            )
-
-        system_prompt = (
-            f"Your task is to answer the following question, using any tools that you deem necessary. "
-            f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
-            f"If you use the web search tool, make sure you include citations (just use a pair of square "
-            f"brackets and a number in text, and at the end, include a citations section).{full_context_str}"
+    def _run_single_task(self) -> str:
+        agent_span = self.current_span
+        # Ensure agent_span is not None before attempting to use it for context
+        parent_context_for_single_task = (
+            trace.set_span_in_context(agent_span)
+            if agent_span
+            else otel_context.get_current()
         )
 
-        human_message_content = self.task
-        if self.u_inst:  # Add user instructions if provided
-            human_message_content += (
-                f"\n\nFollow these specific instructions: {self.u_inst}"
+        with self.tracer.start_as_current_span(
+            "Run Single Task Operation", context=parent_context_for_single_task
+        ) as single_task_span:
+            self.logger.info(f"Running single task: '{self.task}'")
+            context_info = self._build_context_information()
+            full_context_str = "\n".join(
+                self._format_history_parts(context_info, "single task execution")
             )
 
-        human_message_content += "\n\nApply the distributive property to any tool calls. For instance, if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results."
+            single_task_span.add_event(
+                "Single Task Execution Start",
+                {
+                    "task": self.task,
+                    "user_instructions": self.u_inst,
+                    "context_preview": full_context_str[:300],
+                },
+            )
 
-        history = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=human_message_content),
-        ]
-        # self.logger.debug(f"Initial history for single task LLM: {history}")
+            system_prompt_content = (
+                f"Your task is to answer the following question, using any tools that you deem necessary. "
+                f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
+                f"If you use the web search tool, make sure you include citations (just use a pair of square "
+                f"brackets and a number in text, and at the end, include a citations section).{full_context_str}"
+            )
+            human_message_content = self.task
+            if self.u_inst:
+                human_message_content += (
+                    f"\n\nFollow these specific instructions: {self.u_inst}"
+                )
+            human_message_content += "\n\nApply the distributive property to any tool calls. For instance, if you need to search for 3 related things, make 3 separate calls to the search tool, because that will yield better results."
 
-        tracer_to_use = self.tracer if self.tracer else trace.get_tracer(__name__)
-        parent_otel_ctx_for_single_task = (
-            trace.set_span_in_context(span) if span else otel_context.get_current()
-        )
+            history = [
+                SystemMessage(content=system_prompt_content),
+                HumanMessage(content=human_message_content),
+            ]
 
-        with tracer_to_use.start_as_current_span(
-            "Single Task LLM Interaction", context=parent_otel_ctx_for_single_task
-        ) as interaction_span:
-            interaction_span.set_attribute("task", self.task)
-
-            # Tool interaction loop (simplified from original for brevity, assuming it's mostly correct)
             loop_count = 0
-            max_loops = 10  # Safety break for tool loops
+            max_loops = 10
+            final_result_content = (
+                "Max tool loop iterations reached without a final answer."
+            )
+
             while loop_count < max_loops:
                 loop_count += 1
-                self.logger.info(
-                    f"Invoking tool_llm for single task (iteration {loop_count})."
+                single_task_span.add_event(
+                    f"Tool Interaction Loop Iteration {loop_count}"
                 )
+
+                full_prompt_str_for_tokens = "\n".join(
+                    [str(m.content) for m in history]
+                )
+                prompt_preview_str = _serialize_lc_messages_for_preview(
+                    history, max_len=1000
+                )
+                prompt_tokens = self._get_token_count(full_prompt_str_for_tokens)
+
+                single_task_span.add_event(
+                    "LLM Invocation Start (Tool LLM)",
+                    {
+                        "llm_type": "tool_llm",
+                        "iteration": loop_count,
+                        "prompt_messages_count": len(history),
+                        "prompt_preview": prompt_preview_str,
+                        "estimated_prompt_tokens": prompt_tokens,
+                    },
+                )
+
                 current_llm_response = self.tool_llm.invoke(history)
 
-                interaction_span.add_event(
-                    "LLM Invoked",
+                response_content_str = str(current_llm_response.content)
+                completion_tokens = self._get_token_count(response_content_str)
+
+                single_task_span.add_event(
+                    "LLM Invocation End (Tool LLM)",
                     {
-                        "history_length": len(history),
-                        "response_content_preview": str(current_llm_response.content)[
-                            :100
-                        ],
+                        "llm_type": "tool_llm",
+                        "iteration": loop_count,
+                        "response_content_preview": response_content_str[:200],
+                        "response_has_tool_calls": bool(
+                            current_llm_response.tool_calls
+                        ),
                         "tool_calls_count": len(current_llm_response.tool_calls or []),
+                        "estimated_completion_tokens": completion_tokens,
+                        "estimated_total_tokens": prompt_tokens + completion_tokens,
                     },
                 )
                 history.append(current_llm_response)
 
                 if not current_llm_response.tool_calls:
-                    self.logger.info(
-                        "No tool calls in LLM response. Returning content."
+                    final_result_content = str(current_llm_response.content)
+                    single_task_span.add_event(
+                        "LLM Responded Without Tool Calls - Final Answer",
+                        {"final_answer_preview": final_result_content[:200]},
                     )
-                    interaction_span.set_attribute(
-                        "final_result_preview", str(current_llm_response.content)[:100]
-                    )
-                    return str(current_llm_response.content)
+                    break # Exit loop
 
-                tool_messages_for_this_turn = []
-                guidance_for_llm_reprompt = []
-                any_tool_requires_llm_replan = False
+                # If there are tool calls, process them in a dedicated span
+                with self.tracer.start_as_current_span(
+                    "Processing Tool Calls Batch", context=trace.set_span_in_context(single_task_span)
+                ) as batch_tool_span:
+                    tool_calls_in_batch = current_llm_response.tool_calls or []
+                    batch_tool_span.set_attribute("tool_calls.count_in_batch", len(tool_calls_in_batch))
+                    
+                    tool_messages_for_this_turn = []
+                    guidance_for_llm_reprompt = []
+                    any_tool_requires_llm_replan = False
 
-                for tool_call in current_llm_response.tool_calls:
-                    tool_name = tool_call["name"]
-                    tool_args = tool_call["args"]
-                    tool_call_id = tool_call["id"]
-                    tool_executed_successfully_this_iteration = False
-                    this_tool_call_needs_llm_replan = False
-                    human_message_for_this_tool_failure = None
-                    current_tool_output_payload = None
+                    for tool_call_idx, tool_call in enumerate(tool_calls_in_batch):
+                        tool_name = tool_call["name"]
+                        tool_args = tool_call["args"]
+                        tool_call_id = tool_call["id"]
+                        
+                        # Create a span for each individual tool call
+                        with self.tracer.start_as_current_span(
+                            f"Process Tool Call: {tool_name}", context=trace.set_span_in_context(batch_tool_span)
+                        ) as individual_tool_span:
+                            individual_tool_span.set_attributes({
+                                "tool.name": tool_name,
+                                "tool.args": json.dumps(tool_args, default=str),
+                                "tool.call_id": tool_call_id,
+                                "tool.index_in_batch": tool_call_idx,
+                            })
 
-                    # ... (Existing detailed tool execution logic including search query similarity check, error handling, etc.) ...
-                    # This part is assumed to be largely correct from the original snippet.
-                    # For brevity, I'm summarizing the key interactions.
-                    try:
-                        if tool_name not in self.options.tools_dict:
-                            raise KeyError(f"Tool '{tool_name}' not found.")
-                        tool_to_execute = self.options.tools_dict[tool_name]
+                            tool_executed_successfully_this_iteration = False
+                            this_tool_call_needs_llm_replan = False
+                            human_message_for_this_tool_failure = None
+                            current_tool_output_payload = None
+                            
+                            individual_tool_span.add_event("Tool execution attempt initiated")
 
-                        # Simplified: Actual tool execution and error handling would be here
-                        if tool_name == "search" and "query" in tool_args:  # Example
-                            query = tool_args["query"]
-                            sim = calculate_raw_similarity(query, self.task)
-                            if sim < (self.options.similarity_threshold / 5):
-                                error_detail = f"Search query '{query}' too dissimilar (score: {sim:.2f}). Revise."
-                                current_tool_output_payload = {"error": error_detail}
-                                human_message_for_this_tool_failure = error_detail
-                                this_tool_call_needs_llm_replan = True
-                            else:
-                                current_tool_output_payload = tool_to_execute(
-                                    **tool_args
+                            try:
+                                if tool_name not in self.options.tools_dict:
+                                    raise KeyError(f"Tool '{tool_name}' not found.")
+                                tool_to_execute = self.options.tools_dict[tool_name]
+
+                                if tool_name == "search" and "query" in tool_args:
+                                    query = tool_args["query"]
+                                    sim = calculate_raw_similarity(query, self.task)
+                                    individual_tool_span.add_event(
+                                        "Search Tool Query Similarity Check",
+                                        {"query": query, "similarity_score": sim, "threshold": self.options.similarity_threshold / 5},
+                                    )
+                                    if sim < (self.options.similarity_threshold / 5):
+                                        error_detail = f"Search query '{query}' too dissimilar (score: {sim:.2f}) to main task. Revise query."
+                                        current_tool_output_payload = {"error": error_detail, "guidance": "The search query was too different from the main task. Please rephrase your search to be more relevant or break down the problem differently."}
+                                        human_message_for_this_tool_failure = f"Search query '{query}' for tool '{tool_name}' was too dissimilar to the main task. Please adjust your plan or query."
+                                        this_tool_call_needs_llm_replan = True
+                                        individual_tool_span.add_event(
+                                            "Search Tool Query Dissimilar",
+                                            {"error_detail": error_detail},
+                                        )
+                                        individual_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, "Search query dissimilar"))
+                                    else:
+                                        individual_tool_span.add_event("Executing search tool with accepted query")
+                                        current_tool_output_payload = tool_to_execute(**tool_args)
+                                        tool_executed_successfully_this_iteration = True
+                                else:
+                                    individual_tool_span.add_event(f"Executing non-search tool: {tool_name}")
+                                    current_tool_output_payload = tool_to_execute(**tool_args)
+                                    tool_executed_successfully_this_iteration = True
+                                
+                                individual_tool_span.add_event(
+                                    "Tool execution completed",
+                                    {"output_preview": str(current_tool_output_payload)[:200]}
                                 )
-                                tool_executed_successfully_this_iteration = True
-                        else:  # Other tools or search without query (which should be handled)
-                            current_tool_output_payload = tool_to_execute(**tool_args)
-                            tool_executed_successfully_this_iteration = True
+                                if tool_executed_successfully_this_iteration:
+                                     individual_tool_span.set_status(trace.Status(trace.StatusCode.OK))
 
-                    except Exception as e:
-                        error_msg_str = (
-                            f"Error with tool {tool_name} (ID: {tool_call_id}): {e}"
-                        )
-                        self.logger.error(error_msg_str, exc_info=True)
-                        current_tool_output_payload = {
-                            "error": "Tool execution failed",
-                            "details": error_msg_str,
-                        }
-                        human_message_for_this_tool_failure = (
-                            f"Error with '{tool_name}': {e}. Adjust plan."
-                        )
-                        this_tool_call_needs_llm_replan = True
-                    # ... (End of summarized tool execution logic) ...
 
-                    tool_message_content_final_str = json.dumps(
-                        current_tool_output_payload
-                    )  # Ensure serializable
-                    tool_messages_for_this_turn.append(
-                        ToolMessage(
-                            content=tool_message_content_final_str,
-                            tool_call_id=tool_call_id,
-                        )
-                    )
+                            except Exception as e:
+                                error_msg_str = f"Error with tool {tool_name} (ID: {tool_call_id}): {e}"
+                                self.logger.error(error_msg_str, exc_info=True)
+                                current_tool_output_payload = {
+                                    "error": "Tool execution failed",
+                                    "details": error_msg_str,
+                                }
+                                human_message_for_this_tool_failure = f"Error with tool '{tool_name}': {e}. Adjust your plan."
+                                this_tool_call_needs_llm_replan = True
+                                
+                                individual_tool_span.record_exception(e)
+                                individual_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, f"Tool {tool_name} execution failed: {str(e)}"))
 
-                    if self.options.on_tool_call_executed:
-                        self.options.on_tool_call_executed(
-                            self.task,
-                            self.uuid,
-                            tool_name,
-                            tool_args,
-                            current_tool_output_payload,
-                            tool_executed_successfully_this_iteration,
-                            tool_call_id,
-                        )
-
-                    if this_tool_call_needs_llm_replan:
-                        any_tool_requires_llm_replan = True
-                        if human_message_for_this_tool_failure:
-                            guidance_for_llm_reprompt.append(
-                                human_message_for_this_tool_failure
+                            tool_message_content_final_str = json.dumps(current_tool_output_payload, default=str)
+                            tool_messages_for_this_turn.append(
+                                ToolMessage(content=tool_message_content_final_str, tool_call_id=tool_call_id)
                             )
+                            individual_tool_span.add_event(
+                                "ToolMessage prepared",
+                                {"content_preview": tool_message_content_final_str[:200]}
+                            )
+
+                            individual_tool_span.set_attributes({
+                                "tool.execution_successful": tool_executed_successfully_this_iteration,
+                                "tool.requires_llm_replan": this_tool_call_needs_llm_replan,
+                                "tool.response_preview": tool_message_content_final_str[:200] # Redundant with event but useful as attribute
+                            })
+
+                            if self.options.on_tool_call_executed:
+                                individual_tool_span.add_event("Invoking on_tool_call_executed callback")
+                                try:
+                                    self.options.on_tool_call_executed(
+                                        self.task, self.uuid, tool_name, tool_args,
+                                        current_tool_output_payload, tool_executed_successfully_this_iteration, tool_call_id
+                                    )
+                                    individual_tool_span.add_event("on_tool_call_executed callback finished successfully")
+                                except Exception as cb_ex:
+                                    individual_tool_span.record_exception(cb_ex, {"callback_name": "on_tool_call_executed"})
+                                    self.logger.error(f"Error in on_tool_call_executed callback: {cb_ex}", exc_info=True)
+
+
+                            if this_tool_call_needs_llm_replan:
+                                any_tool_requires_llm_replan = True
+                                if human_message_for_this_tool_failure:
+                                    guidance_for_llm_reprompt.append(human_message_for_this_tool_failure)
+                    
+                    # After loop of tool calls, still inside "Processing Tool Calls Batch" span
+                    batch_tool_span.set_attribute("any_tool_requires_llm_replan_after_batch", any_tool_requires_llm_replan)
+                    if guidance_for_llm_reprompt:
+                        batch_tool_span.set_attribute("llm_reprompt_guidance_messages_count", len(guidance_for_llm_reprompt))
+                        batch_tool_span.add_event("LLM reprompt guidance prepared", {"guidance_preview": "\n".join(guidance_for_llm_reprompt)[:300]})
+                    
+                    if not any_tool_requires_llm_replan:
+                         batch_tool_span.set_status(trace.Status(trace.StatusCode.OK))
+                    else:
+                         batch_tool_span.set_status(trace.Status(trace.StatusCode.ERROR, "One or more tools require LLM replan"))
+
 
                 history.extend(tool_messages_for_this_turn)
 
                 if any_tool_requires_llm_replan:
-                    if guidance_for_llm_reprompt:
-                        history.append(
-                            HumanMessage(
-                                content="Review tool issues and adjust plan:\n"
-                                + "\n".join(guidance_for_llm_reprompt)
-                            )
-                        )
-                    else:  # Fallback if no specific guidance messages were generated
-                        history.append(
-                            HumanMessage(
-                                content="One or more tool calls had issues. Please review the tool responses and adjust your plan."
-                            )
-                        )
-                    continue  # Back to LLM with new human message
+                    replan_message_content = (
+                        "One or more tool actions resulted in errors or require a change of plan. "
+                        "Review the previous tool outputs and your reasoning. Adjust your plan and continue towards the main goal.\n"
+                        "Specific issues encountered:\n" + "\n".join([f"- {g}" for g in guidance_for_llm_reprompt])
+                        if guidance_for_llm_reprompt
+                        else "One or more tool calls had issues. Please review the tool responses and adjust your plan. Re-evaluate your approach to the main task."
+                    )
+                    history.append(HumanMessage(content=replan_message_content))
+                    single_task_span.add_event( # This event is on the main single_task_span
+                        "LLM Re-Plan Requested After Tool Batch",
+                        {"replan_reason_preview": replan_message_content[:300]},
+                    )
+                    continue # Continue the main while loop for LLM to re-plan
 
-            self.logger.warning(
-                f"Max tool loop iterations ({max_loops}) reached for task '{self.task}'. Returning current history's last AI message or error."
+            if loop_count >= max_loops:
+                single_task_span.add_event(
+                    "Max Tool Loop Iterations Reached", {"max_loops": max_loops}
+                )
+                single_task_span.set_status(trace.Status(trace.StatusCode.ERROR, "Max tool loop iterations reached"))
+                if history and isinstance(history[-1], AIMessage):
+                    final_result_content = str(history[-1].content)
+                elif history and isinstance(history[-1], ToolMessage): # If loop ended after tool messages but before AI
+                    final_result_content = "Max tool loop iterations reached. Last action was a tool call. No final AI response generated."
+            else: # Loop broke due to no tool calls, meaning LLM provided final answer
+                single_task_span.set_status(trace.Status(trace.StatusCode.OK))
+
+
+            single_task_span.add_event(
+                "Single Task Execution End",
+                {"final_result_preview": final_result_content[:200]},
             )
-            # Fallback: return the last AI message content if loop terminates due to count
-            if history and isinstance(history[-1], AIMessage):
-                return str(history[-1].content)
-            return "Max tool loop iterations reached without a final answer."
-
+            return final_result_content
     def _split_task(self) -> SplitTask:
-        self.logger.info(f"Splitting task: '{self.task}'")
-        task_history_for_splitting = self._build_task_split_history()
-        max_subtasks = self._get_max_subtasks()
-
-        system_msg_content = (
-            f"Split this task into smaller, parallelizable subtasks only if it's complex and benefits from it. You can create up to {max_subtasks} subtasks. "
-            "Do not attempt to answer the main task yourself.\n\n"
-            "Consider this contextual history (parent tasks, sibling tasks already in progress):\n"
-            f"{task_history_for_splitting}\n\n"
-            "When deciding on subtasks for the current task ('{self.task}'), ensure they:\n"
-            "1. Avoid redundant overlap with tasks in the history.\n"
-            "2. Logically break down the current task if it's too broad for a single LLM response.\n"
-            "3. Are distinct and can be worked on independently if possible.\n"
-            f"4. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
+        agent_span = self.current_span
+        parent_context_for_split = (
+            trace.set_span_in_context(agent_span)
+            if agent_span
+            else otel_context.get_current()
         )
-        if self.u_inst:
-            system_msg_content += f"User-provided instructions for the main task (consider these when splitting):\n{self.u_inst}\n"
 
-        system_msg = SystemMessage(content=system_msg_content)
-        split_msgs_hist = [system_msg, HumanMessage(self.task)]
+        with self.tracer.start_as_current_span(
+            "Split Task Operation", context=parent_context_for_split
+        ) as split_span:
+            self.logger.info(f"Splitting task: '{self.task}'")
+            task_history_for_splitting = self._build_task_split_history()
+            max_subtasks = self._get_max_subtasks()
 
-        evaluation = evaluate_prompt(
-            f"Prompt: {self.task}"
-        )  # Assuming evaluate_prompt is defined elsewhere
-        if self.current_span:
-            self.current_span.set_attribute(
-                "prompt_complexity.score", evaluation.prompt_complexity_score[0]
+            split_span.add_event(
+                "Task Splitting Start",
+                {
+                    "task": self.task,
+                    "max_subtasks_allowed": max_subtasks,
+                    "context_for_splitting_preview": task_history_for_splitting[:300],
+                },
             )
 
-        if (
-            evaluation.prompt_complexity_score[0] < 0.1
-            and evaluation.domain_knowledge[0] > 0.8
-        ):
-            self.logger.info(
-                "Task complexity/domain knowledge suggests no subtasks needed based on evaluation."
+            system_msg_content = (
+                f"Split this task into smaller, parallelizable subtasks only if it's complex and benefits from it. You can create up to {max_subtasks} subtasks. "
+                "Do not attempt to answer the main task yourself.\n\n"
+                "Consider this contextual history (parent tasks, sibling tasks already in progress):\n"
+                f"{task_history_for_splitting}\n\n"
+                "When deciding on subtasks for the current task ('{self.task}'), ensure they:\n"
+                "1. Avoid redundant overlap with tasks in the history.\n"
+                "2. Logically break down the current task if it's too broad for a single LLM response.\n"
+                "3. Are distinct and can be worked on independently if possible.\n"
+                f"4. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
             )
-            return SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)
+            if self.u_inst:
+                system_msg_content += f"User-provided instructions for the main task (consider these when splitting):\n{self.u_inst}\n"
 
-        # LLM call to get textual list of subtasks
-        response = self.llm.invoke(
-            split_msgs_hist + [AIMessage(content="1. ")]
-        )  # Priming
-        split_msgs_hist.append(AIMessage(content="1. " + response.content))
+            split_msgs_hist = [
+                SystemMessage(content=system_msg_content),
+                HumanMessage(self.task),
+            ]
 
-        split_msgs_hist.append(
-            HumanMessage(
+            evaluation = evaluate_prompt(f"Prompt: {self.task}")
+            split_span.add_event(
+                "Prompt Complexity Evaluation",
+                {
+                    "complexity_score": evaluation.prompt_complexity_score[0],
+                    "domain_knowledge_score": evaluation.domain_knowledge[0],
+                },
+            )
+
+            if (
+                evaluation.prompt_complexity_score[0] < 0.1
+                and evaluation.domain_knowledge[0] > 0.8
+            ):
+                split_span.add_event(
+                    "Skipping LLM Split: Low Complexity / High Domain Knowledge"
+                )
+                return SplitTask(
+                    needs_subtasks=False, subtasks=[], evaluation=evaluation
+                )
+
+            # LLM Call 1: Initial subtask generation
+            primed_hist_1 = split_msgs_hist + [AIMessage(content="1. ")]
+            prompt_str_1 = _serialize_lc_messages_for_preview(primed_hist_1)
+            full_prompt_str_1_tokens = "\n".join(
+                [str(m.content) for m in primed_hist_1]
+            )
+            prompt_tokens_1 = self._get_token_count(full_prompt_str_1_tokens)
+            split_span.add_event(
+                "LLM Invocation Start (Splitting - Initial List)",
+                {
+                    "llm_type": "main_llm",
+                    "prompt_preview": prompt_str_1,
+                    "estimated_prompt_tokens": prompt_tokens_1,
+                },
+            )
+            response1 = self.llm.invoke(primed_hist_1)  # Pass primed history
+            response_content_1 = "1. " + str(
+                response1.content
+            )  # Prepend the prime for full response
+            completion_tokens_1 = self._get_token_count(
+                str(response1.content)
+            )  # Count only new content
+            split_span.add_event(
+                "LLM Invocation End (Splitting - Initial List)",
+                {
+                    "llm_type": "main_llm",
+                    "response_preview": response_content_1[:200],
+                    "estimated_completion_tokens": completion_tokens_1,
+                },
+            )
+            split_msgs_hist.append(
+                AIMessage(content=response_content_1)
+            )  # Add the full AI response including prime
+
+            # LLM Call 2: Refine subtasks
+            refine_human_msg = HumanMessage(
                 content="Can you make these more specific? Remember, each of these is sent off to another agent, with no context, asynchronously. All they know is what you put in this list."
             )
-        )
-
-        split_msgs_hist.append(
-            self.llm.invoke(split_msgs_hist)
-        )  # LLM call to get more specific subtasks
-
-        # LLM call to format into JSON
-        split_msgs_hist.append(
-            self._construct_subtask_to_json_prompt()
-        )  # Renamed for clarity
-        structured_response_msg = self.llm.invoke(split_msgs_hist)
-
-        split_task_result: SplitTask
-        try:
-            parsed_output_from_llm = self.task_split_parser.invoke(
-                structured_response_msg
+            hist_for_refine = split_msgs_hist + [refine_human_msg]
+            prompt_str_2 = _serialize_lc_messages_for_preview(hist_for_refine)
+            full_prompt_str_2_tokens = "\n".join(
+                [str(m.content) for m in hist_for_refine]
             )
-            if isinstance(parsed_output_from_llm, dict):
-                parsed_output_from_llm["evaluation"] = evaluation
-                split_task_result = SplitTask(**parsed_output_from_llm)
-            elif isinstance(parsed_output_from_llm, SplitTask):  # Should be this path
-                split_task_result = parsed_output_from_llm
-                split_task_result.evaluation = evaluation
-            else:  # Fallback
+            prompt_tokens_2 = self._get_token_count(full_prompt_str_2_tokens)
+            split_span.add_event(
+                "LLM Invocation Start (Splitting - Refine List)",
+                {
+                    "llm_type": "main_llm",
+                    "prompt_preview": prompt_str_2,
+                    "estimated_prompt_tokens": prompt_tokens_2,
+                },
+            )
+            response2 = self.llm.invoke(
+                hist_for_refine
+            )  # Use the history including the refine human message
+            completion_tokens_2 = self._get_token_count(str(response2.content))
+            split_span.add_event(
+                "LLM Invocation End (Splitting - Refine List)",
+                {
+                    "llm_type": "main_llm",
+                    "response_preview": str(response2.content)[:200],
+                    "estimated_completion_tokens": completion_tokens_2,
+                },
+            )
+            split_msgs_hist.append(response2)  # Add refined AI response
+
+            # LLM Call 3: Format to JSON
+            json_format_msg = self._construct_subtask_to_json_prompt()
+            hist_for_json = split_msgs_hist + [json_format_msg]
+            prompt_str_3 = _serialize_lc_messages_for_preview(hist_for_json)
+            full_prompt_str_3_tokens = "\n".join(
+                [str(m.content) for m in hist_for_json]
+            )
+            prompt_tokens_3 = self._get_token_count(full_prompt_str_3_tokens)
+            split_span.add_event(
+                "LLM Invocation Start (Splitting - JSON Format)",
+                {
+                    "llm_type": "main_llm",
+                    "prompt_preview": prompt_str_3,
+                    "estimated_prompt_tokens": prompt_tokens_3,
+                },
+            )
+            structured_response_msg = self.llm.invoke(hist_for_json)
+            completion_tokens_3 = self._get_token_count(
+                str(structured_response_msg.content)
+            )
+            split_span.add_event(
+                "LLM Invocation End (Splitting - JSON Format)",
+                {
+                    "llm_type": "main_llm",
+                    "response_preview": str(structured_response_msg.content)[:200],
+                    "estimated_completion_tokens": completion_tokens_3,
+                },
+            )
+
+            split_task_result: SplitTask
+            try:
+                parsed_output_from_llm = self.task_split_parser.invoke(
+                    structured_response_msg
+                )
+                if isinstance(parsed_output_from_llm, dict):
+                    parsed_output_from_llm["evaluation"] = evaluation
+                    split_task_result = SplitTask(**parsed_output_from_llm)
+                elif isinstance(parsed_output_from_llm, SplitTask):
+                    split_task_result = parsed_output_from_llm
+                    split_task_result.evaluation = evaluation
+                else:
+                    self.logger.error(
+                        f"Unexpected type from task_split_parser: {type(parsed_output_from_llm)}."
+                    )
+                    raise TypeError(
+                        f"Unexpected type from parser: {type(parsed_output_from_llm)}"
+                    )
+
+                split_span.add_event(
+                    "Task Splitting JSON Parsed",
+                    {
+                        "parsed_needs_subtasks": split_task_result.needs_subtasks,
+                        "parsed_subtasks_count": len(split_task_result.subtasks),
+                    },
+                )
+
+            except (ValidationError, OutputParserException, TypeError) as e:
                 self.logger.error(
-                    f"Unexpected type from task_split_parser: {type(parsed_output_from_llm)}."
+                    f"Error parsing LLM JSON for task splitting: {e}. LLM content: {str(structured_response_msg.content)[:500]}",
+                    exc_info=True,
+                )
+                split_span.record_exception(
+                    e,
+                    attributes={
+                        "llm_content_preview": str(structured_response_msg.content)[
+                            :200
+                        ]
+                    },
                 )
                 split_task_result = SplitTask(
                     needs_subtasks=False, subtasks=[], evaluation=evaluation
                 )
-        except (ValidationError, OutputParserException, TypeError) as e:
-            self.logger.error(
-                f"Error parsing LLM JSON for task splitting: {e}. LLM content: {str(structured_response_msg.content)[:500]}",
-                exc_info=True,
-            )
-            split_task_result = SplitTask(
-                needs_subtasks=False, subtasks=[], evaluation=evaluation
-            )
 
-        # Trim subtasks if they exceed max_subtasks
-        if split_task_result.subtasks:
-            original_subtask_count = len(split_task_result.subtasks)
-            split_task_result.subtasks = split_task_result.subtasks[:max_subtasks]
-            if len(split_task_result.subtasks) < original_subtask_count:
-                self.logger.info(
-                    f"Trimmed subtasks from {original_subtask_count} to {len(split_task_result.subtasks)}."
-                )
-            split_task_result.needs_subtasks = bool(
-                split_task_result.subtasks
-            )  # Update based on actual count
+            if split_task_result.subtasks:
+                original_subtask_count = len(split_task_result.subtasks)
+                split_task_result.subtasks = split_task_result.subtasks[:max_subtasks]
+                if len(split_task_result.subtasks) < original_subtask_count:
+                    split_span.add_event(
+                        "Subtasks Trimmed to Max Allowed",
+                        {
+                            "original_count": original_subtask_count,
+                            "trimmed_count": len(split_task_result.subtasks),
+                        },
+                    )
+                split_task_result.needs_subtasks = bool(split_task_result.subtasks)
 
-        self.logger.info(
-            f"Task splitting finished. Needs subtasks: {split_task_result.needs_subtasks}. Num subtasks: {len(split_task_result.subtasks)}"
-        )
-        return split_task_result
+            split_span.add_event(
+                "Task Splitting Finished",
+                {
+                    "final_needs_subtasks": split_task_result.needs_subtasks,
+                    "final_subtasks_count": len(split_task_result.subtasks),
+                    "subtasks_preview": json.dumps(
+                        [
+                            st.model_dump(exclude={"evaluation"})
+                            for st in split_task_result.subtasks
+                        ],
+                        default=str,
+                    )[:500],
+                },
+            )
+            return split_task_result
 
     def _verify_result(
         self, subtask_results_map: Optional[Dict[str, str]] = None
     ) -> bool:
-        self.logger.info(f"Verifying result for task: '{self.task}'")
-        if self.result is None:
-            self.logger.warning(
-                f"Cannot verify task '{self.task}' as its result is None."
-            )
-            return False  # Cannot verify a None result
-
-        task_history_for_verification = self._build_task_verify_history(
-            subtask_results_map
+        agent_span = self.current_span
+        parent_context_for_verify = (
+            trace.set_span_in_context(agent_span)
+            if agent_span
+            else otel_context.get_current()
         )
 
-        system_msg_content = (
-            "You are an AI assistant tasked with verifying the successful completion of a task. "
-            "You will be given the original task, the result produced, and contextual history "
-            "(parent tasks, sibling tasks, and any subtasks that contributed to this result).\n\n"
-            f"Contextual History:\n{task_history_for_verification}\n\n"
-            "Based on ALL information (original task, produced result, and full context), critically evaluate if the produced result "
-            "comprehensively, accurately, and directly addresses the original task. "
-            "Do not verify external information sources, but focus on the quality and relevance of the result to the task. "
-            "Output a JSON object with a 'successful' boolean field."
-        )
+        with self.tracer.start_as_current_span(
+            "Verify Result Operation", context=parent_context_for_verify
+        ) as verify_span:
+            self.logger.info(f"Verifying result for task: '{self.task}'")
+            if self.result is None:
+                verify_span.add_event("Verification Skipped: Result is None")
+                return False
 
-        human_msg_content = (
-            f"Original Task Statement:\n'''\n{self.task}\n'''\n\n"
-            f"Produced Result for the Original Task:\n'''\n{self.result}\n'''\n\n"
-            "User Instructions (if any) for the Original Task:\n'''\n"
-            f"{self.u_inst if self.u_inst else 'No specific user instructions were provided.'}\n'''\n\n"
-            "Considering all the above and the contextual history, was the original task successfully completed by the produced result?"
-        )
-
-        verify_msgs_hist = [
-            SystemMessage(content=system_msg_content),
-            HumanMessage(content=human_msg_content),
-        ]
-
-        # Priming the LLM for JSON output
-        verify_msgs_hist.append(
-            AIMessage(content=f'```json\n{{\n  "successful": ')
-        )  # Prime for boolean
-
-        self.logger.info("Invoking LLM for answer verification (JSON formatting).")
-        structured_response_msg = self.llm.invoke(
-            verify_msgs_hist
-        )  # AIMessage expected
-
-        # Append the LLM's actual JSON completion to the primed AIMessage for full log
-        if isinstance(structured_response_msg, AIMessage):
-            verify_msgs_hist[-1] = AIMessage(
-                content=verify_msgs_hist[-1].content + structured_response_msg.content
+            task_history_for_verification = self._build_task_verify_history(
+                subtask_results_map
             )
-        else:  # Should not happen with Langchain LLMs
-            verify_msgs_hist.append(AIMessage(content=str(structured_response_msg)))
 
-        verification_obj: Optional[verification] = None
-        try:
-            # The parser expects the raw JSON string or a message containing it.
-            parsed_output = self.task_verification_parser.invoke(
-                structured_response_msg
+            verify_span.add_event(
+                "Verification Process Start",
+                {
+                    "task": self.task,
+                    "current_result_preview": str(self.result)[:200],
+                    "user_instructions_preview": str(self.u_inst)[:200],
+                    "verification_context_preview": task_history_for_verification[:300],
+                },
             )
-            if isinstance(parsed_output, dict):
-                verification_obj = verification(**parsed_output)
-            elif isinstance(
-                parsed_output, verification
-            ):  # Parser might return the object directly
-                verification_obj = parsed_output
 
-            if verification_obj is None:
-                raise ValueError(
-                    "Parsed output could not be converted to verification object."
+            system_msg_content = (
+                "You are an AI assistant tasked with verifying the successful completion of a task. "
+                "You will be given the original task, the result produced, and contextual history "
+                "(parent tasks, sibling tasks, and any subtasks that contributed to this result).\n\n"
+                f"Contextual History:\n{task_history_for_verification}\n\n"
+                "Based on ALL information (original task, produced result, and full context), critically evaluate if the produced result "
+                "comprehensively, accurately, and directly addresses the original task. "
+                "Do not verify external information sources, but focus on the quality and relevance of the result to the task. "
+                "Output a JSON object with a 'successful' boolean field."
+            )
+            human_msg_content = (
+                f"Original Task Statement:\n'''\n{self.task}\n'''\n\n"
+                f"Produced Result for the Original Task:\n'''\n{self.result}\n'''\n\n"
+                "User Instructions (if any) for the Original Task:\n'''\n"
+                f"{self.u_inst if self.u_inst else 'No specific user instructions were provided.'}\n'''\n\n"
+                "Considering all the above and the contextual history, was the original task successfully completed by the produced result?"
+            )
+            verify_msgs_hist_initial = [
+                SystemMessage(content=system_msg_content),
+                HumanMessage(content=human_msg_content),
+            ]
+
+            # primed_ai_msg_content = f'```json\n{{\n  "successful": '
+            verify_msgs_hist_for_llm = verify_msgs_hist_initial + [
+                # AIMessage(content=primed_ai_msg_content)
+            ]
+
+            prompt_str = _serialize_lc_messages_for_preview(verify_msgs_hist_for_llm)
+            full_prompt_str_tokens = "\n".join(
+                [str(m.content) for m in verify_msgs_hist_for_llm]
+            )
+            prompt_tokens = self._get_token_count(full_prompt_str_tokens)
+            verify_span.add_event(
+                "LLM Invocation Start (Verification)",
+                {
+                    "llm_type": "main_llm",
+                    "prompt_preview": prompt_str,
+                    "estimated_prompt_tokens": prompt_tokens,
+                },
+            )
+            structured_response_msg = self.llm.invoke(
+                verify_msgs_hist_for_llm
+            )  # LLM completes the primed JSON
+
+            llm_completion_part = str(structured_response_msg.content)
+            full_llm_response_content_for_parser = (
+                llm_completion_part
+            )
+            completion_tokens = self._get_token_count(llm_completion_part)
+            verify_span.add_event(
+                "LLM Invocation End (Verification)",
+                {
+                    "llm_type": "main_llm",
+                    "response_preview": full_llm_response_content_for_parser[:200],
+                    "estimated_completion_tokens": completion_tokens,
+                },
+            )
+
+            verification_obj: Optional[verification] = None
+            try:
+                # Pass the full content, assuming parser can handle the primed start + completion
+                # Or, if parser expects only the completion part that makes it valid JSON:
+                # parsed_output = self.task_verification_parser.parse(f'{{"successful": {llm_completion_part}')
+                # For Langchain's JsonOutputParser, passing the AIMessage containing the JSON is standard.
+                # The AIMessage from LLM already contains the completed JSON.
+                # However, since we primed, the `structured_response_msg` might only be the boolean value.
+                # Let's reconstruct the full message as Langchain JsonOutputParser expects a message
+                # or a string that is valid JSON.
+
+                # Create a new AIMessage with the fully formed JSON string for the parser
+                full_json_ai_message = AIMessage(
+                    content=full_llm_response_content_for_parser
+                )
+                parsed_output = self.task_verification_parser.invoke(
+                    full_json_ai_message
                 )
 
-            if self.current_span:
-                self.current_span.add_event(
-                    "Answer Verification Parsed",
-                    {"parsed_ok": True, "task_successful": verification_obj.successful},
+                if isinstance(parsed_output, dict):
+                    verification_obj = verification(**parsed_output)
+                elif isinstance(parsed_output, verification):
+                    verification_obj = parsed_output
+                else:
+                    raise TypeError(
+                        f"Unexpected type from verification parser: {type(parsed_output)}"
+                    )
+
+                if verification_obj is None:
+                    raise ValueError(
+                        "Parsed output could not be converted to verification object."
+                    )
+
+                verify_span.add_event(
+                    "Verification JSON Parsed",
+                    {"task_successful": verification_obj.successful},
                 )
-            self.logger.info(
-                f"Verification result for task '{self.task}': {'Successful' if verification_obj.successful else 'Failed'}"
-            )
-            return verification_obj.successful
-        except (ValidationError, OutputParserException, TypeError, ValueError) as e:
-            self.logger.error(
-                f"Error parsing LLM JSON for verification or instantiating 'verification' object: {e}. LLM content: {str(structured_response_msg.content if isinstance(structured_response_msg, AIMessage) else structured_response_msg)[:500]}",
-                exc_info=True,
-            )
-            if self.current_span:
-                self.current_span.record_exception(e)
-                self.current_span.add_event("Verification Parsing Failed")
-            # Default to unsuccessful if parsing fails, to be safe
-            return False
-        except Exception as e:
-            self.logger.error(
-                f"Unexpected error during verification finalization: {e}. LLM content: {str(structured_response_msg.content if isinstance(structured_response_msg, AIMessage) else structured_response_msg)[:500]}",
-                exc_info=True,
-            )
-            return False
+                return verification_obj.successful
+            except (ValidationError, OutputParserException, TypeError, ValueError) as e:
+                self.logger.error(
+                    f"Error parsing LLM JSON for verification: {e}. LLM content: {full_llm_response_content_for_parser[:500]}",
+                    exc_info=True,
+                )
+                verify_span.record_exception(
+                    e,
+                    attributes={
+                        "llm_content_preview": full_llm_response_content_for_parser[
+                            :200
+                        ]
+                    },
+                )
+                return False
+            except Exception as e:
+                self.logger.error(
+                    f"Unexpected error during verification finalization: {e}. LLM content: {full_llm_response_content_for_parser[:500]}",
+                    exc_info=True,
+                )
+                verify_span.record_exception(
+                    e,
+                    attributes={
+                        "llm_content_preview": full_llm_response_content_for_parser[
+                            :200
+                        ]
+                    },
+                )
+                return False
 
     def verify_result(self, subtask_results_map: Optional[Dict[str, str]] = None):
-        successful = self._verify_result(subtask_results_map)
+        agent_span = self.current_span  # This is the main agent span
+        successful = self._verify_result(
+            subtask_results_map
+        )  # _verify_result creates its own child span
+
         if successful:
             self.status = "succeeded"
+            if agent_span:
+                agent_span.add_event(
+                    "Task Verification Passed",
+                    {"new_status": self.status, "task": self.task},
+                )
         else:
-            self.status = "failed_verification"  # More specific status before fix
+            self.status = "failed_verification"
+            if agent_span:
+                agent_span.add_event(
+                    "Task Verification Failed",
+                    {"new_status": self.status, "task": self.task},
+                )
             raise TaskFailedException(
                 f"Task '{self.task}' (UUID: {self.uuid}) was not completed successfully according to verification."
             )
 
     def _fix(self, failed_subtask_results_map: Optional[Dict[str, str]]):
-        self.logger.info(
-            f"Attempting to fix task: '{self.task}' (UUID: {self.uuid}) which failed verification."
-        )
-        original_task_str = self.task
-        failed_result_str = str(
-            self.result
-            if self.result is not None
-            else "No result was produced or result was None."
+        agent_span = self.current_span
+        parent_context_for_fix = (
+            trace.set_span_in_context(agent_span)
+            if agent_span
+            else otel_context.get_current()
         )
 
-        fix_instructions_parts = [
-            f"The original task was: '{original_task_str}'.",
-            f"A previous attempt to solve it resulted in (or failed to produce a result): '{failed_result_str[:700]}...'. This outcome was deemed unsatisfactory/incomplete by an automated verification step.",
-        ]
-        if failed_subtask_results_map:
-            fix_instructions_parts.append(
-                "The failed attempt may have involved these subtasks and their results:"
+        with self.tracer.start_as_current_span(
+            "Fix Task Operation", context=parent_context_for_fix
+        ) as fix_span:
+            self.logger.info(
+                f"Attempting to fix task: '{self.task}' (UUID: {self.uuid}) which failed verification."
             )
-            for sub_task, sub_result in failed_subtask_results_map.items():
+            original_task_str = self.task
+            failed_result_str = str(
+                self.result if self.result is not None else "No result was produced."
+            )
+
+            fix_span.add_event(
+                "Fix Attempt Initiated",
+                {
+                    "original_task": original_task_str,
+                    "failed_result_preview": failed_result_str[:200],
+                    "original_user_instructions_preview": str(self.u_inst)[:200],
+                    "failed_subtasks_map_preview": (
+                        json.dumps(failed_subtask_results_map, default=str)[:300]
+                        if failed_subtask_results_map
+                        else "None"
+                    ),
+                },
+            )
+
+            fix_instructions_parts = [
+                f"The original task was: '{original_task_str}'.",
+                f"A previous attempt to solve it resulted in (or failed to produce a result): '{failed_result_str[:700]}...'. This outcome was deemed unsatisfactory/incomplete by an automated verification step.",
+            ]
+            if failed_subtask_results_map:
                 fix_instructions_parts.append(
-                    f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}..."
+                    "The failed attempt may have involved these subtasks and their results:"
+                )
+                for sub_task, sub_result in failed_subtask_results_map.items():
+                    fix_instructions_parts.append(
+                        f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}..."
+                    )
+            if self.u_inst:
+                fix_instructions_parts.append(
+                    f"\nOriginal user instructions for the task were: {self.u_inst}"
+                )
+            fix_instructions_parts.append(
+                "\nYour current objective is to FIX this failure. Analyze the original task, the failed outcome, any subtask information, and original user instructions. "
+                "Then, provide a corrected and complete solution to the original task: '{original_task_str}'. "
+                "You can break this fix attempt into a small number of sub-steps if that helps achieve a high-quality corrected solution. "
+                "Focus on addressing the deficiencies of the previous attempt."
+            )
+            full_fix_instructions = "\n".join(fix_instructions_parts)
+
+            current_agent_max_subtasks_at_this_layer = self._get_max_subtasks()
+            fixer_max_subtasks_for_its_level = 0
+            if current_agent_max_subtasks_at_this_layer > 0:
+                fixer_max_subtasks_for_its_level = max(
+                    1, int(current_agent_max_subtasks_at_this_layer / 2)
                 )
 
-        if self.u_inst:
-            fix_instructions_parts.append(
-                f"\nOriginal user instructions for the task were: {self.u_inst}"
+            original_max_depth = len(self.options.task_limits.limits)
+            fixer_limits_config_array = [0] * original_max_depth
+            if self.current_layer < original_max_depth:
+                fixer_limits_config_array[self.current_layer] = (
+                    fixer_max_subtasks_for_its_level
+                )
+
+            fixer_task_limits = TaskLimit.from_array(fixer_limits_config_array)
+            fixer_options = self.options.model_copy()
+            fixer_options.task_limits = fixer_task_limits
+
+            fixer_agent_uuid = str(uuid.uuid4())
+            fix_span.add_event(
+                "Fixer Agent Configuration",
+                {
+                    "fixer_agent_uuid": fixer_agent_uuid,
+                    "fixer_max_subtasks": fixer_max_subtasks_for_its_level,
+                    "fixer_instructions_preview": full_fix_instructions[:300],
+                },
             )
 
-        fix_instructions_parts.append(
-            "\nYour current objective is to FIX this failure. Analyze the original task, the failed outcome, any subtask information, and original user instructions. "
-            "Then, provide a corrected and complete solution to the original task: '{original_task_str}'. "
-            "You can break this fix attempt into a small number of sub-steps if that helps achieve a high-quality corrected solution. "
-            "Focus on addressing the deficiencies of the previous attempt."
-        )
-        full_fix_instructions = "\n".join(fix_instructions_parts)
-
-        # Configure options for the fixer agent
-        current_agent_max_subtasks_at_this_layer = 0
-        if self.current_layer < len(self.options.task_limits.limits):
-            current_agent_max_subtasks_at_this_layer = self.options.task_limits.limits[
-                self.current_layer
-            ]
-        else:  # Agent is deeper than configured limits, should not allow subtasks
-            current_agent_max_subtasks_at_this_layer = 0
-
-        # Fixer gets half subtasks, min 1 if original allowed any, else 0.
-        fixer_max_subtasks_for_its_level = 0
-        if current_agent_max_subtasks_at_this_layer > 0:
-            fixer_max_subtasks_for_its_level = max(
-                1, int(current_agent_max_subtasks_at_this_layer / 2)
+            fixer_agent_context = TaskContext(
+                task=original_task_str, parent_context=self.context.parent_context
+            )
+            fixer_agent = RecursiveAgent(
+                task=original_task_str,
+                u_inst=full_fix_instructions,
+                tracer=self.tracer,
+                tracer_span=fix_span,
+                uuid=fixer_agent_uuid,
+                agent_options=fixer_options,
+                allow_subtasks=True,
+                current_layer=self.current_layer,
+                parent=self,
+                context=fixer_agent_context,
+                siblings=[],
             )
 
-        self.logger.info(
-            f"Fixer agent for '{original_task_str}' will be allowed up to {fixer_max_subtasks_for_its_level} subtasks."
-        )
+            try:
+                fix_span.add_event(
+                    "Fixer Agent Run Start", {"fixer_agent_uuid": fixer_agent_uuid}
+                )
+                fixer_result = fixer_agent.run()
+                fix_span.add_event(
+                    "Fixer Agent Run Completed",
+                    {
+                        "fixer_agent_uuid": fixer_agent_uuid,
+                        "fixer_result_preview": str(fixer_result)[:200],
+                        "fixer_agent_final_status": fixer_agent.status,
+                    },
+                )
 
-        original_max_depth = len(self.options.task_limits.limits)
-        fixer_limits_config_array = [0] * original_max_depth
+                self.result = fixer_result
+                self.context.result = self.result
 
-        if self.current_layer < original_max_depth:
-            fixer_limits_config_array[self.current_layer] = (
-                fixer_max_subtasks_for_its_level
-            )
+                fix_span.add_event("Re-verifying Fixed Result")
+                self.verify_result(None)
 
-        fixer_task_limits = TaskLimit.from_array(fixer_limits_config_array)
-        fixer_options = (
-            self.options.model_copy()
-        )  # update={"task_limits": fixer_task_limits})
-        fixer_options.task_limits = fixer_task_limits
+                self.status = "fixed_and_verified"
+                fix_span.add_event(
+                    "Fix Attempt Succeeded",
+                    {
+                        "final_status": self.status,
+                        "new_result_preview": str(self.result)[:200],
+                    },
+                )
 
-        fixer_agent_uuid = str(uuid.uuid4())
-        self.logger.info(
-            f"Initializing fixer agent (UUID: {fixer_agent_uuid}) for task: '{original_task_str}'."
-        )
-
-        fixer_agent_context = TaskContext(
-            task=original_task_str, parent_context=self.context.parent_context
-        )
-
-        fixer_agent = RecursiveAgent(
-            task=original_task_str,
-            u_inst=full_fix_instructions,  # u_inst now contains all context for fixing
-            tracer=self.tracer,
-            tracer_span=self.current_span,  # Fixer runs as a child span of the original task's execution
-            uuid=fixer_agent_uuid,
-            agent_options=fixer_options,
-            allow_subtasks=True,  # Governed by its specific fixer_task_limits
-            current_layer=self.current_layer,  # Fixer operates at the same layer
-            parent=self,  # The failed agent is parent, fixer can see its failed result via context
-            context=fixer_agent_context,
-            siblings=[],  # Fixer agent is a new independent operation, no initial siblings of its type
-        )
-
-        try:
-            self.logger.info(
-                f"Running fixer agent (UUID: {fixer_agent_uuid}) for task '{self.task}'."
-            )
-            fixer_result = (
-                fixer_agent.run()
-            )  # Fixer agent runs its full cycle, including its own verification if it uses subtasks.
-
-            self.result = (
-                fixer_result  # Update current agent's result with fixer's output
-            )
-            self.context.result = self.result  # Also update context object
-
-            self.logger.info(
-                f"Fixer agent completed. Re-verifying the fixed result for task: '{self.task}'."
-            )
-            # Verify the fixer's result against the original task.
-            # The fixer_agent might have had its own subtasks, but for this verification,
-            # we are verifying the final output of the fixer_agent. So, subtask_results_map is None.
-            self.verify_result(
-                None
-            )  # This will raise TaskFailedException if this new verification fails.
-            # If successful, it sets self.status = "succeeded".
-
-            # If verify_result passed, the task is now considered fixed and successful.
-            self.logger.info(
-                f"Task '{self.task}' successfully fixed and verified. New result: {str(self.result)[:100]}..."
-            )
-            self.status = "fixed_and_verified"
-
-        except TaskFailedException as e_fix_verify:
-            self.logger.error(
-                f"Verification of fixer agent's result FAILED for task '{self.task}': {e_fix_verify}. Marking task as terminally failed."
-            )
-            self.status = "failed"  # Fix attempt's result also failed verification.
-        except Exception as e_fix_run:
-            self.logger.error(
-                f"Fixer agent (UUID: {fixer_agent_uuid}) encountered an UNHANDLED ERROR during its run for task '{self.task}': {e_fix_run}",
-                exc_info=True,
-            )
-            self.status = "failed"  # Fixer agent crashed or had an unhandled error.
-            if self.result is None:  # If fixer didn't even produce a result.
-                self.result = f"Fix attempt failed with error: {e_fix_run}"
+            except TaskFailedException as e_fix_verify:
+                self.logger.error(
+                    f"Verification of fixer agent's result FAILED for task '{self.task}': {e_fix_verify}. Marking task as terminally failed."
+                )
+                self.status = "failed"
+                fix_span.record_exception(
+                    e_fix_verify,
+                    attributes={"reason": "Re-verification of fixed result failed"},
+                )
+                fix_span.add_event(
+                    "Fix Attempt Failed: Re-verification",
+                    {"final_status": self.status, "error": str(e_fix_verify)},
+                )
+            except Exception as e_fix_run:
+                self.logger.error(
+                    f"Fixer agent (UUID: {fixer_agent_uuid}) encountered an UNHANDLED ERROR: {e_fix_run}",
+                    exc_info=True,
+                )
+                self.status = "failed"
+                if self.result is None:
+                    self.result = f"Fix attempt failed with error: {e_fix_run}"
+                fix_span.record_exception(
+                    e_fix_run, attributes={"reason": "Fixer agent run error"}
+                )
+                fix_span.add_event(
+                    "Fix Attempt Failed: Fixer Agent Error",
+                    {"final_status": self.status, "error": str(e_fix_run)},
+                )
 
     def _get_max_subtasks(self) -> int:
         if self.current_layer >= len(self.options.task_limits.limits):
-            self.logger.warning(
-                f"Current layer {self.current_layer} exceeds max depth {len(self.options.task_limits.limits)}. No subtasks allowed."
-            )
             return 0
-        max_s = self.options.task_limits.limits[self.current_layer]
-        self.logger.debug(
-            f"Max subtasks for current layer {self.current_layer}: {max_s}"
-        )
-        return max_s
+        return self.options.task_limits.limits[self.current_layer]
 
     def _summarize_subtask_results(
         self, tasks: List[str], subtask_results: List[str]
     ) -> str:
-        self.logger.info(
-            f"Summarizing {len(subtask_results)} subtask results for task: '{self.task}'"
+        agent_span = self.current_span
+        parent_context_for_summary = (
+            trace.set_span_in_context(agent_span)
+            if agent_span
+            else otel_context.get_current()
         )
-        # ... (existing summarization logic, assumed correct) ...
-        if not subtask_results:
-            return "No subtask results were generated to summarize."
 
-        merge_options = MergeOptions(llm=self.llm, context_window=15000)
-        merger = self.options.merger(merge_options)
-
-        documents_to_merge = [
-            f"SUBTASK QUESTION: {question}\n\nSUBTASK ANSWER:\n{answer}"
-            for (question, answer) in zip(tasks, subtask_results)
-            if answer is not None  # Filter out None answers
-        ]
-        if not documents_to_merge:
-            return "All subtasks yielded empty or no results."
-
-        merged_content = merger.merge_documents(documents_to_merge)
-
-        if self.options.align_summaries:
-            max_merged_content_len = 10000
-            merged_content_for_alignment = merged_content
-            if len(merged_content) > max_merged_content_len:
-                self.logger.warning(
-                    f"Merged content length ({len(merged_content)}) too long, truncating for alignment."
-                )
-                merged_content_for_alignment = (
-                    merged_content[:max_merged_content_len]
-                    + "\n... [Content Truncated]"
-                )
-
-            alignment_prompt_messages = [
-                HumanMessage(
-                    f"The following information has been gathered from subtasks:\n\n{merged_content_for_alignment}\n\n"
-                    f"Based on this information, compile a comprehensive and well-structured report that directly answers this main question: '{self.task}'.\n"
-                    f"User instructions for the main question (if any): {self.u_inst if self.u_inst else 'None'}\n\n"
-                    "Report Requirements:\n"
-                    "- Go into detail where relevant information is provided.\n"
-                    "- Disregard irrelevant information from subtasks.\n"
-                    "- Ensure clear structure and directness in addressing the main question.\n"
-                    "- Preserve or synthesize citations (e.g., [1], [2]) if present in subtask answers."
-                )
-            ]
-            aligned_response = self.llm.invoke(alignment_prompt_messages)
-            final_summary = aligned_response.content
+        with self.tracer.start_as_current_span(
+            "Summarize Subtasks Operation", context=parent_context_for_summary
+        ) as summary_span:
             self.logger.info(
-                f"Summarization complete (aligned). Result preview: {str(final_summary)[:100]}..."
+                f"Summarizing {len(subtask_results)} subtask results for task: '{self.task}'"
+            )
+
+            summary_span.add_event(
+                "Summarization Start",
+                {
+                    "main_task_for_summary": self.task,
+                    "subtask_count": len(tasks),
+                    "input_tasks_preview": json.dumps(tasks, default=str)[:300],
+                    "input_results_preview": json.dumps(
+                        [
+                            str(r)[:100] + "..." if r else "None"
+                            for r in subtask_results
+                        ],
+                        default=str,
+                    )[:300],
+                    "align_summaries_enabled": self.options.align_summaries,
+                },
+            )
+
+            if not subtask_results:  # Check if list itself is empty
+                summary_span.add_event(
+                    "Summarization End: No Results to Summarize (Input List Empty)"
+                )
+                return "No subtask results were generated to summarize."
+
+            documents_to_merge = [
+                f"SUBTASK QUESTION: {q}\n\nSUBTASK ANSWER:\n{a}"
+                for q, a in zip(tasks, subtask_results)
+                if a is not None
+            ]  # Filter out None answers
+
+            if not documents_to_merge:  # Check if, after filtering None, list is empty
+                summary_span.add_event(
+                    "Summarization End: All Subtasks Yielded Empty/No Results"
+                )
+                return "All subtasks yielded empty or no results."
+
+            merged_content = []
+            for document in documents_to_merge:
+                if self._get_token_count(document) > 5000:
+                    num_sentences = int(
+                        len(document.split()) / 5000 * self.options.summary_sentences_factor
+                    )
+                    summary_span.add_event(
+                        "Summarizing Long Document",
+                        {
+                            "document_length": len(document),
+                            "num_sentences": num_sentences,
+                        },
+                    )
+                    merged_content.append(summarize(document, num_sentences))
+                else:
+                    merged_content.append(document)
+
+            merge_options = MergeOptions(
+                llm=self.llm, context_window=15000
+            )  # Assuming self.llm is not None
+            merger = self.options.merger(merge_options)
+            merged_content_str = "\n".join(merged_content)
+            merged_content_str = merger.merge_documents([merged_content_str])
+            summary_span.add_event(
+                "Documents Merged (Pre-Alignment)",
+                {
+                    "merged_content_length": len(merged_content_str),
+                    "merged_content_preview": merged_content_str[:200],
+                },
+            )
+
+            final_summary = merged_content_str
+            if self.options.align_summaries:
+                max_merged_content_len = 10000
+                merged_content_for_alignment = merged_content_str
+                if len(merged_content_str) > max_merged_content_len:
+                    merged_content_for_alignment = (
+                        merged_content_str[:max_merged_content_len]
+                        + "\n... [Content Truncated]"
+                    )
+                    summary_span.add_event("Merged Content Truncated for Alignment LLM")
+
+                alignment_prompt_messages = [
+                    HumanMessage(
+                        f"The following information has been gathered from subtasks:\n\n{merged_content_for_alignment}\n\n"
+                        f"Based on this information, compile a comprehensive and well-structured report that directly answers this main question: '{self.task}'.\n"
+                        f"User instructions for the main question (if any): {self.u_inst if self.u_inst else 'None'}\n\n"
+                        "Report Requirements:\n"
+                        "- Go into detail where relevant information is provided.\n"
+                        "- Disregard irrelevant information from subtasks.\n"
+                        "- Ensure clear structure and directness in addressing the main question.\n"
+                        "- Preserve or synthesize citations (e.g., [1], [2]) if present in subtask answers."
+                    )
+                ]
+
+                prompt_str = _serialize_lc_messages_for_preview(
+                    alignment_prompt_messages
+                )
+                full_prompt_str_tokens = "\n".join(
+                    [str(m.content) for m in alignment_prompt_messages]
+                )
+                prompt_tokens = self._get_token_count(full_prompt_str_tokens)
+                summary_span.add_event(
+                    "LLM Invocation Start (Alignment Summary)",
+                    {
+                        "llm_type": "main_llm",
+                        "prompt_preview": prompt_str,
+                        "estimated_prompt_tokens": prompt_tokens,
+                    },
+                )
+                # Ensure self.llm is not None before invoking
+                if not self.llm:
+                    self.logger.error(
+                        "LLM for alignment summary is None. Cannot proceed with alignment."
+                    )
+                    summary_span.add_event(
+                        "LLM Invocation Error (Alignment Summary)",
+                        {"error": "LLM is None"},
+                    )
+                    # Keep final_summary as merged_content if alignment LLM is missing
+                else:
+                    aligned_response = self.llm.invoke(alignment_prompt_messages)
+                    final_summary = str(aligned_response.content)
+                    completion_tokens = self._get_token_count(final_summary)
+                    summary_span.add_event(
+                        "LLM Invocation End (Alignment Summary)",
+                        {
+                            "llm_type": "main_llm",
+                            "response_preview": final_summary[:200],
+                            "estimated_completion_tokens": completion_tokens,
+                        },
+                    )
+
+            summary_span.add_event(
+                "Summarization End",
+                {
+                    "final_summary_preview": final_summary[:200],
+                    "aligned": self.options.align_summaries,
+                },
             )
             return final_summary
-        else:
-            self.logger.info(
-                f"Summarization complete (not aligned). Result preview: {str(merged_content)[:100]}..."
-            )
-            return merged_content
 
     def _construct_subtask_to_json_prompt(
         self,
-    ):  # Renamed from _construct_answer_to_json_prompt
-        # ... (existing logic for this method, assumed correct) ...
+    ):
         json_schema_str = SplitTask.model_json_schema()
-        try:  # Simplify schema for LLM
-            schema_dict = json.loads(json.dumps(json_schema_str))  # Deep copy
+        try:
+            schema_dict = json.loads(json.dumps(json_schema_str))
             if "required" in schema_dict and "evaluation" in schema_dict["required"]:
                 schema_dict["required"].remove("evaluation")
             if (
@@ -1214,18 +1626,18 @@ class RecursiveAgent:
             f'  "needs_subtasks": false,\n'
             f'  "subtasks": []\n'
             f"}}\n```\n"
-            "Provide ONLY the JSON object as your response, without any other text or explanations."
+            "Provide ONLY the JSON object as your response, without any other text or explanations. Also, can you do it in a single line?"
         )
         return HumanMessage(prompt_content)
 
-    def _construct_verify_answer_prompt(self):  # For the _verify_result method
+    def _construct_verify_answer_prompt(self):
         json_schema_str = verification.model_json_schema()
         prompt_content = (
             f"Based on your evaluation, provide the outcome as a JSON object. Use the `successful` boolean field. "
             f"Schema:\n```json\n{json_schema_str}\n```\n"
             "Example:\n"
             f"```json\n{{\n"
-            f'  "successful": true\n'  # or false
+            f'  "successful": true\n'
             f"}}\n```\n"
             "Provide ONLY the JSON object as your response."
         )

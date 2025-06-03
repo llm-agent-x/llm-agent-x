@@ -2,7 +2,6 @@ import argparse
 import sys
 from os import getenv, environ
 from pathlib import Path
-from dotenv import load_dotenv
 import nltk
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
@@ -37,6 +36,7 @@ from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
 from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.tools.brave_web_search import brave_web_search
+from llm_agent_x.cli_args_parser import parser
 
 nltk.download("punkt_tab", force=False)
 
@@ -50,7 +50,7 @@ exporter = OTLPSpanExporter(
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
 # Load environment variables
-load_dotenv(".env", override=True)
+
 
 
 # Initialize LLM and Search
@@ -66,54 +66,10 @@ output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 
-def main():
-    global live  # Allow assignment to the global 'live' variable
 
-    parser = argparse.ArgumentParser(description="Run the LLM agent.")
-    parser.add_argument("task", type=str, help="The task to execute.")
-    parser.add_argument(
-        "--u_inst", type=str, help="User instructions for the task.", default=""
-    )
-    parser.add_argument(
-        "--max_layers",
-        type=int,
-        default=3,
-        help="The maximum number of layers (deprecated, use task_limit).",
-    )
-    parser.add_argument(
-        "--output", type=str, default="output.md", help="The output file path"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=getenv(
-            "DEFAULT_LLM", "gpt-4o-mini"
-        ),  # Ensure default matches initialization
-        help="The name of the LLM to use",
-    )
-    parser.add_argument(
-        "--task_limit",
-        type=str,
-        default="[3,2,2,0]",
-        help="Task limits per layer as a Python list string e.g., '[3,2,2,0]'",
-    )
-    parser.add_argument(
-        "--merger",
-        type=str,
-        default="ai",
-        choices=["ai", "append", "algorithmic"],
-        help="Merger type: 'ai' or 'append'.",
-    )
-    parser.add_argument(
-        "--no-tree", action="store_true", help="Disable the real-time tree view."
-    )
-    parser.add_argument(
-        "--default_subtask_type",
-        type=str,
-        default="basic",
-        choices=["research", "search", "basic", "text/reasoning"],
-        help="The default task type to apply to all subtasks. Should be one of 'research', 'search', 'basic', or 'text/reasoning'.",
-    )
+def main():
+    global live
+
 
     args = parser.parse_args()
 
