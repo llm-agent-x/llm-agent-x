@@ -9,6 +9,7 @@ packages = [{include = "llm_agent_x"}]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<3.14"
+requests = "*"
 pydantic = "^2.0"
 langchain-openai = "^0.3.18"
 langchain-community = "^0.3.24"
@@ -24,6 +25,7 @@ sumy = "^0.11.0"
 lxml-html-clean = "^0.4.2"
 redis = "^6.2.0"
 sentence-transformers = "^4.1.0"
+cloudpickle = "^3.1.1"
 
 [tool.poetry.scripts]
 llm-agent-x = "llm_agent_x.cli:main"

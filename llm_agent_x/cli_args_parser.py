@@ -56,3 +56,8 @@ parser.add_argument(
     choices=["research", "search", "basic", "text/reasoning"],
     help="The default task type to apply to all subtasks. Should be one of 'research', 'search', 'basic', or 'text/reasoning'.",
 )
+
+parser.add_argument(
+    "--enable-python-execution",
+    help="Enable the exec_python tool for the agent. (Requires Docker for sandbox mode)",
+)

@@ -129,7 +129,8 @@ class RecursiveAgentOptions(BaseModel):
     similarity_threshold: float = 0.8
     merger: Any = LLMMerger
     align_summaries: bool = True
-    token_counter: Optional[Callable[[str], int]] = None  # For token counting
+    token_counter: Optional[Callable[[str], int]] = None
+    summary_sentences_factor: int = 10  # Added for _summarize_subtask_results
 
     class Config:
         arbitrary_types_allowed = True
@@ -139,7 +140,6 @@ def calculate_raw_similarity(text1: str, text2: str) -> float:
     return SequenceMatcher(None, text1, text2).ratio()
 
 
-# Helper to serialize Langchain messages for tracing previews and token counting
 def _serialize_lc_messages_for_preview(
     messages: List[BaseMessage], max_len: int = 500
 ) -> str:
@@ -148,13 +148,12 @@ def _serialize_lc_messages_for_preview(
 
     content_parts = []
     for msg in messages:
-        role = msg.type.upper()  # e.g., HUMAN, AI, SYSTEM, TOOL
+        role = msg.type.upper()
         content_str = str(msg.content)
 
-        # Add tool call info if present
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             content_str += f" (Tool Calls: {len(msg.tool_calls)})"
-        elif hasattr(msg, "tool_call_id") and msg.tool_call_id:  # For ToolMessage
+        elif hasattr(msg, "tool_call_id") and msg.tool_call_id:
             content_str += f" (Tool Call ID: {msg.tool_call_id})"
 
         content_parts.append(f"{role}: {content_str}")
@@ -194,9 +193,7 @@ class RecursiveAgent:
         self.task = task
         self.u_inst = u_inst
         self.tracer = tracer if tracer else trace.get_tracer(__name__)
-        self.tracer_span = (
-            tracer_span  # This is the PARENT span for the current agent's operations
-        )
+        self.tracer_span = tracer_span
         self.options = agent_options
         self.allow_subtasks = allow_subtasks
         self.llm: DotTree = self.options.llm
@@ -210,11 +207,7 @@ class RecursiveAgent:
         self.context = context or TaskContext(task=task)
         self.result: Optional[str] = None
         self.status: str = "pending"
-        self.current_span: Optional[trace.Span] = (
-            None  # This will be this agent's OWN main span
-        )
-
-        # self.logger.debug(f"Agent initialized with options: {self.options.model_dump_json(exclude={'token_counter', 'pre_task_executed', 'on_task_executed', 'on_tool_call_executed'}, indent=2)}")
+        self.current_span: Optional[trace.Span] = None
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -229,25 +222,58 @@ class RecursiveAgent:
         return 0
 
     def _build_context_information(self) -> dict:
-        parent_contexts = []
-        current_p_context = self.context.parent_context
-        while current_p_context:
-            if current_p_context.result:
-                parent_contexts.append(
-                    {"task": current_p_context.task, "result": current_p_context.result}
+        ancestor_chain_contexts_data = []
+        current_ancestor_node = self.context.parent_context
+        while current_ancestor_node:
+            if current_ancestor_node.result is not None:
+                ancestor_chain_contexts_data.append(
+                    {
+                        "task": current_ancestor_node.task,
+                        "result": current_ancestor_node.result,
+                        "relation": "ancestor",
+                    }
                 )
-            current_p_context = current_p_context.parent_context
-        parent_contexts.reverse()
+            current_ancestor_node = current_ancestor_node.parent_context
+        ancestor_chain_contexts_data.reverse()
 
-        sibling_contexts = []
-        for sibling_agent in self.siblings:
-            if sibling_agent.result and sibling_agent != self:
-                sibling_contexts.append(
-                    {"task": sibling_agent.task, "result": sibling_agent.result}
-                )
+        broader_family_contexts_data = []
+
+        tasks_to_exclude_from_broader = {
+            ctx_data["task"] for ctx_data in ancestor_chain_contexts_data
+        }
+        tasks_to_exclude_from_broader.add(self.context.task)
+
+        ancestor_depth = 0
+        temp_node_for_sibling_scan = self.context
+
+        while temp_node_for_sibling_scan:
+            for sibling_of_temp_node in temp_node_for_sibling_scan.siblings:
+                if (
+                    sibling_of_temp_node.result is not None
+                    and sibling_of_temp_node.task not in tasks_to_exclude_from_broader
+                ):
+
+                    relation = ""
+                    if ancestor_depth == 0:
+                        relation = "direct_sibling"
+                    else:
+                        relation = f"ancestor_level_{ancestor_depth}_sibling"
+
+                    broader_family_contexts_data.append(
+                        {
+                            "task": sibling_of_temp_node.task,
+                            "result": sibling_of_temp_node.result,
+                            "relation": relation,
+                        }
+                    )
+                    tasks_to_exclude_from_broader.add(sibling_of_temp_node.task)
+
+            temp_node_for_sibling_scan = temp_node_for_sibling_scan.parent_context
+            ancestor_depth += 1
+
         return {
-            "parent_contexts": parent_contexts,
-            "sibling_contexts": sibling_contexts,
+            "ancestor_chain_contexts": ancestor_chain_contexts_data,
+            "broader_family_contexts": broader_family_contexts_data,
         }
 
     def _format_history_parts(
@@ -257,27 +283,31 @@ class RecursiveAgent:
         subtask_results_map: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         history = []
-        if context_info["parent_contexts"]:
-            history.append(f"Previous parent tasks and their results (for {purpose}):")
-            for ctx in context_info["parent_contexts"]:
+
+        if context_info.get("ancestor_chain_contexts"):
+            history.append(f"Context from direct ancestor tasks (for {purpose}):")
+            for ctx in context_info["ancestor_chain_contexts"]:
                 history.append(
-                    f"- Parent Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
+                    f"- Ancestor Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
                 )
-        if context_info["sibling_contexts"]:
+
+        if context_info.get("broader_family_contexts"):
             history.append(
-                f"\nParallel sibling tasks and their results (for {purpose}):"
+                f"\nContext from other related tasks in the hierarchy (for {purpose}):"
             )
-            for ctx in context_info["sibling_contexts"]:
+            for ctx in context_info["broader_family_contexts"]:
+                relation_desc = ctx["relation"].replace("_", " ").capitalize()
                 history.append(
-                    f"- Sibling Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
+                    f"- {relation_desc} Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
                 )
+
         if purpose == "verification" and subtask_results_map:
             history.append(
-                "\nThe current main task involved these subtasks and their results:"
+                "\nThe current main task involved these subtasks and their results (for verification):"
             )
             for sub_task, sub_result in subtask_results_map.items():
                 history.append(
-                    f"- Subtask: {sub_task}\n  - Result: {str(sub_result)[:200]}..."
+                    f"- Subtask (of current task): {sub_task}\n  - Result: {str(sub_result)[:200]}..."
                 )
         return history
 
@@ -344,7 +374,7 @@ class RecursiveAgent:
                     f"Critical error in agent run for task '{self.task}': {e}",
                     exc_info=True,
                 )
-                if span:  # Ensure span exists before using it
+                if span:
                     span.record_exception(e)
                     self.status = "failed_critically"
                     span.set_attribute("agent.final_status", self.status)
@@ -361,15 +391,6 @@ class RecursiveAgent:
             self.logger.warning(
                 "_run called without an active self.current_span. Tracing will be limited for this operation."
             )
-            # Fallback: Create a temporary span if absolutely necessary, though it might orphan this part of the trace
-            # For robustness, one might add:
-            # with self.tracer.start_as_current_span(f"Orphaned _run: {self.task[:50]}") as temp_span:
-            #     return self.__execute_run_logic(temp_span)
-            # For now, we proceed, but this indicates a potential setup issue if span is None.
-            # Let's assume span exists for the main logic flow.
-            # If not, the following add_event calls would fail.
-            # A safer approach is to ensure self.current_span is always valid or handle its absence gracefully.
-            # For this refactor, we assume `run` sets `self.current_span`.
 
         self.logger.info(
             f"Starting _run for task: '{self.task}' at layer {self.current_layer}"
@@ -595,7 +616,6 @@ class RecursiveAgent:
 
     def _run_single_task(self) -> str:
         agent_span = self.current_span
-        # Ensure agent_span is not None before attempting to use it for context
         parent_context_for_single_task = (
             trace.set_span_in_context(agent_span)
             if agent_span
@@ -624,7 +644,8 @@ class RecursiveAgent:
                 f"Your task is to answer the following question, using any tools that you deem necessary. "
                 f"Make sure to phrase your search phrase in a way that it could be understood easily without context. "
                 f"If you use the web search tool, make sure you include citations (just use a pair of square "
-                f"brackets and a number in text, and at the end, include a citations section).{full_context_str}"
+                f"brackets and a number in text, and at the end, include a citations section).\n\n"
+                f"Relevant contextual history from other tasks (if any):\n{full_context_str}"
             )
             human_message_content = self.task
             if self.u_inst:
@@ -698,9 +719,8 @@ class RecursiveAgent:
                         "LLM Responded Without Tool Calls - Final Answer",
                         {"final_answer_preview": final_result_content[:200]},
                     )
-                    break  # Exit loop
+                    break
 
-                # If there are tool calls, process them in a dedicated span
                 with self.tracer.start_as_current_span(
                     "Processing Tool Calls Batch",
                     context=trace.set_span_in_context(single_task_span),
@@ -719,7 +739,6 @@ class RecursiveAgent:
                         tool_args = tool_call["args"]
                         tool_call_id = tool_call["id"]
 
-                        # Create a span for each individual tool call
                         with self.tracer.start_as_current_span(
                             f"Process Tool Call: {tool_name}",
                             context=trace.set_span_in_context(batch_tool_span),
@@ -849,7 +868,7 @@ class RecursiveAgent:
                                     "tool.requires_llm_replan": this_tool_call_needs_llm_replan,
                                     "tool.response_preview": tool_message_content_final_str[
                                         :200
-                                    ],  # Redundant with event but useful as attribute
+                                    ],
                                 }
                             )
 
@@ -887,7 +906,6 @@ class RecursiveAgent:
                                         human_message_for_this_tool_failure
                                     )
 
-                    # After loop of tool calls, still inside "Processing Tool Calls Batch" span
                     batch_tool_span.set_attribute(
                         "any_tool_requires_llm_replan_after_batch",
                         any_tool_requires_llm_replan,
@@ -928,11 +946,11 @@ class RecursiveAgent:
                         else "One or more tool calls had issues. Please review the tool responses and adjust your plan. Re-evaluate your approach to the main task."
                     )
                     history.append(HumanMessage(content=replan_message_content))
-                    single_task_span.add_event(  # This event is on the main single_task_span
+                    single_task_span.add_event(
                         "LLM Re-Plan Requested After Tool Batch",
                         {"replan_reason_preview": replan_message_content[:300]},
                     )
-                    continue  # Continue the main while loop for LLM to re-plan
+                    continue
 
             if loop_count >= max_loops:
                 single_task_span.add_event(
@@ -945,11 +963,9 @@ class RecursiveAgent:
                 )
                 if history and isinstance(history[-1], AIMessage):
                     final_result_content = str(history[-1].content)
-                elif history and isinstance(
-                    history[-1], ToolMessage
-                ):  # If loop ended after tool messages but before AI
+                elif history and isinstance(history[-1], ToolMessage):
                     final_result_content = "Max tool loop iterations reached. Last action was a tool call. No final AI response generated."
-            else:  # Loop broke due to no tool calls, meaning LLM provided final answer
+            else:
                 single_task_span.set_status(trace.Status(trace.StatusCode.OK))
 
             single_task_span.add_event(
@@ -982,16 +998,42 @@ class RecursiveAgent:
                 },
             )
 
+            # Get tools to use from tools dictionary
+            
+            tools_to_use = self.options.tools_dict.values()
+            # Remove duplicates
+            tools_to_use = list(set(tools_to_use))
+            tools_to_use = sorted(tools_to_use, key=lambda t: t.__name__)
+
+            # get their docstrings
+            import inspect
+
+            tools_docstrings = []
+            for tool in tools_to_use:
+                if tool.__doc__ is not None:
+                    tools_docstrings.append(inspect.cleandoc(tool.__doc__))
+
+            tools_docstrings = "\n".join(tools_docstrings)
+
+            # construct tool list with docstrings
+            tools_with_docstrings = []
+            for tool in tools_to_use:
+                if tool.__doc__ is not None:
+                    tools_with_docstrings.append(f"{tool.__name__}: {inspect.cleandoc(tool.__doc__)}")
+
+            tools_with_docstrings = "\n".join(tools_with_docstrings)
+
             system_msg_content = (
                 f"Split this task into smaller, parallelizable subtasks only if it's complex and benefits from it. You can create up to {max_subtasks} subtasks. "
                 "Do not attempt to answer the main task yourself.\n\n"
-                "Consider this contextual history (parent tasks, sibling tasks already in progress):\n"
+                "Consider this contextual history (ancestor tasks, other related tasks):\n"
                 f"{task_history_for_splitting}\n\n"
                 "When deciding on subtasks for the current task ('{self.task}'), ensure they:\n"
                 "1. Avoid redundant overlap with tasks in the history.\n"
                 "2. Logically break down the current task if it's too broad for a single LLM response.\n"
                 "3. Are distinct and can be worked on independently if possible.\n"
                 f"4. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
+                f"The tasks you create can also use these tools: \n\n{tools_with_docstrings}"
             )
             if self.u_inst:
                 system_msg_content += f"User-provided instructions for the main task (consider these when splitting):\n{self.u_inst}\n"
@@ -1021,7 +1063,6 @@ class RecursiveAgent:
                     needs_subtasks=False, subtasks=[], evaluation=evaluation
                 )
 
-            # LLM Call 1: Initial subtask generation
             primed_hist_1 = split_msgs_hist + [AIMessage(content="1. ")]
             prompt_str_1 = _serialize_lc_messages_for_preview(primed_hist_1)
             full_prompt_str_1_tokens = "\n".join(
@@ -1036,15 +1077,9 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_1,
                 },
             )
-            response1 = self.llm.resolve("llm").value.invoke(
-                primed_hist_1
-            )  # Pass primed history
-            response_content_1 = "1. " + str(
-                response1.content
-            )  # Prepend the prime for full response
-            completion_tokens_1 = self._get_token_count(
-                str(response1.content)
-            )  # Count only new content
+            response1 = self.llm.resolve("llm").value.invoke(primed_hist_1)
+            response_content_1 = "1. " + str(response1.content)
+            completion_tokens_1 = self._get_token_count(str(response1.content))
             split_span.add_event(
                 "LLM Invocation End (Splitting - Initial List)",
                 {
@@ -1053,11 +1088,8 @@ class RecursiveAgent:
                     "estimated_completion_tokens": completion_tokens_1,
                 },
             )
-            split_msgs_hist.append(
-                AIMessage(content=response_content_1)
-            )  # Add the full AI response including prime
+            split_msgs_hist.append(AIMessage(content=response_content_1))
 
-            # LLM Call 2: Refine subtasks
             refine_human_msg = HumanMessage(
                 content="Can you make these more specific? Remember, each of these is sent off to another agent, with no context, asynchronously. All they know is what you put in this list."
             )
@@ -1075,9 +1107,7 @@ class RecursiveAgent:
                     "estimated_prompt_tokens": prompt_tokens_2,
                 },
             )
-            response2 = self.llm.resolve("llm").value.invoke(
-                hist_for_refine
-            )  # Use the history including the refine human message
+            response2 = self.llm.resolve("llm").value.invoke(hist_for_refine)
             completion_tokens_2 = self._get_token_count(str(response2.content))
             split_span.add_event(
                 "LLM Invocation End (Splitting - Refine List)",
@@ -1087,9 +1117,8 @@ class RecursiveAgent:
                     "estimated_completion_tokens": completion_tokens_2,
                 },
             )
-            split_msgs_hist.append(response2)  # Add refined AI response
+            split_msgs_hist.append(response2)
 
-            # LLM Call 3: Format to JSON
             json_format_msg = self._construct_subtask_to_json_prompt()
             hist_for_json = split_msgs_hist + [json_format_msg]
             prompt_str_3 = _serialize_lc_messages_for_preview(hist_for_json)
@@ -1193,7 +1222,7 @@ class RecursiveAgent:
             )
             return split_task_result
 
-    def _verify_result(
+    def _verify_result_internal(
         self, subtask_results_map: Optional[Dict[str, str]] = None
     ) -> bool:
         agent_span = self.current_span
@@ -1228,7 +1257,7 @@ class RecursiveAgent:
             system_msg_content = (
                 "You are an AI assistant tasked with verifying the successful completion of a task. "
                 "You will be given the original task, the result produced, and contextual history "
-                "(parent tasks, sibling tasks, and any subtasks that contributed to this result).\n\n"
+                "(ancestor tasks, other related tasks, and any subtasks that contributed to this result).\n\n"
                 f"Contextual History:\n{task_history_for_verification}\n\n"
                 "Based on ALL information (original task, produced result, and full context), critically evaluate if the produced result "
                 "comprehensively, accurately, and directly addresses the original task. "
@@ -1242,14 +1271,9 @@ class RecursiveAgent:
                 f"{self.u_inst if self.u_inst else 'No specific user instructions were provided.'}\n'''\n\n"
                 "Considering all the above and the contextual history, was the original task successfully completed by the produced result?"
             )
-            verify_msgs_hist_initial = [
+            verify_msgs_hist_for_llm = [
                 SystemMessage(content=system_msg_content),
                 HumanMessage(content=human_msg_content),
-            ]
-
-            # primed_ai_msg_content = f'```json\n{{\n  "successful": '
-            verify_msgs_hist_for_llm = verify_msgs_hist_initial + [
-                # AIMessage(content=primed_ai_msg_content)
             ]
 
             prompt_str = _serialize_lc_messages_for_preview(verify_msgs_hist_for_llm)
@@ -1267,34 +1291,23 @@ class RecursiveAgent:
             )
             structured_response_msg = self.llm.resolve("llm").value.invoke(
                 verify_msgs_hist_for_llm
-            )  # LLM completes the primed JSON
+            )
 
-            llm_completion_part = str(structured_response_msg.content)
-            full_llm_response_content_for_parser = llm_completion_part
-            completion_tokens = self._get_token_count(llm_completion_part)
+            llm_response_content_for_parser = str(structured_response_msg.content)
+            completion_tokens = self._get_token_count(llm_response_content_for_parser)
             verify_span.add_event(
                 "LLM Invocation End (Verification)",
                 {
                     "llm_type": "main_llm",
-                    "response_preview": full_llm_response_content_for_parser[:200],
+                    "response_preview": llm_response_content_for_parser[:200],
                     "estimated_completion_tokens": completion_tokens,
                 },
             )
 
             verification_obj: Optional[verification] = None
             try:
-                # Pass the full content, assuming parser can handle the primed start + completion
-                # Or, if parser expects only the completion part that makes it valid JSON:
-                # parsed_output = self.task_verification_parser.parse(f'{{"successful": {llm_completion_part}')
-                # For Langchain's JsonOutputParser, passing the AIMessage containing the JSON is standard.
-                # The AIMessage from LLM already contains the completed JSON.
-                # However, since we primed, the `structured_response_msg` might only be the boolean value.
-                # Let's reconstruct the full message as Langchain JsonOutputParser expects a message
-                # or a string that is valid JSON.
-
-                # Create a new AIMessage with the fully formed JSON string for the parser
                 full_json_ai_message = AIMessage(
-                    content=full_llm_response_content_for_parser
+                    content=llm_response_content_for_parser
                 )
                 parsed_output = self.task_verification_parser.invoke(
                     full_json_ai_message
@@ -1321,38 +1334,32 @@ class RecursiveAgent:
                 return verification_obj.successful
             except (ValidationError, OutputParserException, TypeError, ValueError) as e:
                 self.logger.error(
-                    f"Error parsing LLM JSON for verification: {e}. LLM content: {full_llm_response_content_for_parser[:500]}",
+                    f"Error parsing LLM JSON for verification: {e}. LLM content: {llm_response_content_for_parser[:500]}",
                     exc_info=True,
                 )
                 verify_span.record_exception(
                     e,
                     attributes={
-                        "llm_content_preview": full_llm_response_content_for_parser[
-                            :200
-                        ]
+                        "llm_content_preview": llm_response_content_for_parser[:200]
                     },
                 )
                 return False
             except Exception as e:
                 self.logger.error(
-                    f"Unexpected error during verification finalization: {e}. LLM content: {full_llm_response_content_for_parser[:500]}",
+                    f"Unexpected error during verification finalization: {e}. LLM content: {llm_response_content_for_parser[:500]}",
                     exc_info=True,
                 )
                 verify_span.record_exception(
                     e,
                     attributes={
-                        "llm_content_preview": full_llm_response_content_for_parser[
-                            :200
-                        ]
+                        "llm_content_preview": llm_response_content_for_parser[:200]
                     },
                 )
                 return False
 
     def verify_result(self, subtask_results_map: Optional[Dict[str, str]] = None):
-        agent_span = self.current_span  # This is the main agent span
-        successful = self._verify_result(
-            subtask_results_map
-        )  # _verify_result creates its own child span
+        agent_span = self.current_span
+        successful = self._verify_result_internal(subtask_results_map)
 
         if successful:
             self.status = "succeeded"
@@ -1417,12 +1424,22 @@ class RecursiveAgent:
                     fix_instructions_parts.append(
                         f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}..."
                     )
+
+            context_for_fix = self._build_context_information()
+            formatted_context_for_fix = "\n".join(
+                self._format_history_parts(context_for_fix, "fixing a failed task")
+            )
+            if formatted_context_for_fix:
+                fix_instructions_parts.append(
+                    f"\nRelevant contextual history from other tasks:\n{formatted_context_for_fix}"
+                )
+
             if self.u_inst:
                 fix_instructions_parts.append(
                     f"\nOriginal user instructions for the task were: {self.u_inst}"
                 )
             fix_instructions_parts.append(
-                "\nYour current objective is to FIX this failure. Analyze the original task, the failed outcome, any subtask information, and original user instructions. "
+                "\nYour current objective is to FIX this failure. Analyze the original task, the failed outcome, any subtask information, original user instructions, and all provided context. "
                 "Then, provide a corrected and complete solution to the original task: '{original_task_str}'. "
                 "You can break this fix attempt into a small number of sub-steps if that helps achieve a high-quality corrected solution. "
                 "Focus on addressing the deficiencies of the previous attempt."
@@ -1458,7 +1475,9 @@ class RecursiveAgent:
             )
 
             fixer_agent_context = TaskContext(
-                task=original_task_str, parent_context=self.context.parent_context
+                task=original_task_str,
+                parent_context=self.context.parent_context,
+                siblings=self.context.siblings,
             )
             fixer_agent = RecursiveAgent(
                 task=original_task_str,
@@ -1469,9 +1488,9 @@ class RecursiveAgent:
                 agent_options=fixer_options,
                 allow_subtasks=True,
                 current_layer=self.current_layer,
-                parent=self,
+                parent=self.parent,
                 context=fixer_agent_context,
-                siblings=[],
+                siblings=self.siblings,
             )
 
             try:
@@ -1516,6 +1535,10 @@ class RecursiveAgent:
                     "Fix Attempt Failed: Re-verification",
                     {"final_status": self.status, "error": str(e_fix_verify)},
                 )
+                raise TaskFailedException(
+                    f"Fix attempt for '{self.task}' ultimately failed after re-verification: {e_fix_verify}"
+                ) from e_fix_verify
+
             except Exception as e_fix_run:
                 self.logger.error(
                     f"Fixer agent (UUID: {fixer_agent_uuid}) encountered an UNHANDLED ERROR: {e_fix_run}",
@@ -1531,6 +1554,9 @@ class RecursiveAgent:
                     "Fix Attempt Failed: Fixer Agent Error",
                     {"final_status": self.status, "error": str(e_fix_run)},
                 )
+                raise TaskFailedException(
+                    f"Fixer agent for '{self.task}' run failed: {e_fix_run}"
+                ) from e_fix_run
 
     def _get_max_subtasks(self) -> int:
         if self.current_layer >= len(self.options.task_limits.limits):
@@ -1571,7 +1597,7 @@ class RecursiveAgent:
                 },
             )
 
-            if not subtask_results:  # Check if list itself is empty
+            if not subtask_results:
                 summary_span.add_event(
                     "Summarization End: No Results to Summarize (Input List Empty)"
                 )
@@ -1581,40 +1607,58 @@ class RecursiveAgent:
                 f"SUBTASK QUESTION: {q}\n\nSUBTASK ANSWER:\n{a}"
                 for q, a in zip(tasks, subtask_results)
                 if a is not None
-            ]  # Filter out None answers
+            ]
 
-            if not documents_to_merge:  # Check if, after filtering None, list is empty
+            if not documents_to_merge:
                 summary_span.add_event(
                     "Summarization End: All Subtasks Yielded Empty/No Results"
                 )
                 return "All subtasks yielded empty or no results."
 
-            merged_content = []
+            merged_content_list = []
             for document in documents_to_merge:
+                summary_sentences_factor = self.options.summary_sentences_factor
                 if self._get_token_count(document) > 5000:
-                    num_sentences = int(
-                        len(document.split())
-                        / 5000
-                        * self.options.summary_sentences_factor
+                    num_sentences = max(
+                        1, int(len(document.split()) / 5000 * summary_sentences_factor)
                     )
                     summary_span.add_event(
                         "Summarizing Long Document",
                         {
-                            "document_length": len(document),
-                            "num_sentences": num_sentences,
+                            "document_length_chars": len(document),
+                            "estimated_num_sentences_for_summary": num_sentences,
                         },
                     )
-                    merged_content.append(summarize(document, num_sentences))
+                    try:
+                        merged_content_list.append(summarize(document, num_sentences))
+                    except Exception as e_summarize:
+                        self.logger.warning(
+                            f"Summarize tool failed for a document part: {e_summarize}. Using original.",
+                            exc_info=True,
+                        )
+                        merged_content_list.append(document)
                 else:
-                    merged_content.append(document)
+                    merged_content_list.append(document)
 
-            llm = self.llm.resolve("llm.small.tiny").value
-            merge_options = MergeOptions(
-                llm=llm, context_window=15000
-            )  # Assuming self.llm is not None
-            merger = self.options.merger(merge_options)
-            merged_content_str = "\n".join(merged_content)
-            merged_content_str = merger.merge_documents([merged_content_str])
+            llm_for_merge = self.llm.resolve("llm.small.tiny").value
+            merged_content_str = ""
+            if not llm_for_merge:
+                self.logger.warning(
+                    "LLM for merging documents (llm.small.tiny) is not available. Using simple join."
+                )
+                merged_content_str = "\n\n---\n\n".join(merged_content_list)
+            else:
+                merge_options = MergeOptions(llm=llm_for_merge, context_window=15000)
+                merger = self.options.merger(merge_options)
+                try:
+                    merged_content_str = merger.merge_documents(merged_content_list)
+                except Exception as e_merge:
+                    self.logger.warning(
+                        f"LLMMerger failed: {e_merge}. Using simple join of content.",
+                        exc_info=True,
+                    )
+                    merged_content_str = "\n\n---\n\n".join(merged_content_list)
+
             summary_span.add_event(
                 "Documents Merged (Pre-Alignment)",
                 {
@@ -1662,28 +1706,39 @@ class RecursiveAgent:
                         "estimated_prompt_tokens": prompt_tokens,
                     },
                 )
-                # Ensure self.llm is not None before invoking
-                if not llm:
+
+                llm_for_alignment = self.llm.resolve("llm").value
+                if not llm_for_alignment:
                     self.logger.error(
-                        "LLM for alignment summary is None. Cannot proceed with alignment."
+                        "LLM for alignment summary (main llm) is None. Cannot proceed with alignment."
                     )
                     summary_span.add_event(
                         "LLM Invocation Error (Alignment Summary)",
-                        {"error": "LLM is None"},
+                        {"error": "LLM (main) is None"},
                     )
-                    # Keep final_summary as merged_content if alignment LLM is missing
                 else:
-                    aligned_response = llm.invoke(alignment_prompt_messages)
-                    final_summary = str(aligned_response.content)
-                    completion_tokens = self._get_token_count(final_summary)
-                    summary_span.add_event(
-                        "LLM Invocation End (Alignment Summary)",
-                        {
-                            "llm_type": "main_llm",
-                            "response_preview": final_summary[:200],
-                            "estimated_completion_tokens": completion_tokens,
-                        },
-                    )
+                    try:
+                        aligned_response = llm_for_alignment.invoke(
+                            alignment_prompt_messages
+                        )
+                        final_summary = str(aligned_response.content)
+                        completion_tokens = self._get_token_count(final_summary)
+                        summary_span.add_event(
+                            "LLM Invocation End (Alignment Summary)",
+                            {
+                                "llm_type": "main_llm",
+                                "response_preview": final_summary[:200],
+                                "estimated_completion_tokens": completion_tokens,
+                            },
+                        )
+                    except Exception as e_align:
+                        self.logger.error(
+                            f"LLM alignment failed: {e_align}. Using pre-alignment summary.",
+                            exc_info=True,
+                        )
+                        summary_span.record_exception(
+                            e_align, {"during": "alignment_summary_llm_invocation"}
+                        )
 
             summary_span.add_event(
                 "Summarization End",
@@ -1711,7 +1766,9 @@ class RecursiveAgent:
                 del schema_dict["$defs"]["TaskEvaluation"]
             simplified_schema_str = json.dumps(schema_dict)
         except Exception:
-            simplified_schema_str = json.dumps(json_schema_str)
+            simplified_schema_str = json.dumps(
+                SplitTask.model_json_schema(exclude={"evaluation"})
+            )
 
         prompt_content = (
             f"Now, format the subtask list (or indicate no subtasks are needed) strictly according to the following JSON schema. "
