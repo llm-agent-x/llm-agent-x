@@ -1467,26 +1467,44 @@ class RecursiveAgent:
                 )
                 return "All subtasks yielded empty or no results."
 
+            merged_content = []
+            for document in documents_to_merge:
+                if self._get_token_count(document) > 5000:
+                    num_sentences = int(
+                        len(document.split()) / 5000 * self.options.summary_sentences_factor
+                    )
+                    summary_span.add_event(
+                        "Summarizing Long Document",
+                        {
+                            "document_length": len(document),
+                            "num_sentences": num_sentences,
+                        },
+                    )
+                    merged_content.append(summarize(document, num_sentences))
+                else:
+                    merged_content.append(document)
+
             merge_options = MergeOptions(
                 llm=self.llm, context_window=15000
             )  # Assuming self.llm is not None
             merger = self.options.merger(merge_options)
-            merged_content = merger.merge_documents(documents_to_merge)
+            merged_content_str = "\n".join(merged_content)
+            merged_content_str = merger.merge_documents([merged_content_str])
             summary_span.add_event(
                 "Documents Merged (Pre-Alignment)",
                 {
-                    "merged_content_length": len(merged_content),
-                    "merged_content_preview": merged_content[:200],
+                    "merged_content_length": len(merged_content_str),
+                    "merged_content_preview": merged_content_str[:200],
                 },
             )
 
-            final_summary = merged_content
+            final_summary = merged_content_str
             if self.options.align_summaries:
                 max_merged_content_len = 10000
-                merged_content_for_alignment = merged_content
-                if len(merged_content) > max_merged_content_len:
+                merged_content_for_alignment = merged_content_str
+                if len(merged_content_str) > max_merged_content_len:
                     merged_content_for_alignment = (
-                        merged_content[:max_merged_content_len]
+                        merged_content_str[:max_merged_content_len]
                         + "\n... [Content Truncated]"
                     )
                     summary_span.add_event("Merged Content Truncated for Alignment LLM")
