@@ -17,6 +17,7 @@ if not os.path.exists(WORKSPACE_DIR):
 # Keys will be file paths, values will be the unpickled objects
 LOADED_PICKLES: Dict[str, object] = {}
 
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """
@@ -26,7 +27,7 @@ async def upload_file(file: UploadFile = File(...)):
     """
     if not file:
         return {"error": "No file part"}, 400
-    if file.filename == '':
+    if file.filename == "":
         return {"error": "No selected file"}, 400
     filename = os.path.join(WORKSPACE_DIR, file.filename)
     # Ensure the filename is within the workspace_dir to prevent directory traversal
@@ -34,11 +35,14 @@ async def upload_file(file: UploadFile = File(...)):
         return {"error": "Invalid file path"}, 400
     try:
         contents = await file.read()
-        with open(filename, 'wb') as f:
+        with open(filename, "wb") as f:
             f.write(contents)
-        return {"message": f"File '{file.filename}' uploaded successfully to {filename}"}, 200
+        return {
+            "message": f"File '{file.filename}' uploaded successfully to {filename}"
+        }, 200
     except Exception as e:
         return {"error": str(e)}, 500
+
 
 @app.post("/load_pickle")
 async def load_pickle(file_path: str):
@@ -62,13 +66,19 @@ async def load_pickle(file_path: str):
         return {"error": f"Pickle file not found: {full_pickle_path}"}, 404
 
     try:
-        with open(full_pickle_path, 'rb') as f:
+        with open(full_pickle_path, "rb") as f:
             obj = cloudpickle.load(f)
         # Store the loaded object using its workspace-relative path as key
         LOADED_PICKLES[pickle_file_path] = obj
-        return {"message": f"Object from '{pickle_file_path}' loaded successfully."}, 200
+        return {
+            "message": f"Object from '{pickle_file_path}' loaded successfully."
+        }, 200
     except Exception as e:
-        return {"error": f"Error loading pickle: {str(e)}", "trace": traceback.format_exc()}, 500
+        return {
+            "error": f"Error loading pickle: {str(e)}",
+            "trace": traceback.format_exc(),
+        }, 500
+
 
 @app.post("/execute")
 async def execute_code(code: str):
@@ -87,7 +97,7 @@ async def execute_code(code: str):
     # E.g., if 'my_data.pkl' was loaded, it's available as LOADED_PICKLES['my_data.pkl']
     execution_globals = {
         "LOADED_PICKLES": LOADED_PICKLES,
-        **globals() # Includes other globals from this script if necessary
+        **globals(),  # Includes other globals from this script if necessary
     }
 
     # Capture stdout and stderr
@@ -103,7 +113,7 @@ async def execute_code(code: str):
         return {
             "stdout": stdout_val,
             "stderr": stderr_val,
-            "message": "Code executed successfully."
+            "message": "Code executed successfully.",
         }, 200
     except Exception as e:
         stdout_val = captured_stdout.getvalue()
@@ -112,7 +122,7 @@ async def execute_code(code: str):
             "stdout": stdout_val,
             "stderr": stderr_val,
             "error": f"Error during execution: {str(e)}",
-            "trace": traceback.format_exc()
+            "trace": traceback.format_exc(),
         }, 500
     finally:
         sys.stdout = old_stdout

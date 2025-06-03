@@ -15,7 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Create a temporary workspace for testing
 temp_workspace = tempfile.TemporaryDirectory()
-os.environ['PYTHON_SANDBOX_WORKSPACE_DIR'] = temp_workspace.name
+os.environ["PYTHON_SANDBOX_WORKSPACE_DIR"] = temp_workspace.name
 
 # It's tricky to modify sandbox_api.WORKSPACE_DIR after import.
 # A common pattern for configurable Flask apps is to have a create_app function.
@@ -35,6 +35,7 @@ os.environ['PYTHON_SANDBOX_WORKSPACE_DIR'] = temp_workspace.name
 # and then monkeypatch its WORKSPACE_DIR for testing.
 from sandbox.sandbox_api import app, LOADED_PICKLES
 
+
 class SandboxAPITestCase(unittest.TestCase):
 
     def setUp(self):
@@ -44,7 +45,9 @@ class SandboxAPITestCase(unittest.TestCase):
 
         # Create a temporary workspace for each test
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.original_workspace_dir = app.config.get('WORKSPACE_DIR', '/workspace') # Assuming it might be in config
+        self.original_workspace_dir = app.config.get(
+            "WORKSPACE_DIR", "/workspace"
+        )  # Assuming it might be in config
 
         # Monkeypatch WORKSPACE_DIR in sandbox_api module
         # This requires sandbox_api.py to be written to respect this variable.
@@ -65,9 +68,8 @@ class SandboxAPITestCase(unittest.TestCase):
         # Create a temporary directory that will simulate the app's WORKSPACE_DIR for uploads
         self.test_workspace = tempfile.TemporaryDirectory()
         # Monkey patch the WORKSPACE_DIR in the imported app module for the duration of the test
-        self.actual_sandbox_api_workspace_dir = app.WORKSPACE_DIR # store original
+        self.actual_sandbox_api_workspace_dir = app.WORKSPACE_DIR  # store original
         app.WORKSPACE_DIR = self.test_workspace.name
-
 
     def tearDown(self):
         # Clean up the temporary directory
@@ -76,22 +78,25 @@ class SandboxAPITestCase(unittest.TestCase):
         # Restore original WORKSPACE_DIR
         app.WORKSPACE_DIR = self.actual_sandbox_api_workspace_dir
 
-
     def test_0_health_check(self):
         # A simple check to see if the app is alive, e.g. a 404 on root
-        response = self.client.get('/')
+        response = self.client.get("/")
         self.assertEqual(response.status_code, 404)
 
     def test_1_upload_file(self):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as tmp_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".txt"
+        ) as tmp_file:
             tmp_file.write("hello world")
             tmp_file_path = tmp_file.name
             tmp_file_basename = os.path.basename(tmp_file_path)
 
-        with open(tmp_file_path, 'rb') as tf:
-            response = self.client.post('/upload', data={'file': (tf, tmp_file_basename)})
+        with open(tmp_file_path, "rb") as tf:
+            response = self.client.post(
+                "/upload", data={"file": (tf, tmp_file_basename)}
+            )
 
-        os.remove(tmp_file_path) # Clean up the temp file from host
+        os.remove(tmp_file_path)  # Clean up the temp file from host
 
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
@@ -100,21 +105,22 @@ class SandboxAPITestCase(unittest.TestCase):
         # Verify file exists in the test_workspace
         uploaded_file_path = os.path.join(self.test_workspace.name, tmp_file_basename)
         self.assertTrue(os.path.exists(uploaded_file_path))
-        with open(uploaded_file_path, 'r') as f:
+        with open(uploaded_file_path, "r") as f:
             content = f.read()
         self.assertEqual(content, "hello world")
-
 
     def test_2_load_pickle_success(self):
         # Create a dummy pickle file in the test_workspace
         pickle_data = {"message": "hello from pickle"}
         pickle_filename = "test_data.pkl"
-        pickle_filepath_in_workspace = os.path.join(self.test_workspace.name, pickle_filename)
+        pickle_filepath_in_workspace = os.path.join(
+            self.test_workspace.name, pickle_filename
+        )
 
-        with open(pickle_filepath_in_workspace, 'wb') as f:
+        with open(pickle_filepath_in_workspace, "wb") as f:
             cloudpickle.dump(pickle_data, f)
 
-        response = self.client.post('/load_pickle', json={'file_path': pickle_filename})
+        response = self.client.post("/load_pickle", json={"file_path": pickle_filename})
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
         self.assertIn("loaded successfully", json_data.get("message", ""))
@@ -122,28 +128,32 @@ class SandboxAPITestCase(unittest.TestCase):
         self.assertEqual(LOADED_PICKLES[pickle_filename], pickle_data)
 
     def test_3_load_pickle_file_not_found(self):
-        response = self.client.post('/load_pickle', json={'file_path': 'non_existent.pkl'})
+        response = self.client.post(
+            "/load_pickle", json={"file_path": "non_existent.pkl"}
+        )
         self.assertEqual(response.status_code, 404)
         json_data = response.get_json()
         self.assertIn("Pickle file not found", json_data.get("error", ""))
 
     def test_4_execute_code_simple(self):
         code = "a = 1 + 2\nprint(a)"
-        response = self.client.post('/execute', json={'code': code})
+        response = self.client.post("/execute", json={"code": code})
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
-        self.assertEqual(json_data.get('stdout').strip(), "3")
-        self.assertEqual(json_data.get('stderr'), "")
+        self.assertEqual(json_data.get("stdout").strip(), "3")
+        self.assertEqual(json_data.get("stderr"), "")
 
     def test_5_execute_code_with_loaded_pickle(self):
         # First, load a pickle
         pickle_data = {"value": 42}
         pickle_filename = "data_for_exec.pkl"
-        pickle_filepath_in_workspace = os.path.join(self.test_workspace.name, pickle_filename)
-        with open(pickle_filepath_in_workspace, 'wb') as f:
+        pickle_filepath_in_workspace = os.path.join(
+            self.test_workspace.name, pickle_filename
+        )
+        with open(pickle_filepath_in_workspace, "wb") as f:
             cloudpickle.dump(pickle_data, f)
 
-        self.client.post('/load_pickle', json={'file_path': pickle_filename}) # Load it
+        self.client.post("/load_pickle", json={"file_path": pickle_filename})  # Load it
 
         # Now, execute code that uses it
         code = (
@@ -153,10 +163,10 @@ class SandboxAPITestCase(unittest.TestCase):
             "else:\n"
             "    print('Pickle not found')"
         )
-        response = self.client.post('/execute', json={'code': code})
+        response = self.client.post("/execute", json={"code": code})
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
-        self.assertEqual(json_data.get('stdout').strip(), "42")
+        self.assertEqual(json_data.get("stdout").strip(), "42")
 
     def test_6_execute_code_accessing_uploaded_file(self):
         # 1. Upload a file
@@ -165,18 +175,22 @@ class SandboxAPITestCase(unittest.TestCase):
 
         # Create the file locally first
         temp_file_to_upload = os.path.join(self.temp_dir.name, text_filename)
-        with open(temp_file_to_upload, 'w') as f:
+        with open(temp_file_to_upload, "w") as f:
             f.write(text_content)
 
         # Upload it using the API
-        with open(temp_file_to_upload, 'rb') as f_rb: # Flask test client needs rb for files
-            upload_response = self.client.post('/upload', data={'file': (f_rb, text_filename)})
+        with open(
+            temp_file_to_upload, "rb"
+        ) as f_rb:  # Flask test client needs rb for files
+            upload_response = self.client.post(
+                "/upload", data={"file": (f_rb, text_filename)}
+            )
         self.assertEqual(upload_response.status_code, 200)
 
         # 2. Execute code that reads this file from the (monkeypatched) WORKSPACE_DIR
         # The path in the code should be relative to the sandbox's /workspace
         code_to_execute = (
-            f"file_path = '/workspace/{text_filename}'\n" # Code inside sandbox uses /workspace
+            f"file_path = '/workspace/{text_filename}'\n"  # Code inside sandbox uses /workspace
             "try:\n"
             "    with open(file_path, 'r') as f:\n"
             "        content = f.read()\n"
@@ -210,7 +224,7 @@ class SandboxAPITestCase(unittest.TestCase):
         path_in_sandbox_script = os.path.join(app.WORKSPACE_DIR, text_filename)
 
         code_to_execute_corrected = (
-            f"file_path = r'{path_in_sandbox_script}'\n" # Use raw string for Windows paths if applicable
+            f"file_path = r'{path_in_sandbox_script}'\n"  # Use raw string for Windows paths if applicable
             "try:\n"
             "    with open(file_path, 'r') as f:\n"
             "        content = f.read()\n"
@@ -219,20 +233,24 @@ class SandboxAPITestCase(unittest.TestCase):
             "    print(f'File not found at {file_path}')"
         )
 
-        response = self.client.post('/execute', json={'code': code_to_execute_corrected})
+        response = self.client.post(
+            "/execute", json={"code": code_to_execute_corrected}
+        )
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
-        self.assertEqual(json_data.get('stdout').strip(), text_content)
-
+        self.assertEqual(json_data.get("stdout").strip(), text_content)
 
     def test_7_execute_code_syntax_error(self):
         code = "print('hello world'\nthis is a syntax error"
-        response = self.client.post('/execute', json={'code': code})
-        self.assertEqual(response.status_code, 500) # Server error due to exec failure
+        response = self.client.post("/execute", json={"code": code})
+        self.assertEqual(response.status_code, 500)  # Server error due to exec failure
         json_data = response.get_json()
         self.assertIn("error", json_data)
         self.assertIn("Error during execution", json_data.get("error"))
-        self.assertNotEqual(json_data.get('stderr'), "") # Stderr should have exception info
+        self.assertNotEqual(
+            json_data.get("stderr"), ""
+        )  # Stderr should have exception info
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

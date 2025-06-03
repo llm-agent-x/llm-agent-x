@@ -6,7 +6,15 @@ import cloudpickle
 # Configuration for the Dockerized sandbox API
 SANDBOX_API_URL = os.getenv("PYTHON_SANDBOX_API_URL", "http://localhost:5000")
 
-def exec_python(code, use_docker_sandbox=False, files_to_upload=None, cloud_pickle_files_to_load=None, globals=None, locals=None):
+
+def exec_python(
+    code,
+    use_docker_sandbox=False,
+    files_to_upload=None,
+    cloud_pickle_files_to_load=None,
+    globals=None,
+    locals=None,
+):
     """
     Execute the given Python code.
 
@@ -48,15 +56,19 @@ def exec_python(code, use_docker_sandbox=False, files_to_upload=None, cloud_pick
         if files_to_upload:
             for file_path in files_to_upload:
                 try:
-                    with open(file_path, 'rb') as f:
+                    with open(file_path, "rb") as f:
                         file_name = os.path.basename(file_path)
-                        response = requests.post(f"{SANDBOX_API_URL}/upload", files={'file': (file_name, f)})
+                        response = requests.post(
+                            f"{SANDBOX_API_URL}/upload", files={"file": (file_name, f)}
+                        )
                         response.raise_for_status()
                         # Optionally log response.json().get("message")
                 except FileNotFoundError:
-                    results["stderr"] += f"Error: File not found for upload: {file_path}\n"
+                    results[
+                        "stderr"
+                    ] += f"Error: File not found for upload: {file_path}\n"
                     results["error"] = "File upload error"
-                    return results # Stop if a file can't be uploaded
+                    return results  # Stop if a file can't be uploaded
                 except requests.exceptions.RequestException as e:
                     results["stderr"] += f"Error uploading {file_path}: {e}\n"
                     results["error"] = "File upload error"
@@ -67,16 +79,23 @@ def exec_python(code, use_docker_sandbox=False, files_to_upload=None, cloud_pick
             for cp_file_path in cloud_pickle_files_to_load:
                 try:
                     # cp_file_path is relative to the workspace, e.g., "my_data.pkl"
-                    response = requests.post(f"{SANDBOX_API_URL}/load_pickle", json={"file_path": cp_file_path})
+                    response = requests.post(
+                        f"{SANDBOX_API_URL}/load_pickle",
+                        json={"file_path": cp_file_path},
+                    )
                     response.raise_for_status()
                     # Optionally log response.json().get("message")
                 except requests.exceptions.RequestException as e:
-                    results["stderr"] += f"Error loading cloudpickle file {cp_file_path}: {e}\n"
+                    results[
+                        "stderr"
+                    ] += f"Error loading cloudpickle file {cp_file_path}: {e}\n"
                     # Attempt to get more details from the sandbox response if available
                     try:
                         error_detail = response.json()
-                        results["stderr"] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
-                    except ValueError: # If response is not JSON
+                        results[
+                            "stderr"
+                        ] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
+                    except ValueError:  # If response is not JSON
                         results["stderr"] += f"Sandbox response: {response.text}\n"
                     results["error"] = "Cloudpickle load error"
                     return results
@@ -87,18 +106,24 @@ def exec_python(code, use_docker_sandbox=False, files_to_upload=None, cloud_pick
             response.raise_for_status()
             exec_result = response.json()
             results["stdout"] = exec_result.get("stdout", "")
-            results["stderr"] += exec_result.get("stderr", "") # Append to any previous stderr
+            results["stderr"] += exec_result.get(
+                "stderr", ""
+            )  # Append to any previous stderr
             if exec_result.get("error"):
                 results["error"] = exec_result.get("error")
-                results["stderr"] += f"Execution error from sandbox: {exec_result.get('error')}\n"
+                results[
+                    "stderr"
+                ] += f"Execution error from sandbox: {exec_result.get('error')}\n"
                 if exec_result.get("trace"):
-                     results["stderr"] += f"Sandbox Trace: {exec_result.get('trace')}\n"
+                    results["stderr"] += f"Sandbox Trace: {exec_result.get('trace')}\n"
 
         except requests.exceptions.RequestException as e:
             results["stderr"] += f"Error executing code in sandbox: {e}\n"
             try:
                 error_detail = response.json()
-                results["stderr"] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
+                results[
+                    "stderr"
+                ] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
             except ValueError:
                 results["stderr"] += f"Sandbox response: {response.text}\n"
             results["error"] = "Code execution error"
@@ -110,18 +135,27 @@ def exec_python(code, use_docker_sandbox=False, files_to_upload=None, cloud_pick
         # For simplicity, this part remains as is, but for production, you might want
         # to use subprocess or other methods to capture output from local exec as well.
         try:
-            exec(code, globals if globals is not None else {}, locals if locals is not None else {})
+            exec(
+                code,
+                globals if globals is not None else {},
+                locals if locals is not None else {},
+            )
             # Local execution doesn't directly return stdout/stderr or errors in this simple form
-            return {"stdout": "[Local execution - stdout not captured]",
-                    "stderr": "[Local execution - stderr not captured]",
-                    "error": None}
+            return {
+                "stdout": "[Local execution - stdout not captured]",
+                "stderr": "[Local execution - stderr not captured]",
+                "error": None,
+            }
         except Exception as e:
-            return {"stdout": "",
-                    "stderr": f"[Local execution error: {str(e)}]",
-                    "error": str(e)}
+            return {
+                "stdout": "",
+                "stderr": f"[Local execution error: {str(e)}]",
+                "error": str(e),
+            }
+
 
 # Example usage (for testing purposes, can be removed later)
-if __name__ == '__main__':
+if __name__ == "__main__":
     # This example assumes the sandbox_api.py is running and accessible at http://localhost:5000
 
     # Create a dummy file to upload
@@ -147,7 +181,11 @@ if __name__ == '__main__':
         "    content = f.read()\n"
         "print(f'Content of uploaded file: {content}')"
     )
-    result2 = exec_python(code_with_file_access, use_docker_sandbox=True, files_to_upload=["test_upload.txt"])
+    result2 = exec_python(
+        code_with_file_access,
+        use_docker_sandbox=True,
+        files_to_upload=["test_upload.txt"],
+    )
     print(f"Sandbox Result 2: {result2}")
     print("\n")
 
@@ -157,15 +195,15 @@ if __name__ == '__main__':
         "my_obj = LOADED_PICKLES.get('test_data.pkl')\n"
         "if my_obj:\n"
         "    print(f'Loaded pickle object: {my_obj}')\n"
-        "    print(f'Accessing item: {my_obj.get(\'key\')}')\n"
+        "    print(f'Accessing item: {my_obj.get('key')}')\n"
         "else:\n"
         "    print('Pickle object test_data.pkl not found in LOADED_PICKLES.')"
     )
     result3 = exec_python(
         code_with_pickle_access,
         use_docker_sandbox=True,
-        files_to_upload=["test_data.pkl"], # Pickle file must be uploaded first
-        cloud_pickle_files_to_load=["test_data.pkl"]
+        files_to_upload=["test_data.pkl"],  # Pickle file must be uploaded first
+        cloud_pickle_files_to_load=["test_data.pkl"],
     )
     print(f"Sandbox Result 3: {result3}")
     print("\n")
@@ -175,16 +213,18 @@ if __name__ == '__main__':
     result4 = exec_python(
         "print(LOADED_PICKLES['non_existent.pkl'])",
         use_docker_sandbox=True,
-        cloud_pickle_files_to_load=["non_existent.pkl"] # This file wasn't uploaded
+        cloud_pickle_files_to_load=["non_existent.pkl"],  # This file wasn't uploaded
     )
     print(f"Sandbox Result 4: {result4}")
     print("\n")
 
     # Test 5: Local execution (for comparison)
     print("--- Test 5: Local execution ---")
-    local_code = "b = 20 * 3\n# print(f'Local result: {b}') # print won't be captured by default"
-    result5 = exec_python(local_code) # use_docker_sandbox is False by default
-    print(f"Local Result 5: {result5}") # This will show the placeholder messages
+    local_code = (
+        "b = 20 * 3\n# print(f'Local result: {b}') # print won't be captured by default"
+    )
+    result5 = exec_python(local_code)  # use_docker_sandbox is False by default
+    print(f"Local Result 5: {result5}")  # This will show the placeholder messages
 
     # Clean up dummy files
     os.remove("test_upload.txt")

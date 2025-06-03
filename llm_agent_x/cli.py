@@ -86,7 +86,7 @@ def main():
     if args.enable_python_execution:
         available_tools.append(exec_python)
         tools_dict_for_agent["exec_python"] = exec_python
-        tools_dict_for_agent["exec"] = exec_python # Alias
+        tools_dict_for_agent["exec"] = exec_python  # Alias
 
     tool_llm = llm.bind_tools(available_tools)
     model_tree.resolve("llm.tools").value.bind_tools([exec_python])
