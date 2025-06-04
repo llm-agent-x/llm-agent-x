@@ -9,6 +9,7 @@ from icecream import ic
 from llm_agent_x.tools.training_stub_tools import get_random_subset_from_distribution
 from os import getenv
 from rich import console
+
 # # select n numbers that add up to 1
 # distribution = {
 #     "Communication": 1 / 3,
@@ -17,16 +18,23 @@ from rich import console
 
 # }
 
-distribution = dict(zip(['Communication',
-                 'FileManagement',
-                 'DataProcessing',
-                 'InternetInteraction',
-                 'Utility',
-                 'DatabaseInteraction',
-                 'SystemControl',
-                 'UserInteraction',
-                 'Authentication',
-                 'Orchestration'], [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]))
+distribution = dict(
+    zip(
+        [
+            "Communication",
+            "FileManagement",
+            "DataProcessing",
+            "InternetInteraction",
+            "Utility",
+            "DatabaseInteraction",
+            "SystemControl",
+            "UserInteraction",
+            "Authentication",
+            "Orchestration",
+        ],
+        [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+    )
+)
 
 c = console.Console()
 
@@ -35,7 +43,7 @@ load_dotenv(".env", override=True)
 llm = ChatOpenAI(
     base_url=openai_base_url,
     api_key=openai_api_key,
-    model="gpt-4.1-nano", #getenv("DEFAULT_LLM", "gpt-4o-mini"),
+    model="gpt-4.1-nano",  # getenv("DEFAULT_LLM", "gpt-4o-mini"),
     temperature=0.5,
 )
 
@@ -71,7 +79,6 @@ for i in range(3):
             + "\n\n If you can, use all the tools. Make it brief (1-3 sentences)."
         ),
     ]
-
 
     # create a task based on the tools with llm
     start = time.time()
