@@ -18,23 +18,18 @@ from rich import console
 
 # }
 
-distribution = dict(
-    zip(
-        [
-            "Communication",
-            "FileManagement",
-            "DataProcessing",
-            "InternetInteraction",
-            "Utility",
-            "DatabaseInteraction",
-            "SystemControl",
-            "UserInteraction",
-            "Authentication",
-            "Orchestration",
-        ],
-        [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
-    )
-)
+distribution = {
+    "Communication": 0.1,
+    "FileManagement": 0.1,
+    "DataProcessing": 0.1,
+    "InternetInteraction": 0.1,
+    "Utility": 0.1,
+    "DatabaseInteraction": 0.1,
+    "SystemControl": 0.1,
+    "UserInteraction": 0.1,
+    "Authentication": 0.1,
+    "Orchestration": 0.1,
+}
 
 c = console.Console()
 
