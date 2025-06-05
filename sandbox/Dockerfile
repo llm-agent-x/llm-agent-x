@@ -8,13 +8,23 @@ RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir fastapi cloudpickle requests
+RUN pip install --no-cache-dir poetry
+
+# Install tree for directory listing
+RUN apt-get update && apt-get install -y tree && apt-get clean
+
+# Copy all files first
+COPY . .
+
+# Install dependencies
+RUN python -m poetry config virtualenvs.create false && \
+    python -m poetry install --no-interaction --no-ansi
+
+# Install additional dependencies
+RUN python3 -m pip install uvicorn python-multipart
 
 # Create a workspace directory for user files
-RUN mkdir /workspace && chown appuser:appuser /workspace
-
-# Copy the API script into the image
-COPY sandbox_api.py .
+RUN mkdir -p /workspace && chown appuser:appuser /workspace
 
 # Change ownership of the application directory
 RUN chown -R appuser:appuser /app
@@ -25,11 +35,5 @@ USER appuser
 # Expose the port the app runs on
 EXPOSE 5000
 
-# Limit container resources (example values, adjust as needed)
-# Note: These limits need to be set when running the container, not in the Dockerfile.
-# Example: docker run --memory="256m" --cpus="0.5" myimage
-# For documentation purposes, including these comments here for clarity.
-
 # Command to run the application
-CMD ["python", "sandbox_api.py"]
-
+CMD ["sh", "-c", "tree && exec python3 -m uvicorn sandbox.sandbox_api:app --host 0.0.0.0 --port 5000"]

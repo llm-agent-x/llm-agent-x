@@ -149,3 +149,7 @@ def final_response(stdout=None, stderr=None, error=None, message=None, trace=Non
         "message": message,
         "trace": trace,
     }
+
+@app.get("/health_check")
+async def health_check():
+    return {"status": "OK"}, 200

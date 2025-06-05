@@ -33,7 +33,7 @@ os.environ["PYTHON_SANDBOX_WORKSPACE_DIR"] = temp_workspace.name
 
 # Given the current structure of sandbox_api.py, we will directly import `app`
 # and then monkeypatch its WORKSPACE_DIR for testing.
-from sandbox.sandbox_api import app, LOADED_PICKLES
+from sandbox.sandbox.sandbox_api import app, LOADED_PICKLES
 
 
 class SandboxAPITestCase(unittest.TestCase):
