@@ -743,7 +743,8 @@ class RecursiveAgent:
                         "estimated_prompt_tokens": prompt_tokens,
                     },
                 )
-
+                llm = self.llm.resolve("llm.tools").value
+                logger.debug(f"LLM: {llm}")
                 current_llm_response = self.llm.resolve("llm.tools").value.invoke(
                     history
                 )

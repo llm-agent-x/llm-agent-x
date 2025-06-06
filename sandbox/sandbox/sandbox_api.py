@@ -5,6 +5,7 @@ import os
 import cloudpickle
 import traceback
 from typing import Dict
+import base64
 
 app = FastAPI()
 
@@ -81,7 +82,7 @@ async def load_pickle(file_path: str):
 
 
 @app.post("/execute")
-async def execute_code(code: str):
+async def execute_code(encoded_code: str):
     """
     Executes Python code within the sandbox.
     The code can access objects loaded via /load_pickle through the `LOADED_PICKLES` dict.
@@ -91,15 +92,19 @@ async def execute_code(code: str):
         You can use the preloaded `final_response` function to construct a custom response,
         which will, if called, overwrite the captured stdout and stderr.
     """
-    if not code:
-        return {"error": "Missing 'code' in JSON payload"}, 400
+    if not encoded_code:
+        return {"error": "Missing 'encoded_code' in JSON payload"}, 400
+
+    # Decode the base64 encoded code
+    try:
+        code = base64.b64decode(encoded_code).decode('utf-8')
+    except Exception as e:
+        return {"error": f"Invalid base64 encoding: {str(e)}"}, 400
 
     # Prepare a globals dictionary for exec, including loaded pickles
-    # This allows the executed code to access objects loaded by /load_pickle
-    # E.g., if 'my_data.pkl' was loaded, it's available as LOADED_PICKLES['my_data.pkl']
     execution_globals = {
         "LOADED_PICKLES": LOADED_PICKLES,
-        **globals(),  # Includes other globals from this script if necessary
+        **globals(),
         "final_response": final_response,
     }
 
@@ -119,7 +124,6 @@ async def execute_code(code: str):
             "message": "Code executed successfully.",
         }
         if "final_response" in execution_globals:
-            # response.update(execution_globals["final_response"])
             response = execution_globals["final_response"]
         return response, 200
     except Exception as e:

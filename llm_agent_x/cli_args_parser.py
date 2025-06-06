@@ -6,6 +6,14 @@ load_dotenv(".env", override=True)
 
 parser = argparse.ArgumentParser(description="Run the LLM agent.")
 parser.add_argument("task", type=str, help="The task to execute.")
+
+parser.add_argument(
+    "--task_type",
+    type=str,
+    choices=["research", "search", "basic", "text/reasoning"],
+    default="research",
+    help="The type of task to execute.",
+)
 parser.add_argument(
     "--u_inst", type=str, help="User instructions for the task.", default=""
 )

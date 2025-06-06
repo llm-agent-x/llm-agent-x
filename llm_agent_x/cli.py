@@ -35,7 +35,7 @@ from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
 )
 from llm_agent_x.console import console, task_tree, live
 from llm_agent_x.constants import openai_api_key, openai_base_url
-from llm_agent_x.llm_manager import llm, model_tree, tool_llm
+from llm_agent_x.llm_manager import llm, model_tree
 from llm_agent_x.tools.brave_web_search import brave_web_search
 
 from llm_agent_x.cli_args_parser import parser
@@ -69,7 +69,7 @@ output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 
-def main():
+def main():    
     global live
 
     args = parser.parse_args()
@@ -89,7 +89,8 @@ def main():
         tools_dict_for_agent["exec"] = exec_python  # Alias
 
     tool_llm = llm.bind_tools(available_tools)
-    model_tree.resolve("llm.tools").value.bind_tools([exec_python])
+    model_tree.update("llm.tools", tool_llm)
+    model_tree.update("llm.small.tools", tool_llm)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -104,6 +105,7 @@ def main():
     with tracer.start_as_current_span("agent run") as span:
         agent = RecursiveAgent(
             task=args.task,
+            task_type_override=args.task_type,
             u_inst=args.u_inst,
             tracer=tracer,
             tracer_span=span,
@@ -115,7 +117,7 @@ def main():
                 llm=(model_tree),
                 tools=[],
                 allow_search=True,
-                allow_tools=True if args.enable_python_execution else False,
+                allow_tools=True,
                 tools_dict=tools_dict_for_agent,
                 task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={

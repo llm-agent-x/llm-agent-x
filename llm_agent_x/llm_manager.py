@@ -18,7 +18,6 @@ llm = ChatOpenAI(
     model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
     temperature=0.5,
 )
-tool_llm = llm.bind_tools([brave_web_search])
 llm_tiny = ChatOpenAI(
     base_url=openai_base_url,
     api_key=openai_api_key,
@@ -27,8 +26,6 @@ llm_tiny = ChatOpenAI(
 )
 model_tree = DotTree()
 model_tree.update("llm", llm)
-model_tree.update("llm.tools", tool_llm)
 model_tree.update("llm.small", llm)
-model_tree.update("llm.small.tools", tool_llm)
 model_tree.update("llm.tiny", llm_tiny)
 model_tree.update("llm.small.tiny", llm_tiny)
