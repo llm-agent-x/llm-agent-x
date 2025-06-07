@@ -976,15 +976,27 @@ class RecursiveAgent:
             task_history_for_splitting = self._build_task_split_history()
             max_subtasks = self._get_max_subtasks()
 
-            # --- NEW: Build a list of existing tasks for the LLM ---
+            # --- MODIFICATION START: Prevent circular dependencies ---
+            # 1. Collect UUIDs of all ancestors and the current task itself.
+            ancestor_uuids = set()
+            current_agent_for_traversal = self
+            while current_agent_for_traversal:
+                ancestor_uuids.add(current_agent_for_traversal.uuid)
+                current_agent_for_traversal = current_agent_for_traversal.parent
+
+            # 2. Build a list of VALID tasks for the LLM to depend on.
             existing_tasks_summary = []
             if self.options.task_registry:
-                existing_tasks_summary.append("You have access to the following tasks that have been planned or completed. You can create dependencies on them using their UUIDs in the `depends_on` field.")
+                existing_tasks_summary.append(
+                    "You can create dependencies on the following tasks that are already complete or are part of a different, independent branch. Use their UUIDs in the `depends_on` field."
+                )
                 for task_uuid, agent_instance in self.options.task_registry.items():
-                    # Don't list the current task as a potential dependency for itself
-                    if task_uuid == self.uuid:
+                    # Exclude any task that is an ancestor of the current task.
+                    if task_uuid in ancestor_uuids:
                         continue
                     
+                    # You might also consider only showing tasks that are 'succeeded',
+                    # but for now, excluding ancestors is the crucial fix.
                     status_info = agent_instance.status
                     if status_info == 'succeeded' and agent_instance.result:
                         status_info += f" (Result: {str(agent_instance.result)[:80]}...)"
@@ -992,9 +1004,11 @@ class RecursiveAgent:
                     existing_tasks_summary.append(
                         f"- Task: \"{agent_instance.task}\"\n  UUID: {task_uuid}\n  Status: {status_info}"
                     )
+            # --- MODIFICATION END ---
+
             existing_tasks_str = "\n".join(existing_tasks_summary)
             if not existing_tasks_summary:
-                existing_tasks_str = "No other tasks have been created yet."
+                existing_tasks_str = "No other tasks have been created yet that can be depended on."
 
 
             split_span.add_event("Task Splitting Start", {"task": self.task, "max_subtasks_allowed": max_subtasks})
