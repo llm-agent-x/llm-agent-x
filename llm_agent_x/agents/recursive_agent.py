@@ -967,6 +967,10 @@ class RecursiveAgent:
             )
             return final_result_content
 
+# In llm_agent_x/agents/recursive_agent.py
+
+# ... inside the RecursiveAgent class ...
+
     def _split_task(self) -> SplitTask:
         agent_span = self.current_span
         parent_context_for_split = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
@@ -976,35 +980,36 @@ class RecursiveAgent:
             task_history_for_splitting = self._build_task_split_history()
             max_subtasks = self._get_max_subtasks()
 
-            # --- MODIFICATION START: Prevent circular dependencies ---
-            # 1. Collect UUIDs of all ancestors and the current task itself.
+            # --- MODIFICATION: Stricter check for valid dependencies ---
             ancestor_uuids = set()
             current_agent_for_traversal = self
             while current_agent_for_traversal:
                 ancestor_uuids.add(current_agent_for_traversal.uuid)
                 current_agent_for_traversal = current_agent_for_traversal.parent
 
-            # 2. Build a list of VALID tasks for the LLM to depend on.
             existing_tasks_summary = []
             if self.options.task_registry:
                 existing_tasks_summary.append(
-                    "You can create dependencies on the following tasks that are already complete or are part of a different, independent branch. Use their UUIDs in the `depends_on` field."
+                    "You can create dependencies on the following tasks that have ALREADY COMPLETED SUCCESSFULLY. Use their UUIDs in the `depends_on` field."
                 )
                 for task_uuid, agent_instance in self.options.task_registry.items():
-                    # Exclude any task that is an ancestor of the current task.
+                    # A task can only be a dependency if it meets ALL of the following criteria:
+                    # 1. It is NOT an ancestor of the current task (prevents circularity).
+                    # 2. It has a status of 'succeeded' (prevents deadlocks with pending parallel tasks).
                     if task_uuid in ancestor_uuids:
                         continue
-                    
-                    # You might also consider only showing tasks that are 'succeeded',
-                    # but for now, excluding ancestors is the crucial fix.
+                    if agent_instance.status != 'succeeded':
+                        continue
+
+                    # If it passes all checks, it's a valid dependency candidate.
                     status_info = agent_instance.status
-                    if status_info == 'succeeded' and agent_instance.result:
+                    if agent_instance.result:
                         status_info += f" (Result: {str(agent_instance.result)[:80]}...)"
                     
                     existing_tasks_summary.append(
                         f"- Task: \"{agent_instance.task}\"\n  UUID: {task_uuid}\n  Status: {status_info}"
                     )
-            # --- MODIFICATION END ---
+            # --- END OF MODIFICATION ---
 
             existing_tasks_str = "\n".join(existing_tasks_summary)
             if not existing_tasks_summary:
@@ -1032,6 +1037,8 @@ class RecursiveAgent:
                 f"4. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
                 f"The tasks you create can also use these tools: \n{tools_with_docstrings}"
             )
+
+            logger.debug(ic.format(system_msg_content))
             if self.u_inst:
                 system_msg_content += f"\nUser-provided instructions for the main task:\n{self.u_inst}"
 
