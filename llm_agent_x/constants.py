@@ -14,3 +14,4 @@ redis_expiry = int(
 redis_port = int(getenv("REDIS_PORT", 6379))  # Default to 6379 if not set
 openai_base_url = getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 openai_api_key = getenv("OPENAI_API_KEY")
+SANDBOX_API_URL = getenv("PYTHON_SANDBOX_API_URL", "http://localhost:5000")

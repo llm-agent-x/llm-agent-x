@@ -3,10 +3,8 @@ import os
 import json
 import base64
 import cloudpickle
-
+from llm_agent_x.constants import SANDBOX_API_URL
 # Configuration for the Dockerized sandbox API
-SANDBOX_API_URL = os.getenv("PYTHON_SANDBOX_API_URL", "http://localhost:5000")
-
 
 def exec_python(
     code,

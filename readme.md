@@ -53,6 +53,9 @@ llm-agent-x "Your task description here" --max_layers 2 --output output.md --mod
 - `--model`: The name of the LLM to use (default: value from `DEFAULT_LLM` environment variable, or the hardcoded default in `cli.py` if `DEFAULT_LLM` is not set).
 - `--task_limit`: Array defining task limits per layer (default: "[3,2,2,0]").
 - `--merger`: Strategy for merging results, 'ai' or 'append' (default: 'ai').
+- `--align_summaries`: Whether to align summaries with user instructions.
+- `--no-tree`: If specified, disables tree rendering in console
+- `--default_subtask_type`: The default task type to apply to all subtasks.
 - `--enable-python-execution`: Enable the `exec_python` tool for the agent. If enabled, the agent can choose to execute Python code, potentially in a Docker sandbox if configured (see Python Execution Sandbox section). Defaults to False.
 
 ## Example
@@ -111,7 +114,7 @@ LLM Agent X includes an optional Dockerized sandbox environment for executing Py
 ### Building the Sandbox Image
 From the root of the repository:
 ```sh
-docker build -t python-sandbox .
+docker build -t python-sandbox ./sandbox
 ```
 
 ### Running the Sandbox Container
