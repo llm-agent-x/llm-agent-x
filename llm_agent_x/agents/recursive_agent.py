@@ -132,6 +132,8 @@ class RecursiveAgentOptions(BaseModel):
     token_counter: Optional[Callable[[str], int]] = None
     summary_sentences_factor: int = 10  # Added for _summarize_subtask_results
 
+    max_fix_attempts: int = 2
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -179,6 +181,7 @@ class RecursiveAgent:
         context: Optional[TaskContext] = None,
         siblings: Optional[List["RecursiveAgent"]] = None,
         task_type_override: Optional[str] = None, # New parameter
+        max_fix_attempts: int = 2
     ):
         self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{uuid}")
         # Logging of initial task will be done after task string is determined
@@ -240,6 +243,9 @@ class RecursiveAgent:
         self.result: Optional[str] = None
         self.status: str = "pending"
         self.current_span: Optional[trace.Span] = None
+
+        self.fix_attempt_count: int = 0 # Number of fix attempts
+        self.max_fix_attempts = max_fix_attempts or agent_options.max_fix_attempts if agent_options.max_fix_attempts is not None else 2
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -678,7 +684,7 @@ class RecursiveAgent:
                 },
             )
 
-            current_task_type = getattr(self, 'task_type', 'research') # Get task_type, default to research
+            current_task_type = getattr(self, 'task_type', 'research')
 
             if current_task_type in ["basic", "task"]:
                 self.logger.info(f"Adjusting system prompt for '{current_task_type}' task type.")
@@ -691,7 +697,7 @@ class RecursiveAgent:
                     f"Current Task: {self.task}\n\n"
                     f"Relevant contextual history from other tasks (if any):\n{full_context_str}"
                 )
-            else: # Default to 'research' or other types
+            else:
                 self.logger.info(f"Using standard system prompt for '{current_task_type}' task type.")
                 system_prompt_content = (
                     f"Your task is to answer the following question, using any tools that you deem necessary. "
@@ -701,7 +707,7 @@ class RecursiveAgent:
                     f"Relevant contextual history from other tasks (if any):\n{full_context_str}"
                 )
 
-            human_message_content = self.task # This remains unchanged as per the plan
+            human_message_content = self.task
             if self.u_inst:
                 human_message_content += (
                     f"\n\nFollow these specific instructions: {self.u_inst}"
@@ -733,39 +739,37 @@ class RecursiveAgent:
                 )
                 prompt_tokens = self._get_token_count(full_prompt_str_for_tokens)
 
-                single_task_span.add_event(
-                    "LLM Invocation Start (Tool LLM)",
-                    {
-                        "llm_type": "tool_llm",
-                        "iteration": loop_count,
-                        "prompt_messages_count": len(history),
-                        "prompt_preview": prompt_preview_str,
-                        "estimated_prompt_tokens": prompt_tokens,
-                    },
-                )
-                llm = self.llm.resolve("llm.tools").value
-                logger.debug(f"LLM: {llm}")
-                current_llm_response = self.llm.resolve("llm.tools").value.invoke(
-                    history
-                )
+                with self.tracer.start_as_current_span(
+                    "LLM Invocation (Tool LLM)",
+                    context=trace.set_span_in_context(single_task_span),
+                ) as llm_span:
+                    llm_span.set_attributes(
+                        {
+                            "llm.type": "tool_llm",
+                            "iteration": loop_count,
+                            "prompt.messages_count": len(history),
+                            "prompt.preview": prompt_preview_str,
+                            "estimated_prompt_tokens": prompt_tokens,
+                        }
+                    )
+                    llm_span.add_event("LLM Invocation Start")
+                    llm = self.llm.resolve("llm.tools").value
+                    current_llm_response = llm.invoke(history)
+                    response_content_str = str(current_llm_response.content)
+                    completion_tokens = self._get_token_count(response_content_str)
+                    llm_span.add_event("LLM Invocation End")
 
-                response_content_str = str(current_llm_response.content)
-                completion_tokens = self._get_token_count(response_content_str)
-
-                single_task_span.add_event(
-                    "LLM Invocation End (Tool LLM)",
-                    {
-                        "llm_type": "tool_llm",
-                        "iteration": loop_count,
-                        "response_content_preview": response_content_str[:200],
-                        "response_has_tool_calls": bool(
-                            current_llm_response.tool_calls
-                        ),
-                        "tool_calls_count": len(current_llm_response.tool_calls or []),
-                        "estimated_completion_tokens": completion_tokens,
-                        "estimated_total_tokens": prompt_tokens + completion_tokens,
-                    },
-                )
+                    llm_span.set_attributes(
+                        {
+                            "response.content_preview": response_content_str[:200],
+                            "response.has_tool_calls": bool(
+                                current_llm_response.tool_calls
+                            ),
+                            "response.tool_calls_count": len(current_llm_response.tool_calls or []),
+                            "estimated_completion_tokens": completion_tokens,
+                            "estimated_total_tokens": prompt_tokens + completion_tokens,
+                        }
+                    )
                 history.append(current_llm_response)
 
                 if not current_llm_response.tool_calls:
@@ -875,6 +879,9 @@ class RecursiveAgent:
                                             current_tool_output_payload
                                         )[:200]
                                     },
+                                )
+                                individual_tool_span.set_attribute(
+                                    "output", str(current_tool_output_payload)
                                 )
                                 if tool_executed_successfully_this_iteration:
                                     individual_tool_span.set_status(
@@ -1222,6 +1229,10 @@ class RecursiveAgent:
                     raise TypeError(
                         f"Unexpected type from parser: {type(parsed_output_from_llm)}"
                     )
+                
+                split_span.set_attribute(
+                    "subtasks", [task.task for task in split_task_result.subtasks]
+                )
 
                 split_span.add_event(
                     "Task Splitting JSON Parsed",
@@ -1448,171 +1459,174 @@ class RecursiveAgent:
             self.logger.info(
                 f"Attempting to fix task: '{self.task}' (UUID: {self.uuid}) which failed verification."
             )
-            original_task_str = self.task
-            failed_result_str = str(
-                self.result if self.result is not None else "No result was produced."
-            )
-
-            fix_span.add_event(
-                "Fix Attempt Initiated",
-                {
-                    "original_task": original_task_str,
-                    "failed_result_preview": failed_result_str[:200],
-                    "original_user_instructions_preview": str(self.u_inst)[:200],
-                    "failed_subtasks_map_preview": (
-                        json.dumps(failed_subtask_results_map, default=str)[:300]
-                        if failed_subtask_results_map
-                        else "None"
-                    ),
-                },
-            )
-
-            fix_instructions_parts = [
-                f"The original task was: '{original_task_str}'.",
-                f"A previous attempt to solve it resulted in (or failed to produce a result): '{failed_result_str[:700]}...'. This outcome was deemed unsatisfactory/incomplete by an automated verification step.",
-            ]
-            if failed_subtask_results_map:
-                fix_instructions_parts.append(
-                    "The failed attempt may have involved these subtasks and their results:"
+            if self.fix_attempt_count >= self.max_fix_attempts:
+                self.fix_attempt_count += 1
+                original_task_str = self.task
+                failed_result_str = str(
+                    self.result if self.result is not None else "No result was produced."
                 )
-                for sub_task, sub_result in failed_subtask_results_map.items():
+
+                fix_span.add_event(
+                    "Fix Attempt Initiated",
+                    {
+                        "original_task": original_task_str,
+                        "failed_result_preview": failed_result_str[:200],
+                        "original_user_instructions_preview": str(self.u_inst)[:200],
+                        "failed_subtasks_map_preview": (
+                            json.dumps(failed_subtask_results_map, default=str)[:300]
+                            if failed_subtask_results_map
+                            else "None"
+                        ),
+                    },
+                )
+
+                fix_instructions_parts = [
+                    f"The original task was: '{original_task_str}'.",
+                    f"A previous attempt to solve it resulted in (or failed to produce a result): '{failed_result_str[:700]}...'. This outcome was deemed unsatisfactory/incomplete by an automated verification step.",
+                ]
+                if failed_subtask_results_map:
                     fix_instructions_parts.append(
-                        f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}..."
+                        "The failed attempt may have involved these subtasks and their results:"
+                    )
+                    for sub_task, sub_result in failed_subtask_results_map.items():
+                        fix_instructions_parts.append(
+                            f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}..."
+                        )
+
+                context_for_fix = self._build_context_information()
+                formatted_context_for_fix = "\n".join(
+                    self._format_history_parts(context_for_fix, "fixing a failed task")
+                )
+                if formatted_context_for_fix:
+                    fix_instructions_parts.append(
+                        f"\nRelevant contextual history from other tasks:\n{formatted_context_for_fix}"
                     )
 
-            context_for_fix = self._build_context_information()
-            formatted_context_for_fix = "\n".join(
-                self._format_history_parts(context_for_fix, "fixing a failed task")
-            )
-            if formatted_context_for_fix:
+                if self.u_inst:
+                    fix_instructions_parts.append(
+                        f"\nOriginal user instructions for the task were: {self.u_inst}"
+                    )
                 fix_instructions_parts.append(
-                    f"\nRelevant contextual history from other tasks:\n{formatted_context_for_fix}"
+                    "\nYour current objective is to FIX this failure. Analyze the original task, the failed outcome, any subtask information, original user instructions, and all provided context. "
+                    "Then, provide a corrected and complete solution to the original task: '{original_task_str}'. "
+                    "You can break this fix attempt into a small number of sub-steps if that helps achieve a high-quality corrected solution. "
+                    "Focus on addressing the deficiencies of the previous attempt."
                 )
+                full_fix_instructions = "\n".join(fix_instructions_parts)
 
-            if self.u_inst:
-                fix_instructions_parts.append(
-                    f"\nOriginal user instructions for the task were: {self.u_inst}"
-                )
-            fix_instructions_parts.append(
-                "\nYour current objective is to FIX this failure. Analyze the original task, the failed outcome, any subtask information, original user instructions, and all provided context. "
-                "Then, provide a corrected and complete solution to the original task: '{original_task_str}'. "
-                "You can break this fix attempt into a small number of sub-steps if that helps achieve a high-quality corrected solution. "
-                "Focus on addressing the deficiencies of the previous attempt."
-            )
-            full_fix_instructions = "\n".join(fix_instructions_parts)
+                current_agent_max_subtasks_at_this_layer = self._get_max_subtasks()
+                fixer_max_subtasks_for_its_level = 0
+                if current_agent_max_subtasks_at_this_layer > 0:
+                    fixer_max_subtasks_for_its_level = max(
+                        1, int(current_agent_max_subtasks_at_this_layer / 2)
+                    )
 
-            current_agent_max_subtasks_at_this_layer = self._get_max_subtasks()
-            fixer_max_subtasks_for_its_level = 0
-            if current_agent_max_subtasks_at_this_layer > 0:
-                fixer_max_subtasks_for_its_level = max(
-                    1, int(current_agent_max_subtasks_at_this_layer / 2)
-                )
+                original_max_depth = len(self.options.task_limits.limits)
+                fixer_limits_config_array = [0] * original_max_depth
+                if self.current_layer < original_max_depth:
+                    fixer_limits_config_array[self.current_layer] = (
+                        fixer_max_subtasks_for_its_level
+                    )
 
-            original_max_depth = len(self.options.task_limits.limits)
-            fixer_limits_config_array = [0] * original_max_depth
-            if self.current_layer < original_max_depth:
-                fixer_limits_config_array[self.current_layer] = (
-                    fixer_max_subtasks_for_its_level
-                )
+                fixer_task_limits = TaskLimit.from_array(fixer_limits_config_array)
+                fixer_options = self.options.model_copy()
+                fixer_options.task_limits = fixer_task_limits
 
-            fixer_task_limits = TaskLimit.from_array(fixer_limits_config_array)
-            fixer_options = self.options.model_copy()
-            fixer_options.task_limits = fixer_task_limits
-
-            fixer_agent_uuid = str(uuid.uuid4())
-            fix_span.add_event(
-                "Fixer Agent Configuration",
-                {
-                    "fixer_agent_uuid": fixer_agent_uuid,
-                    "fixer_max_subtasks": fixer_max_subtasks_for_its_level,
-                    "fixer_instructions_preview": full_fix_instructions[:300],
-                },
-            )
-
-            fixer_agent_context = TaskContext(
-                task=original_task_str,
-                parent_context=self.context.parent_context,
-                siblings=self.context.siblings,
-            )
-            fixer_agent = RecursiveAgent(
-                task=original_task_str,
-                u_inst=full_fix_instructions,
-                tracer=self.tracer,
-                tracer_span=fix_span,
-                uuid=fixer_agent_uuid,
-                agent_options=fixer_options,
-                allow_subtasks=True,
-                current_layer=self.current_layer,
-                parent=self.parent,
-                context=fixer_agent_context,
-                siblings=self.siblings,
-                task_type_override=self.task_type # Pass original agent's task_type
-            )
-
-            try:
+                fixer_agent_uuid = str(uuid.uuid4())
                 fix_span.add_event(
-                    "Fixer Agent Run Start", {"fixer_agent_uuid": fixer_agent_uuid}
-                )
-                fixer_result = fixer_agent.run()
-                fix_span.add_event(
-                    "Fixer Agent Run Completed",
+                    "Fixer Agent Configuration",
                     {
                         "fixer_agent_uuid": fixer_agent_uuid,
-                        "fixer_result_preview": str(fixer_result)[:200],
-                        "fixer_agent_final_status": fixer_agent.status,
+                        "fixer_max_subtasks": fixer_max_subtasks_for_its_level,
+                        "fixer_instructions_preview": full_fix_instructions[:300],
                     },
                 )
 
-                self.result = fixer_result
-                self.context.result = self.result
-
-                fix_span.add_event("Re-verifying Fixed Result")
-                self.verify_result(None)
-
-                self.status = "fixed_and_verified"
-                fix_span.add_event(
-                    "Fix Attempt Succeeded",
-                    {
-                        "final_status": self.status,
-                        "new_result_preview": str(self.result)[:200],
-                    },
+                fixer_agent_context = TaskContext(
+                    task=original_task_str,
+                    parent_context=self.context.parent_context,
+                    siblings=self.context.siblings,
+                )
+                fixer_agent = RecursiveAgent(
+                    task=original_task_str,
+                    u_inst=full_fix_instructions,
+                    tracer=self.tracer,
+                    tracer_span=fix_span,
+                    uuid=fixer_agent_uuid,
+                    agent_options=fixer_options,
+                    allow_subtasks=True,
+                    current_layer=self.current_layer,
+                    parent=self.parent,
+                    context=fixer_agent_context,
+                    siblings=self.siblings,
+                    task_type_override=self.task_type,
+                    max_fix_attempts=max(self.max_fix_attempts - 1, 0)
                 )
 
-            except TaskFailedException as e_fix_verify:
-                self.logger.error(
-                    f"Verification of fixer agent's result FAILED for task '{self.task}': {e_fix_verify}. Marking task as terminally failed."
-                )
-                self.status = "failed"
-                fix_span.record_exception(
-                    e_fix_verify,
-                    attributes={"reason": "Re-verification of fixed result failed"},
-                )
-                fix_span.add_event(
-                    "Fix Attempt Failed: Re-verification",
-                    {"final_status": self.status, "error": str(e_fix_verify)},
-                )
-                raise TaskFailedException(
-                    f"Fix attempt for '{self.task}' ultimately failed after re-verification: {e_fix_verify}"
-                ) from e_fix_verify
+                try:
+                    fix_span.add_event(
+                        "Fixer Agent Run Start", {"fixer_agent_uuid": fixer_agent_uuid}
+                    )
+                    fixer_result = fixer_agent.run()
+                    fix_span.add_event(
+                        "Fixer Agent Run Completed",
+                        {
+                            "fixer_agent_uuid": fixer_agent_uuid,
+                            "fixer_result_preview": str(fixer_result)[:200],
+                            "fixer_agent_final_status": fixer_agent.status,
+                        },
+                    )
 
-            except Exception as e_fix_run:
-                self.logger.error(
-                    f"Fixer agent (UUID: {fixer_agent_uuid}) encountered an UNHANDLED ERROR: {e_fix_run}",
-                    exc_info=True,
-                )
-                self.status = "failed"
-                if self.result is None:
-                    self.result = f"Fix attempt failed with error: {e_fix_run}"
-                fix_span.record_exception(
-                    e_fix_run, attributes={"reason": "Fixer agent run error"}
-                )
-                fix_span.add_event(
-                    "Fix Attempt Failed: Fixer Agent Error",
-                    {"final_status": self.status, "error": str(e_fix_run)},
-                )
-                raise TaskFailedException(
-                    f"Fixer agent for '{self.task}' run failed: {e_fix_run}"
-                ) from e_fix_run
+                    self.result = fixer_result
+                    self.context.result = self.result
+
+                    fix_span.add_event("Re-verifying Fixed Result")
+                    self.verify_result(None)
+
+                    self.status = "fixed_and_verified"
+                    fix_span.add_event(
+                        "Fix Attempt Succeeded",
+                        {
+                            "final_status": self.status,
+                            "new_result_preview": str(self.result)[:200],
+                        },
+                    )
+
+                except TaskFailedException as e_fix_verify:
+                    self.logger.error(
+                        f"Verification of fixer agent's result FAILED for task '{self.task}': {e_fix_verify}. Marking task as terminally failed."
+                    )
+                    self.status = "failed"
+                    fix_span.record_exception(
+                        e_fix_verify,
+                        attributes={"reason": "Re-verification of fixed result failed"},
+                    )
+                    fix_span.add_event(
+                        "Fix Attempt Failed: Re-verification",
+                        {"final_status": self.status, "error": str(e_fix_verify)},
+                    )
+                    raise TaskFailedException(
+                        f"Fix attempt for '{self.task}' ultimately failed after re-verification: {e_fix_verify}"
+                    ) from e_fix_verify
+
+                except Exception as e_fix_run:
+                    self.logger.error(
+                        f"Fixer agent (UUID: {fixer_agent_uuid}) encountered an UNHANDLED ERROR: {e_fix_run}",
+                        exc_info=True,
+                    )
+                    self.status = "failed"
+                    if self.result is None:
+                        self.result = f"Fix attempt failed with error: {e_fix_run}"
+                    fix_span.record_exception(
+                        e_fix_run, attributes={"reason": "Fixer agent run error"}
+                    )
+                    fix_span.add_event(
+                        "Fix Attempt Failed: Fixer Agent Error",
+                        {"final_status": self.status, "error": str(e_fix_run)},
+                    )
+                    raise TaskFailedException(
+                        f"Fixer agent for '{self.task}' run failed: {e_fix_run}"
+                    ) from e_fix_run
 
     def _get_max_subtasks(self) -> int:
         if self.current_layer >= len(self.options.task_limits.limits):

@@ -18,30 +18,21 @@ def exec_python(
     """
     Execute the given Python code.
 
-    If `use_docker_sandbox` is True, the code is executed in a Dockerized sandbox
-    via a REST API. Otherwise, it's executed locally using exec().
-
     Parameters:
     code (str): The Python code to be executed.
-    use_docker_sandbox (bool): Whether to use the Dockerized sandbox. Defaults to False.
-    files_to_upload (list[str], optional): A list of local file paths to upload to the sandbox's /workspace.
-                                          These files can then be accessed by the executed code.
-                                          Only used if use_docker_sandbox is True.
-    cloud_pickle_files_to_load (list[str], optional): A list of file paths (relative to the sandbox's /workspace)
-                                                     of cloudpickle files to load into the sandbox's execution context.
-                                                     These files must have been uploaded first.
-                                                     Only used if use_docker_sandbox is True.
     globals (dict, optional): A dictionary of global variables for local execution. Defaults to None.
                               Not used if use_docker_sandbox is True.
     locals (dict, optional): A dictionary of local variables for local execution. Defaults to None.
                              Not used if use_docker_sandbox is True.
+    
+    For example:
+    exec_python("x = 10; y = 20; z = x + y; print(z)")
 
     Returns:
     dict or None: If using Docker sandbox, returns a dictionary with 'stdout', 'stderr', and 'error' (if any).
                   If local execution, returns None. (Note: local exec() doesn't directly return stdout/stderr,
-                  this might need further refinement if local output capture is critical). Also, note that
-                  there is a function, final_response, that will overwrite the normal stdout/stderr responses,
-                  and can be used to construct a custom response.
+                  this might need further refinement if local output capture is critical). Anything you need,
+                  you can print it to the console, but don't print too much, because there is a 512 char limit.
     """
     use_docker_sandbox = True
     if use_docker_sandbox:
@@ -106,8 +97,13 @@ def exec_python(
         # 3. Execute code
         try:
             # Encode code in base64 before sending it to the server
-            code_b64 = base64.b64encode(code.encode()).decode()
-            response = requests.post(f"{SANDBOX_API_URL}/execute", json={"code": code_b64})
+            code_b64 = base64.b64encode(
+                code.encode()
+                ).decode()
+            from icecream import ic
+            ic(code_b64)
+            
+            response = requests.post(f"{SANDBOX_API_URL}/execute", json={"encoded_code": code_b64})
             response.raise_for_status()
             exec_result = response.json()
             results["stdout"] = exec_result.get("stdout", "")
@@ -133,6 +129,9 @@ def exec_python(
                 results["stderr"] += f"Sandbox response: {response.text}\n"
             results["error"] = "Code execution error"
 
+        results.update({
+            "instructions": "Use the outputs or errors to respond to the query. If it was successful and you got the information you need, relay it to the user."
+        })
         return results
 
     else:
