@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal, Optional, List, Dict
 from llm_agent_x.backend.dot_tree import DotTree
 from llm_agent_x.backend.exceptions import TaskFailedException
 from opentelemetry import trace, context as otel_context
-from pydantic import BaseModel, validator, ValidationError
+from pydantic import BaseModel, Field, validator, ValidationError
 from langchain_core.messages import (
     SystemMessage,
     HumanMessage,
@@ -78,37 +78,44 @@ class TaskLimit(BaseModel):
             limits=TaskLimitConfig.falloff(initial_tasks, max_depth, falloff_func)
         )
 
-
-class TaskObject(BaseModel):
+# --- MODIFICATION: Updated TaskObject and introduced LLMTaskObject ---
+class LLMTaskObject(BaseModel):
+    """Pydantic model for the task object structure expected from the LLM."""
     task: str
     type: Literal["research", "search", "basic", "text/reasoning"]
-    subtasks: int
-    allow_search: bool
-    allow_tools: bool
+    subtasks: int = 0
+    allow_search: bool = True
+    allow_tools: bool = True
+    depends_on: List[str] = Field([], description="A list of task UUIDs that this task depends on.")
 
+
+class TaskObject(LLMTaskObject):
+    """The internal representation of a task, with a system-assigned UUID."""
+    uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
 class task(TaskObject):  # pylint: disable=invalid-name
-    uuid: str
-
+    """Alias for TaskObject for convenience."""
+    pass
 
 class verification(BaseModel):  # pylint: disable=invalid-name
     successful: bool
 
-
 class SplitTask(BaseModel):
     needs_subtasks: bool
-    subtasks: list[TaskObject]
+    # --- MODIFICATION: The list now contains LLMTaskObjects from the LLM's perspective ---
+    subtasks: list[LLMTaskObject]
     evaluation: Optional[TaskEvaluation] = None
 
     def __bool__(self):
         return self.needs_subtasks
-
 
 class TaskContext(BaseModel):
     task: str
     result: Optional[str] = None
     siblings: List["TaskContext"] = []
     parent_context: Optional["TaskContext"] = None
+    # --- MODIFICATION: Added to hold results from dependent tasks ---
+    dependency_results: Dict[str, str] = {}
 
     class Config:
         arbitrary_types_allowed = True
@@ -131,7 +138,8 @@ class RecursiveAgentOptions(BaseModel):
     align_summaries: bool = True
     token_counter: Optional[Callable[[str], int]] = None
     summary_sentences_factor: int = 10  # Added for _summarize_subtask_results
-
+    # --- MODIFICATION: Added central task registry ---
+    task_registry: Dict[str, Any] = {}
     max_fix_attempts: int = 2
 
     class Config:
@@ -145,21 +153,18 @@ def calculate_raw_similarity(text1: str, text2: str) -> float:
 def _serialize_lc_messages_for_preview(
     messages: List[BaseMessage], max_len: int = 500
 ) -> str:
+    # (No changes in this helper function)
     if not messages:
         return "[]"
-
     content_parts = []
     for msg in messages:
         role = msg.type.upper()
         content_str = str(msg.content)
-
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             content_str += f" (Tool Calls: {len(msg.tool_calls)})"
         elif hasattr(msg, "tool_call_id") and msg.tool_call_id:
             content_str += f" (Tool Call ID: {msg.tool_call_id})"
-
         content_parts.append(f"{role}: {content_str}")
-
     full_str = "\n".join(content_parts)
     if len(full_str) > max_len:
         return full_str[: max_len - 3] + "..."
@@ -169,83 +174,66 @@ def _serialize_lc_messages_for_preview(
 class RecursiveAgent:
     def __init__(
         self,
-        task: Any, # Changed from str to Any to allow TaskObject
+        # --- MODIFICATION: Task can be TaskObject, which now includes UUID and depends_on ---
+        task: Any,
         u_inst: str,
         tracer: Optional[trace.Tracer] = None,
         tracer_span: Optional[trace.Span] = None,
-        uuid: str = str(uuid.uuid4()),
+        # uuid is now derived from the task object
         agent_options: Optional[RecursiveAgentOptions] = None,
         allow_subtasks: bool = True,
         current_layer: int = 0,
         parent: Optional["RecursiveAgent"] = None,
         context: Optional[TaskContext] = None,
         siblings: Optional[List["RecursiveAgent"]] = None,
-        task_type_override: Optional[str] = None, # New parameter
+        task_type_override: Optional[str] = None,
         max_fix_attempts: int = 2
     ):
-        self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{uuid}")
-        # Logging of initial task will be done after task string is determined
-
         if agent_options is None:
             self.logger.info("No agent_options provided, using default configuration.")
             agent_options = RecursiveAgentOptions(
                 task_limits=TaskLimit.from_constant(max_tasks=3, max_depth=2)
             )
+        self.options = agent_options
 
-        # Determine actual task string and task type
-        actual_task_string: str
-        determined_task_type: str
+        # --- MODIFICATION: Handle TaskObject and register agent ---
+        if isinstance(task, TaskObject):
+            self.task_obj = task
+        else:
+            # If a string or other type is passed, create a default TaskObject
+            self.task_obj = TaskObject(task=str(task), type=task_type_override or 'research')
 
-        if task_type_override:
-            determined_task_type = task_type_override
-            if isinstance(task, TaskObject):
-                actual_task_string = task.task
-            elif isinstance(task, str):
-                actual_task_string = task
-            else:
-                self.logger.warning(f"Task is of unexpected type {type(task)} with task_type_override. Converting to string.")
-                actual_task_string = str(task)
-            self.logger.info(f"Task type overridden to '{determined_task_type}'.")
-        elif isinstance(task, TaskObject):
-            actual_task_string = task.task
-            determined_task_type = task.type
-            self.logger.info(f"Initialized with TaskObject. Task type set to '{determined_task_type}'.")
-        elif isinstance(task, str):
-            actual_task_string = task
-            determined_task_type = 'research' # Default for string tasks
-            self.logger.info(f"Initialized with string task. Task type defaulted to '{determined_task_type}'.")
-        else: # Fallback for unexpected task types
-            self.logger.warning(f"Task is of unexpected type: {type(task)}. Defaulting task_type to 'research' and converting task to string.")
-            actual_task_string = str(task)
-            determined_task_type = 'research'
-
-        self.task = actual_task_string
-        self.task_type = determined_task_type
-        self.u_inst = u_inst
-
+        self.task = self.task_obj.task
+        self.uuid = self.task_obj.uuid
+        self.task_type = task_type_override or self.task_obj.type
+        
+        self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{self.uuid}")
         self.logger.info(
-            f"Initializing RecursiveAgent for task: '{self.task}' (Type: {self.task_type}) at layer {current_layer} with UUID: {uuid}"
+            f"Initializing RecursiveAgent for task: '{self.task}' (Type: {self.task_type}) at layer {current_layer} with UUID: {self.uuid}"
         )
+        
+        # Register this agent instance in the central registry
+        if self.options.task_registry is not None:
+            self.options.task_registry[self.uuid] = self
 
+        self.u_inst = u_inst
         self.tracer = tracer if tracer else trace.get_tracer(__name__)
         self.tracer_span = tracer_span
-        self.options = agent_options
         self.allow_subtasks = allow_subtasks
         self.llm: DotTree = self.options.llm
         self.tools = self.options.tools
         self.task_split_parser = JsonOutputParser(pydantic_object=SplitTask)
         self.task_verification_parser = JsonOutputParser(pydantic_object=verification)
-        self.uuid = uuid
         self.current_layer = current_layer
         self.parent = parent
         self.siblings = siblings or []
-        self.context = context or TaskContext(task=task)
+        self.context = context or TaskContext(task=self.task)
         self.result: Optional[str] = None
-        self.status: str = "pending"
+        self.status: str = "pending" # status can be: pending, running, succeeded, failed_verification, failed
         self.current_span: Optional[trace.Span] = None
-
-        self.fix_attempt_count: int = 0 # Number of fix attempts
+        self.fix_attempt_count: int = 0
         self.max_fix_attempts = max_fix_attempts or agent_options.max_fix_attempts if agent_options.max_fix_attempts is not None else 2
+
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -260,6 +248,7 @@ class RecursiveAgent:
         return 0
 
     def _build_context_information(self) -> dict:
+        # (This method is kept largely the same, but the formatting function it calls is updated)
         ancestor_chain_contexts_data = []
         current_ancestor_node = self.context.parent_context
         while current_ancestor_node:
@@ -275,7 +264,6 @@ class RecursiveAgent:
         ancestor_chain_contexts_data.reverse()
 
         broader_family_contexts_data = []
-
         tasks_to_exclude_from_broader = {
             ctx_data["task"] for ctx_data in ancestor_chain_contexts_data
         }
@@ -283,20 +271,17 @@ class RecursiveAgent:
 
         ancestor_depth = 0
         temp_node_for_sibling_scan = self.context
-
         while temp_node_for_sibling_scan:
             for sibling_of_temp_node in temp_node_for_sibling_scan.siblings:
                 if (
                     sibling_of_temp_node.result is not None
                     and sibling_of_temp_node.task not in tasks_to_exclude_from_broader
                 ):
-
                     relation = ""
                     if ancestor_depth == 0:
                         relation = "direct_sibling"
                     else:
                         relation = f"ancestor_level_{ancestor_depth}_sibling"
-
                     broader_family_contexts_data.append(
                         {
                             "task": sibling_of_temp_node.task,
@@ -305,14 +290,30 @@ class RecursiveAgent:
                         }
                     )
                     tasks_to_exclude_from_broader.add(sibling_of_temp_node.task)
-
             temp_node_for_sibling_scan = temp_node_for_sibling_scan.parent_context
             ancestor_depth += 1
+        
+        # --- MODIFICATION: Add dependency results to the context info ---
+        dependency_contexts_data = []
+        if self.context.dependency_results:
+            for dep_uuid, dep_result in self.context.dependency_results.items():
+                dep_agent = self.options.task_registry.get(dep_uuid)
+                dep_task_desc = dep_agent.task if dep_agent else "Unknown Task"
+                dependency_contexts_data.append(
+                    {
+                        "task": dep_task_desc,
+                        "result": dep_result,
+                        "relation": "dependency",
+                        "uuid": dep_uuid
+                    }
+                )
 
         return {
             "ancestor_chain_contexts": ancestor_chain_contexts_data,
             "broader_family_contexts": broader_family_contexts_data,
+            "dependency_contexts": dependency_contexts_data, # Add new context type
         }
+
 
     def _format_history_parts(
         self,
@@ -321,9 +322,17 @@ class RecursiveAgent:
         subtask_results_map: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         history = []
+        
+        # --- MODIFICATION: Add formatting for dependency context ---
+        if context_info.get("dependency_contexts"):
+            history.append(f"Context from completed dependency tasks (for {purpose}):")
+            for ctx in context_info["dependency_contexts"]:
+                history.append(
+                    f"- Dependency Task (UUID: {ctx['uuid']}): {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
+                )
 
         if context_info.get("ancestor_chain_contexts"):
-            history.append(f"Context from direct ancestor tasks (for {purpose}):")
+            history.append(f"\nContext from direct ancestor tasks (for {purpose}):")
             for ctx in context_info["ancestor_chain_contexts"]:
                 history.append(
                     f"- Ancestor Task: {ctx['task']}\n  Result: {str(ctx['result'])[:150]}..."
@@ -364,14 +373,14 @@ class RecursiveAgent:
         )
 
     def run(self):
+        self.status = "running"
+        # (Rest of the run wrapper method is unchanged)
         self.logger.info(
             f"Attempting to start run for task: '{self.task}' (UUID: {self.uuid}, Status: {self.status})"
         )
-
         parent_otel_ctx = otel_context.get_current()
         if self.tracer_span:
             parent_otel_ctx = trace.set_span_in_context(self.tracer_span)
-
         with self.tracer.start_as_current_span(
             f"RecursiveAgent Task: {self.task[:50]}...",
             context=parent_otel_ctx,
@@ -392,7 +401,6 @@ class RecursiveAgent:
                     "current_layer": self.current_layer,
                 },
             )
-
             try:
                 result = self._run()
                 span.set_attribute("agent.final_status", self.status)
@@ -423,238 +431,183 @@ class RecursiveAgent:
                     f"Agent run for '{self.task}' failed critically: {e}"
                 ) from e
 
+    # --- MAJOR REFACTOR: _run method with dependency resolution ---
     def _run(self) -> str:
         span = self.current_span
         if not span:
             self.logger.warning(
                 "_run called without an active self.current_span. Tracing will be limited for this operation."
             )
-
-        self.logger.info(
-            f"Starting _run for task: '{self.task}' at layer {self.current_layer}"
-        )
-        if span:
-            span.add_event("Internal Execution Start", {"task": self.task})
+        self.logger.info(f"Starting _run for task: '{self.task}' at layer {self.current_layer}")
+        if span: span.add_event("Internal Execution Start", {"task": self.task})
 
         if self.options.pre_task_executed:
-            if span:
-                span.add_event("Pre-Task Callback Executing")
+            if span: span.add_event("Pre-Task Callback Executing")
             self.options.pre_task_executed(
                 task=self.task,
                 uuid=self.uuid,
                 parent_agent_uuid=(self.parent.uuid if self.parent else None),
             )
-            if span:
-                span.add_event("Pre-Task Callback Executed")
 
         max_subtasks_for_this_layer = self._get_max_subtasks()
-        if max_subtasks_for_this_layer == 0:
-            if span:
-                span.add_event("Executing as Single Task: Max Subtasks at Layer is 0")
-            self.result = self._run_single_task()
-            self.context.result = self.result
-            try:
-                self.verify_result(None)
-            except TaskFailedException:
-                if span:
-                    span.add_event("Single Task Verification Failed, Attempting Fix")
-                self._fix(None)
+        if max_subtasks_for_this_layer == 0 or not self.allow_subtasks:
+            if span: span.add_event("Executing as Single Task: Subtasks disabled for this layer.")
+            return self._execute_and_verify_single_task()
 
-            if self.options.on_task_executed:
-                if span:
-                    span.add_event("On-Task-Executed Callback Executing")
-                self.options.on_task_executed(
-                    self.task,
-                    self.uuid,
-                    self.result,
-                    self.parent.uuid if self.parent else None,
-                )
-                if span:
-                    span.add_event("On-Task-Executed Callback Executed")
-            return self.result
+        if self.parent:
+            similarity = calculate_raw_similarity(self.task, self.parent.task)
+            if span: span.add_event("Parent Similarity Check", {"similarity_score": similarity, "threshold": self.options.similarity_threshold})
+            if similarity >= self.options.similarity_threshold:
+                if span: span.add_event("Executing as Single Task: High Parent Similarity", {"similarity": similarity})
+                return self._execute_and_verify_single_task()
 
-        while self.allow_subtasks:
-            if span:
-                span.add_event("Subtask Processing Loop Iteration Start")
-            if self.parent:
-                similarity = calculate_raw_similarity(self.task, self.parent.task)
-                if span:
-                    span.add_event(
-                        "Parent Similarity Check",
-                        {
-                            "similarity_score": similarity,
-                            "threshold": self.options.similarity_threshold,
-                        },
-                    )
-                if similarity >= self.options.similarity_threshold:
-                    if span:
-                        span.add_event(
-                            "Executing as Single Task: High Parent Similarity",
-                            {"similarity": similarity},
-                        )
-                    self.result = self._run_single_task()
-                    self.context.result = self.result
-                    try:
-                        self.verify_result(None)
-                    except TaskFailedException:
-                        if span:
-                            span.add_event(
-                                "High Similarity Single Task Verification Failed, Attempting Fix"
-                            )
-                        self._fix(None)
-                    if self.options.on_task_executed:
-                        self.options.on_task_executed(
-                            self.task,
-                            self.uuid,
-                            self.result,
-                            self.parent.uuid if self.parent else None,
-                        )
-                    return self.result
-
-            split_task_result = self._split_task()
-
-            if span:
-                span.add_event(
-                    "Task Splitting Outcome",
-                    {
-                        "needs_subtasks": split_task_result.needs_subtasks,
-                        "generated_subtasks_count": len(split_task_result.subtasks),
-                        "evaluation_score": (
-                            split_task_result.evaluation.prompt_complexity_score[0]
-                            if split_task_result.evaluation
-                            else "N/A"
-                        ),
-                    },
-                )
-
-            if not split_task_result or not split_task_result.needs_subtasks:
-                if span:
-                    span.add_event(
-                        "Executing as Single Task: Splitting Indicated No Subtasks"
-                    )
-                break
-
-            limited_subtasks = split_task_result.subtasks[:max_subtasks_for_this_layer]
-            if span:
-                span.add_event(
-                    "Subtasks Limited",
-                    {
-                        "original_count": len(split_task_result.subtasks),
-                        "limited_count": len(limited_subtasks),
-                        "max_allowed": max_subtasks_for_this_layer,
-                    },
-                )
-
-            child_agents: List[RecursiveAgent] = []
-            child_contexts_for_siblings: List[TaskContext] = []
-
-            for subtask_obj in limited_subtasks:
-                child_task_uuid = str(uuid.uuid4())
-                child_context = TaskContext(
-                    task=subtask_obj.task, parent_context=self.context
-                )
-                # Ensure subtask_obj is a TaskObject as expected by this point
-                # The subtasks list from SplitTask should contain TaskObject instances
-                child_task_string = subtask_obj.task
-                child_task_type = subtask_obj.type
-
-                child_agent = RecursiveAgent(
-                    task=child_task_string, # Pass the task string
-                    u_inst=self.u_inst,
-                    tracer=self.tracer,
-                    tracer_span=span,
-                    uuid=child_task_uuid,
-                    agent_options=self.options,
-                    allow_subtasks=True,
-                    current_layer=self.current_layer + 1,
-                    parent=self,
-                    context=child_context,
-                    siblings=child_agents[:],
-                    task_type_override=child_task_type # Pass the type from TaskObject
-                )
-                child_agents.append(child_agent)
-                child_contexts_for_siblings.append(child_context)
-
-            for i, child_agent_to_update in enumerate(child_agents):
-                child_agent_to_update.context.siblings = [
-                    ctx for j, ctx in enumerate(child_contexts_for_siblings) if i != j
-                ]
-
-            subtask_results = []
-            subtask_tasks_for_summary = []
-            if span:
-                span.add_event("Executing Child Agents", {"count": len(child_agents)})
-            for i, child_agent in enumerate(child_agents):
-                if span:
-                    span.add_event(
-                        f"Child Agent {i+1} Run Start",
-                        {
-                            "child_task": child_agent.task,
-                            "child_uuid": child_agent.uuid,
-                        },
-                    )
-                child_result = child_agent.run()
-                subtask_results.append(
-                    child_result
-                    if child_result is not None
-                    else "Error or no result from subtask."
-                )
-                subtask_tasks_for_summary.append(child_agent.task)
-                if span:
-                    span.add_event(
-                        f"Child Agent {i+1} Run End",
-                        {
-                            "child_task": child_agent.task,
-                            "child_result_preview": str(child_result)[:100],
-                            "child_status": child_agent.status,
-                        },
-                    )
-
-            if span:
-                span.add_event("All Child Agents Completed")
-            self.result = self._summarize_subtask_results(
-                subtask_tasks_for_summary, subtask_results
-            )
-            self.context.result = self.result
-
-            subtask_results_map = dict(zip(subtask_tasks_for_summary, subtask_results))
-            try:
-                self.verify_result(subtask_results_map)
-            except TaskFailedException:
-                if span:
-                    span.add_event(
-                        "Subtask Combined Result Verification Failed, Attempting Fix"
-                    )
-                self._fix(subtask_results_map)
-
-            if self.options.on_task_executed:
-                self.options.on_task_executed(
-                    self.task,
-                    self.uuid,
-                    self.result,
-                    self.parent.uuid if self.parent else None,
-                )
-            return self.result
-
+        split_task_result = self._split_task()
         if span:
-            span.add_event("Executing as Single Task: Fallback or Subtask Loop Exit")
+            span.add_event(
+                "Task Splitting Outcome",
+                {
+                    "needs_subtasks": split_task_result.needs_subtasks,
+                    "generated_subtasks_count": len(split_task_result.subtasks)
+                },
+            )
+
+        if not split_task_result or not split_task_result.needs_subtasks:
+            if span: span.add_event("Executing as Single Task: Splitting indicated no subtasks needed.")
+            return self._execute_and_verify_single_task()
+
+        # --- NEW: Dependency-aware execution logic ---
+        limited_subtasks = split_task_result.subtasks[:max_subtasks_for_this_layer]
+        if span:
+            span.add_event("Subtasks Limited", {"original_count": len(split_task_result.subtasks), "limited_count": len(limited_subtasks)})
+
+        # 1. Create all child agent instances first
+        child_agents: Dict[str, RecursiveAgent] = {}
+        child_contexts: List[TaskContext] = []
+        for llm_subtask_obj in limited_subtasks:
+            # Convert LLMTaskObject to the internal TaskObject, assigning a UUID
+            subtask_obj = TaskObject(**llm_subtask_obj.model_dump())
+            
+            child_context = TaskContext(task=subtask_obj.task, parent_context=self.context)
+            child_agent = RecursiveAgent(
+                task=subtask_obj, # Pass the full object
+                u_inst=self.u_inst,
+                tracer=self.tracer,
+                tracer_span=span,
+                agent_options=self.options,
+                allow_subtasks=(self.current_layer + 1 < len(self.options.task_limits.limits)),
+                current_layer=self.current_layer + 1,
+                parent=self,
+                context=child_context,
+            )
+            child_agents[child_agent.uuid] = child_agent
+            child_contexts.append(child_context)
+
+        # Set siblings for all created children
+        for agent in child_agents.values():
+            agent.context.siblings = [ctx for ctx in child_contexts if ctx.task != agent.task]
+
+        # 2. Execute tasks based on dependencies
+        completed_tasks: Dict[str, str] = {}
+        pending_agents: Dict[str, RecursiveAgent] = child_agents.copy()
+        
+        loop_guard = 0
+        max_loops = len(pending_agents) + 2 # Safety break for dependency resolution
+
+        while pending_agents and loop_guard < max_loops:
+            loop_guard += 1
+            runnable_agents: List[RecursiveAgent] = []
+            
+            # Find agents whose dependencies are met
+            for agent_uuid, agent in pending_agents.items():
+                dependencies = agent.task_obj.depends_on
+                if all(dep_uuid in completed_tasks for dep_uuid in dependencies):
+                    runnable_agents.append(agent)
+
+            if not runnable_agents:
+                # Before failing, check if the dependency exists in the global registry (was already completed)
+                # This handles cases where a subtask depends on a task outside its immediate sibling group
+                for agent_uuid, agent in pending_agents.items():
+                    dependencies = agent.task_obj.depends_on
+                    non_sibling_deps_met = True
+                    for dep_uuid in dependencies:
+                        # If a dependency is NOT a sibling and NOT completed, we must wait
+                        if dep_uuid not in child_agents:
+                            dep_agent = self.options.task_registry.get(dep_uuid)
+                            if not dep_agent or dep_agent.status != 'succeeded':
+                                non_sibling_deps_met = False
+                                break # This dependency is not met
+                            else: # The dependency is met, add its result to our completed list
+                                if dep_uuid not in completed_tasks:
+                                    completed_tasks[dep_uuid] = dep_agent.result
+
+                    if non_sibling_deps_met and all(dep_uuid in completed_tasks for dep_uuid in dependencies):
+                         runnable_agents.append(agent)
+
+            if not runnable_agents and pending_agents:
+                failed_tasks_info = {
+                    uuid: agent.task_obj.depends_on for uuid, agent in pending_agents.items()
+                }
+                error_msg = f"Circular or unresolved dependency detected. Cannot proceed. Pending tasks: {failed_tasks_info}"
+                self.logger.error(error_msg)
+                if span: span.add_event("Dependency Error", {"details": error_msg})
+                raise TaskFailedException(error_msg)
+            
+            # Run the agents that are ready
+            for agent in runnable_agents:
+                if agent.uuid not in pending_agents: continue # Already processed in this loop
+                
+                if span: span.add_event(f"Dependency Met: Running Task", {"child_task": agent.task, "child_uuid": agent.uuid})
+                
+                # Inject dependency results into context
+                agent.context.dependency_results = {
+                    dep_uuid: completed_tasks[dep_uuid] for dep_uuid in agent.task_obj.depends_on
+                }
+                
+                result = agent.run()
+                completed_tasks[agent.uuid] = result if result is not None else "No result from subtask."
+                del pending_agents[agent.uuid] # Move from pending
+                if span: span.add_event(f"Task Completed", {"child_task": agent.task, "child_uuid": agent.uuid, "result_preview": str(result)[:100]})
+
+        if pending_agents:
+             self.logger.warning(f"Dependency resolution loop finished with pending agents, something went wrong. {list(pending_agents.keys())}")
+
+
+        # 3. Summarize results
+        subtask_tasks_for_summary = [child_agents[uuid].task for uuid in completed_tasks.keys() if uuid in child_agents]
+        subtask_results_for_summary = [result for uuid, result in completed_tasks.items() if uuid in child_agents]
+        
+        self.result = self._summarize_subtask_results(subtask_tasks_for_summary, subtask_results_for_summary)
+        self.context.result = self.result
+
+        subtask_results_map = {child_agents[uuid].task: result for uuid, result in completed_tasks.items() if uuid in child_agents}
+        try:
+            self.verify_result(subtask_results_map)
+        except TaskFailedException:
+            if span: span.add_event("Subtask Combined Result Verification Failed, Attempting Fix")
+            self._fix(subtask_results_map)
+
+        if self.options.on_task_executed:
+            self.options.on_task_executed(self.task, self.uuid, self.result, self.parent.uuid if self.parent else None)
+            
+        return self.result
+
+    def _execute_and_verify_single_task(self) -> str:
+        """Helper to run a single task, verify, and potentially fix it."""
         self.result = self._run_single_task()
         self.context.result = self.result
         try:
             self.verify_result(None)
         except TaskFailedException:
-            if span:
-                span.add_event(
-                    "Fallback Single Task Verification Failed, Attempting Fix"
-                )
+            if self.current_span:
+                self.current_span.add_event("Single Task Verification Failed, Attempting Fix")
             self._fix(None)
-
+        
         if self.options.on_task_executed:
             self.options.on_task_executed(
                 self.task,
                 self.uuid,
                 self.result,
-                self.parent.uuid if self.parent else None,
+                self.parent.uuid if self.parent else None
             )
         return self.result
 
@@ -1036,74 +989,88 @@ class RecursiveAgent:
             )
             return final_result_content
 
+# In llm_agent_x/agents/recursive_agent.py
+
+# ... inside the RecursiveAgent class ...
+
     def _split_task(self) -> SplitTask:
         agent_span = self.current_span
-        parent_context_for_split = (
-            trace.set_span_in_context(agent_span)
-            if agent_span
-            else otel_context.get_current()
-        )
+        parent_context_for_split = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
 
-        with self.tracer.start_as_current_span(
-            "Split Task Operation", context=parent_context_for_split
-        ) as split_span:
+        with self.tracer.start_as_current_span("Split Task Operation", context=parent_context_for_split) as split_span:
             self.logger.info(f"Splitting task: '{self.task}'")
             task_history_for_splitting = self._build_task_split_history()
             max_subtasks = self._get_max_subtasks()
 
-            split_span.add_event(
-                "Task Splitting Start",
-                {
-                    "task": self.task,
-                    "max_subtasks_allowed": max_subtasks,
-                    "context_for_splitting_preview": task_history_for_splitting[:300],
-                },
-            )
+            # --- MODIFICATION: Build a list of valid, completed tasks for dependency ---
+            ancestor_uuids = set()
+            current_agent_for_traversal = self
+            while current_agent_for_traversal:
+                ancestor_uuids.add(current_agent_for_traversal.uuid)
+                current_agent_for_traversal = current_agent_for_traversal.parent
 
-            # Get tools to use from tools dictionary
+            existing_tasks_summary = []
+            if self.options.task_registry:
+                valid_dependency_candidates = []
+                for task_uuid, agent_instance in self.options.task_registry.items():
+                    # A task can only be a dependency if it meets ALL of the following criteria:
+                    # 1. It is NOT an ancestor of the current task (prevents circularity).
+                    # 2. It has a status of 'succeeded' (prevents deadlocks with pending parallel tasks).
+                    if task_uuid in ancestor_uuids:
+                        continue
+                    if agent_instance.status != 'succeeded':
+                        continue
+
+                    valid_dependency_candidates.append(agent_instance)
+                
+                if valid_dependency_candidates:
+                    existing_tasks_summary.append(
+                        "You can create dependencies on the following tasks that have ALREADY COMPLETED SUCCESSFULLY. Use their UUIDs in the `depends_on` field."
+                    )
+                    for agent_instance in sorted(valid_dependency_candidates, key=lambda a: a.task):
+                        status_info = agent_instance.status
+                        if agent_instance.result:
+                            status_info += f" (Result: {str(agent_instance.result)[:80]}...)"
+                        
+                        existing_tasks_summary.append(
+                            f"- Task: \"{agent_instance.task}\"\n  UUID: {agent_instance.uuid}\n  Status: {status_info}"
+                        )
+            # --- END OF MODIFICATION ---
+
+            existing_tasks_str = "\n".join(existing_tasks_summary)
+            if not existing_tasks_summary:
+                existing_tasks_str = "No other tasks have been created yet that can be depended on."
+
+
+            split_span.add_event("Task Splitting Start", {"task": self.task, "max_subtasks_allowed": max_subtasks})
             
-            tools_to_use = self.options.tools_dict.values()
-            # Remove duplicates
-            tools_to_use = list(set(tools_to_use))
+            tools_to_use = list(set(self.options.tools_dict.values()))
             tools_to_use = sorted(tools_to_use, key=lambda t: t.__name__)
-
-            # get their docstrings
             import inspect
-
-            tools_docstrings = []
-            for tool in tools_to_use:
-                if tool.__doc__ is not None:
-                    tools_docstrings.append(inspect.cleandoc(tool.__doc__))
-
-            tools_docstrings = "\n".join(tools_docstrings)
-
-            # construct tool list with docstrings
-            tools_with_docstrings = []
-            for tool in tools_to_use:
-                if tool.__doc__ is not None:
-                    tools_with_docstrings.append(f"{tool.__name__}: {inspect.cleandoc(tool.__doc__)}")
-
-            tools_with_docstrings = "\n".join(tools_with_docstrings)
+            tools_with_docstrings = "\n".join([f"{tool.__name__}: {inspect.cleandoc(tool.__doc__)}" for tool in tools_to_use if tool.__doc__])
 
             system_msg_content = (
-                f"Split this task into smaller, parallelizable subtasks only if it's complex and benefits from it. You can create up to {max_subtasks} subtasks. "
-                "Do not attempt to answer the main task yourself.\n\n"
-                "Consider this contextual history (ancestor tasks, other related tasks):\n"
+                f"Split this task into smaller subtasks only if it's complex. You can create up to {max_subtasks} subtasks. "
+                "You can also create dependencies between tasks by referencing tasks that are already completed.\n\n"
+                "=== AVAILABLE TASKS FOR DEPENDENCIES ===\n"
+                f"{existing_tasks_str}\n\n"
+                "=== CONTEXTUAL HISTORY (ancestors, siblings) ===\n"
                 f"{task_history_for_splitting}\n\n"
-                "When deciding on subtasks for the current task ('{self.task}'), ensure they:\n"
-                "1. Avoid redundant overlap with tasks in the history.\n"
-                "2. Logically break down the current task if it's too broad for a single LLM response.\n"
-                "3. Are distinct and can be worked on independently if possible.\n"
-                f"4. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
-                f"The tasks you create can also use these tools: \n\n{tools_with_docstrings}"
+                f"=== CURRENT TASK TO SPLIT ===\n'{self.task}'\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Analyze the CURRENT TASK. If it's simple, set `needs_subtasks` to `false`.\n"
+                "2. If it's complex, break it into a logical sequence of smaller, independent subtasks.\n"
+                "3. If a subtask requires the result of a PREVIOUSLY COMPLETED task, add its UUID to the `depends_on` list.\n"
+                "4. You CANNOT create dependencies on other subtasks you are creating in the same list. Dependencies can only be on tasks from the 'AVAILABLE TASKS' list.\n"
+                f"5. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
+                f"The tasks you create can also use these tools: \n{tools_with_docstrings}"
             )
-            if self.u_inst:
-                system_msg_content += f"User-provided instructions for the main task (consider these when splitting):\n{self.u_inst}\n"
 
-            split_msgs_hist = [
-                SystemMessage(content=system_msg_content),
-                HumanMessage(self.task),
-            ]
+            logger.debug(ic.format(system_msg_content))
+            if self.u_inst:
+                system_msg_content += f"\nUser-provided instructions for the main task:\n{self.u_inst}"
+
+            split_msgs_hist = [SystemMessage(content=system_msg_content), HumanMessage(self.task)]
 
             evaluation = evaluate_prompt(f"Prompt: {self.task}")
             split_span.add_event(
@@ -1213,9 +1180,7 @@ class RecursiveAgent:
 
             split_task_result: SplitTask
             try:
-                parsed_output_from_llm = self.task_split_parser.invoke(
-                    structured_response_msg
-                )
+                parsed_output_from_llm = self.task_split_parser.invoke(structured_response_msg)
                 if isinstance(parsed_output_from_llm, dict):
                     parsed_output_from_llm["evaluation"] = evaluation
                     split_task_result = SplitTask(**parsed_output_from_llm)
@@ -1223,69 +1188,21 @@ class RecursiveAgent:
                     split_task_result = parsed_output_from_llm
                     split_task_result.evaluation = evaluation
                 else:
-                    self.logger.error(
-                        f"Unexpected type from task_split_parser: {type(parsed_output_from_llm)}."
-                    )
-                    raise TypeError(
-                        f"Unexpected type from parser: {type(parsed_output_from_llm)}"
-                    )
+                    raise TypeError(f"Unexpected type from parser: {type(parsed_output_from_llm)}")
                 
-                split_span.set_attribute(
-                    "subtasks", [task.task for task in split_task_result.subtasks]
-                )
-
-                split_span.add_event(
-                    "Task Splitting JSON Parsed",
-                    {
-                        "parsed_needs_subtasks": split_task_result.needs_subtasks,
-                        "parsed_subtasks_count": len(split_task_result.subtasks),
-                    },
-                )
+                split_span.set_attribute("subtasks", [task.task for task in split_task_result.subtasks])
+                split_span.add_event("Task Splitting JSON Parsed", {"needs_subtasks": split_task_result.needs_subtasks, "count": len(split_task_result.subtasks)})
 
             except (ValidationError, OutputParserException, TypeError) as e:
-                self.logger.error(
-                    f"Error parsing LLM JSON for task splitting: {e}. LLM content: {str(structured_response_msg.content)[:500]}",
-                    exc_info=True,
-                )
-                split_span.record_exception(
-                    e,
-                    attributes={
-                        "llm_content_preview": str(structured_response_msg.content)[
-                            :200
-                        ]
-                    },
-                )
-                split_task_result = SplitTask(
-                    needs_subtasks=False, subtasks=[], evaluation=evaluation
-                )
+                self.logger.error(f"Error parsing LLM JSON for task splitting: {e}. Content: {str(structured_response_msg.content)[:500]}", exc_info=True)
+                split_span.record_exception(e, attributes={"llm_content_preview": str(structured_response_msg.content)[:200]})
+                split_task_result = SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)
 
             if split_task_result.subtasks:
                 original_subtask_count = len(split_task_result.subtasks)
                 split_task_result.subtasks = split_task_result.subtasks[:max_subtasks]
-                if len(split_task_result.subtasks) < original_subtask_count:
-                    split_span.add_event(
-                        "Subtasks Trimmed to Max Allowed",
-                        {
-                            "original_count": original_subtask_count,
-                            "trimmed_count": len(split_task_result.subtasks),
-                        },
-                    )
                 split_task_result.needs_subtasks = bool(split_task_result.subtasks)
 
-            split_span.add_event(
-                "Task Splitting Finished",
-                {
-                    "final_needs_subtasks": split_task_result.needs_subtasks,
-                    "final_subtasks_count": len(split_task_result.subtasks),
-                    "subtasks_preview": json.dumps(
-                        [
-                            st.model_dump(exclude={"evaluation"})
-                            for st in split_task_result.subtasks
-                        ],
-                        default=str,
-                    )[:500],
-                },
-            )
             return split_task_result
 
     def _verify_result_internal(
@@ -1885,25 +1802,26 @@ class RecursiveAgent:
             )
 
         prompt_content = (
-            f"Now, format the subtask list (or indicate no subtasks are needed) strictly according to the following JSON schema. "
-            f"The 'evaluation' field is optional and you should omit it (it will be added programmatically).\n"
-            f"Schema:\n```json\n{simplified_schema_str}\n```\n"
-            f"Example (needs subtasks):\n"
+            f"Now, format the subtask list strictly according to the following JSON schema. "
+            f"The 'uuid' field is system-assigned; do not include it. Use the `depends_on` field to list UUIDs of tasks that must be completed before this new subtask can start.\n\n"
+            f"Schema:\n```json\n{simplified_schema_str}\n```\n\n"
+            f"Example (with dependency):\n"
             f"```json\n{{\n"
             f'  "needs_subtasks": true,\n'
             f'  "subtasks": [\n'
-            f'    {{ "task": "Subtask 1...", "type": "research", "subtasks": 0, "allow_search": true, "allow_tools": true }},\n'
-            f'    {{ "task": "Subtask 2...", "type": "basic", "subtasks": 0, "allow_search": false, "allow_tools": false }}\n'
+            f'    {{ "task": "First, research topic A.", "type": "research", "subtasks": 0, "allow_search": true, "allow_tools": true, "depends_on": [] }},\n'
+            f'    {{ "task": "Then, using the findings from the research on topic A, write a summary.", "type": "text/reasoning", "subtasks": 0, "allow_search": false, "allow_tools": false, "depends_on": ["uuid-of-task-A"] }}\n'
             f"  ]\n"
-            f"}}\n```\n"
+            f"}}\n```\n\n"
             f"Example (NO subtasks):\n"
             f"```json\n{{\n"
             f'  "needs_subtasks": false,\n'
             f'  "subtasks": []\n'
             f"}}\n```\n"
-            "Provide ONLY the JSON object as your response, without any other text or explanations. Also, can you do it in a single line?"
+            "Provide ONLY the JSON object as your response, in a single line without any other text or explanations."
         )
         return HumanMessage(prompt_content)
+
 
     def _construct_verify_answer_prompt(self):
         json_schema_str = verification.model_json_schema()
