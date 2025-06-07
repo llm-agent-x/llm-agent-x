@@ -524,17 +524,39 @@ class RecursiveAgent:
                     runnable_agents.append(agent)
 
             if not runnable_agents:
+                # Before failing, check if the dependency exists in the global registry (was already completed)
+                # This handles cases where a subtask depends on a task outside its immediate sibling group
+                for agent_uuid, agent in pending_agents.items():
+                    dependencies = agent.task_obj.depends_on
+                    non_sibling_deps_met = True
+                    for dep_uuid in dependencies:
+                        # If a dependency is NOT a sibling and NOT completed, we must wait
+                        if dep_uuid not in child_agents:
+                            dep_agent = self.options.task_registry.get(dep_uuid)
+                            if not dep_agent or dep_agent.status != 'succeeded':
+                                non_sibling_deps_met = False
+                                break # This dependency is not met
+                            else: # The dependency is met, add its result to our completed list
+                                if dep_uuid not in completed_tasks:
+                                    completed_tasks[dep_uuid] = dep_agent.result
+
+                    if non_sibling_deps_met and all(dep_uuid in completed_tasks for dep_uuid in dependencies):
+                         runnable_agents.append(agent)
+
+            if not runnable_agents and pending_agents:
                 failed_tasks_info = {
                     uuid: agent.task_obj.depends_on for uuid, agent in pending_agents.items()
                 }
                 error_msg = f"Circular or unresolved dependency detected. Cannot proceed. Pending tasks: {failed_tasks_info}"
                 self.logger.error(error_msg)
-                span.add_event("Dependency Error", {"details": error_msg})
+                if span: span.add_event("Dependency Error", {"details": error_msg})
                 raise TaskFailedException(error_msg)
             
             # Run the agents that are ready
             for agent in runnable_agents:
-                span.add_event(f"Dependency Met: Running Task", {"child_task": agent.task, "child_uuid": agent.uuid})
+                if agent.uuid not in pending_agents: continue # Already processed in this loop
+                
+                if span: span.add_event(f"Dependency Met: Running Task", {"child_task": agent.task, "child_uuid": agent.uuid})
                 
                 # Inject dependency results into context
                 agent.context.dependency_results = {
@@ -544,20 +566,20 @@ class RecursiveAgent:
                 result = agent.run()
                 completed_tasks[agent.uuid] = result if result is not None else "No result from subtask."
                 del pending_agents[agent.uuid] # Move from pending
-                span.add_event(f"Task Completed", {"child_task": agent.task, "child_uuid": agent.uuid, "result_preview": str(result)[:100]})
+                if span: span.add_event(f"Task Completed", {"child_task": agent.task, "child_uuid": agent.uuid, "result_preview": str(result)[:100]})
 
         if pending_agents:
-             self.logger.warning("Dependency resolution loop finished with pending agents, something went wrong.")
+             self.logger.warning(f"Dependency resolution loop finished with pending agents, something went wrong. {list(pending_agents.keys())}")
 
 
         # 3. Summarize results
-        subtask_tasks_for_summary = [child_agents[uuid].task for uuid in completed_tasks.keys()]
-        subtask_results_for_summary = list(completed_tasks.values())
+        subtask_tasks_for_summary = [child_agents[uuid].task for uuid in completed_tasks.keys() if uuid in child_agents]
+        subtask_results_for_summary = [result for uuid, result in completed_tasks.items() if uuid in child_agents]
         
         self.result = self._summarize_subtask_results(subtask_tasks_for_summary, subtask_results_for_summary)
         self.context.result = self.result
 
-        subtask_results_map = {child_agents[uuid].task: result for uuid, result in completed_tasks.items()}
+        subtask_results_map = {child_agents[uuid].task: result for uuid, result in completed_tasks.items() if uuid in child_agents}
         try:
             self.verify_result(subtask_results_map)
         except TaskFailedException:
@@ -569,7 +591,7 @@ class RecursiveAgent:
             
         return self.result
 
-    def     _execute_and_verify_single_task(self) -> str:
+    def _execute_and_verify_single_task(self) -> str:
         """Helper to run a single task, verify, and potentially fix it."""
         self.result = self._run_single_task()
         self.context.result = self.result
@@ -980,7 +1002,7 @@ class RecursiveAgent:
             task_history_for_splitting = self._build_task_split_history()
             max_subtasks = self._get_max_subtasks()
 
-            # --- MODIFICATION: Stricter check for valid dependencies ---
+            # --- MODIFICATION: Build a list of valid, completed tasks for dependency ---
             ancestor_uuids = set()
             current_agent_for_traversal = self
             while current_agent_for_traversal:
@@ -989,9 +1011,7 @@ class RecursiveAgent:
 
             existing_tasks_summary = []
             if self.options.task_registry:
-                existing_tasks_summary.append(
-                    "You can create dependencies on the following tasks that have ALREADY COMPLETED SUCCESSFULLY. Use their UUIDs in the `depends_on` field."
-                )
+                valid_dependency_candidates = []
                 for task_uuid, agent_instance in self.options.task_registry.items():
                     # A task can only be a dependency if it meets ALL of the following criteria:
                     # 1. It is NOT an ancestor of the current task (prevents circularity).
@@ -1001,14 +1021,20 @@ class RecursiveAgent:
                     if agent_instance.status != 'succeeded':
                         continue
 
-                    # If it passes all checks, it's a valid dependency candidate.
-                    status_info = agent_instance.status
-                    if agent_instance.result:
-                        status_info += f" (Result: {str(agent_instance.result)[:80]}...)"
-                    
+                    valid_dependency_candidates.append(agent_instance)
+                
+                if valid_dependency_candidates:
                     existing_tasks_summary.append(
-                        f"- Task: \"{agent_instance.task}\"\n  UUID: {task_uuid}\n  Status: {status_info}"
+                        "You can create dependencies on the following tasks that have ALREADY COMPLETED SUCCESSFULLY. Use their UUIDs in the `depends_on` field."
                     )
+                    for agent_instance in sorted(valid_dependency_candidates, key=lambda a: a.task):
+                        status_info = agent_instance.status
+                        if agent_instance.result:
+                            status_info += f" (Result: {str(agent_instance.result)[:80]}...)"
+                        
+                        existing_tasks_summary.append(
+                            f"- Task: \"{agent_instance.task}\"\n  UUID: {agent_instance.uuid}\n  Status: {status_info}"
+                        )
             # --- END OF MODIFICATION ---
 
             existing_tasks_str = "\n".join(existing_tasks_summary)
@@ -1025,16 +1051,18 @@ class RecursiveAgent:
 
             system_msg_content = (
                 f"Split this task into smaller subtasks only if it's complex. You can create up to {max_subtasks} subtasks. "
-                "You can also create dependencies between tasks.\n\n"
+                "You can also create dependencies between tasks by referencing tasks that are already completed.\n\n"
                 "=== AVAILABLE TASKS FOR DEPENDENCIES ===\n"
                 f"{existing_tasks_str}\n\n"
                 "=== CONTEXTUAL HISTORY (ancestors, siblings) ===\n"
                 f"{task_history_for_splitting}\n\n"
-                "When deciding on subtasks for the current task ('{self.task}'), ensure they:\n"
-                "1. Logically break down the current task.\n"
-                "2. Can reference completed tasks from the 'AVAILABLE TASKS' list in their `depends_on` field if they need their output.\n"
-                "3. Are distinct and can be worked on independently if possible (unless a dependency is specified).\n"
-                f"4. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
+                f"=== CURRENT TASK TO SPLIT ===\n'{self.task}'\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Analyze the CURRENT TASK. If it's simple, set `needs_subtasks` to `false`.\n"
+                "2. If it's complex, break it into a logical sequence of smaller, independent subtasks.\n"
+                "3. If a subtask requires the result of a PREVIOUSLY COMPLETED task, add its UUID to the `depends_on` list.\n"
+                "4. You CANNOT create dependencies on other subtasks you are creating in the same list. Dependencies can only be on tasks from the 'AVAILABLE TASKS' list.\n"
+                f"5. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
                 f"The tasks you create can also use these tools: \n{tools_with_docstrings}"
             )
 
