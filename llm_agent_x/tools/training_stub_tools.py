@@ -2666,7 +2666,9 @@ categories = [
     if category in categorized_functions_with_details
 ]
 from icecream import ic
+
 ic(categories)
+
 
 def get_random_subset_from_distribution(
     distribution: Dict[str, float],  # Category name -> proportion (0.0 to 1.0)
@@ -2778,6 +2780,7 @@ def get_random_subset_from_distribution(
                 )  # just take everything.
 
     return selected_functions
+
 
 # List all available categories (to show the users the keys for generating a distribution)
 available_categories = list(categorized_functions.keys())

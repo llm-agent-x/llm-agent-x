@@ -69,7 +69,7 @@ output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 
-def main():    
+def main():
     global live
 
     args = parser.parse_args()
