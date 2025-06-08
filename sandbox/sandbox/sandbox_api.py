@@ -239,9 +239,10 @@ async def execute_code(
         sys.stdout = old_stdout
         sys.stderr = old_stderr
 
-
 @app.post("/install")
-async def install_packages(packages: List[str], index_url: str = None):
+async def install_packages(
+    packages: List[str], index_url: str = None, credentials: HTTPAuthorizationCredentials = Depends()
+):
     """
     Install packages to the sandbox environment.
 
@@ -249,6 +250,12 @@ async def install_packages(packages: List[str], index_url: str = None):
     packages (list): List of packages to install, optionally specifying versions.
     index_url (str, optional): URL of the package index to use. Defaults to None.
     """
+    if requires_api_token and credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=403, detail="Invalid authentication scheme")
+
+    if requires_api_token and credentials.credentials != api_token:
+        raise HTTPException(status_code=403, detail="Invalid API token")
+
     if index_url:
         cmd = ["pip", "install", "--index-url", index_url] + packages
     else:
