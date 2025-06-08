@@ -44,6 +44,7 @@ To run the LLM agent, use the following command:
 llm-agent-x "Your task description here" --max_layers 2 --output output.md --model gpt-4o-mini
 ```
 
+> `cli.py` is not intended to be the primary interface for this project. It is merely a script demonstrating the project's capabilities. For your use, we recommend that you modify or copy `cli.py` or integrating `llm_agent_x`'s API into your own project. In the future, we may implement a HTTP server,.
 ### Arguments
 
 - `task`: The task to execute.
