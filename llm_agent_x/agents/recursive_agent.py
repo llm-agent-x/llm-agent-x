@@ -1,7 +1,8 @@
+import asyncio
 import json
 import uuid
 from difflib import SequenceMatcher
-from typing import Any, Callable, Literal, Optional, List, Dict
+from typing import Any, Callable, Literal, Optional, List, Dict, Union
 from llm_agent_x.backend.dot_tree import DotTree
 from llm_agent_x.backend.exceptions import TaskFailedException
 from opentelemetry import trace, context as otel_context
@@ -13,6 +14,7 @@ from langchain_core.messages import (
     ToolMessage,
     BaseMessage,
 )
+from langchain_core.runnables.base import RunnableConfig
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.exceptions import (
     OutputParserException,
@@ -24,6 +26,7 @@ import logging
 import tiktoken
 from llm_agent_x.tools.summarize import summarize
 from langchain_core.runnables.base import Runnable
+from langchain_core.tools.structured import StructuredTool
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -89,14 +92,20 @@ class LLMTaskObject(BaseModel):
     allow_search: bool = True
     allow_tools: bool = True
     depends_on: List[str] = Field(
-        [], description="A list of task UUIDs that this task depends on."
+        [], description="A list of task UUIDs or 1-based indices that this task depends on."
     )
 
 
 class TaskObject(LLMTaskObject):
     """The internal representation of a task, with a system-assigned UUID."""
 
-    uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    uuid: Union[str, int] = Field(default_factory=lambda: str(uuid.uuid4()))
+
+    @validator("uuid", pre=True)
+    def validate_uuid(cls, v):
+        if isinstance(v, int):
+            return str(v)
+        return v
 
 
 class task(TaskObject):  # pylint: disable=invalid-name
@@ -265,7 +274,6 @@ class RecursiveAgent:
         return 0
 
     def _build_context_information(self) -> dict:
-        # (This method is kept largely the same, but the formatting function it calls is updated)
         ancestor_chain_contexts_data = []
         current_ancestor_node = self.context.parent_context
         while current_ancestor_node:
@@ -310,25 +318,25 @@ class RecursiveAgent:
             temp_node_for_sibling_scan = temp_node_for_sibling_scan.parent_context
             ancestor_depth += 1
 
-        # --- MODIFICATION: Add dependency results to the context info ---
         dependency_contexts_data = []
         if self.context.dependency_results:
-            for dep_uuid, dep_result in self.context.dependency_results.items():
-                dep_agent = self.options.task_registry.get(dep_uuid)
+            for dep_key, dep_result in self.context.dependency_results.items():
+                # This part of the code now correctly handles UUIDs post-translation
+                dep_agent = self.options.task_registry.get(dep_key)
                 dep_task_desc = dep_agent.task if dep_agent else "Unknown Task"
                 dependency_contexts_data.append(
                     {
                         "task": dep_task_desc,
                         "result": dep_result,
                         "relation": "dependency",
-                        "uuid": dep_uuid,
+                        "uuid": dep_key,
                     }
                 )
 
         return {
             "ancestor_chain_contexts": ancestor_chain_contexts_data,
             "broader_family_contexts": broader_family_contexts_data,
-            "dependency_contexts": dependency_contexts_data,  # Add new context type
+            "dependency_contexts": dependency_contexts_data,
         }
 
     def _format_history_parts(
@@ -523,8 +531,8 @@ class RecursiveAgent:
                 },
             )
 
-        # 1. Create all child agent instances first
-        child_agents: Dict[str, RecursiveAgent] = {}
+        # 1. Create all child agent instances first, preserving order for dependency mapping
+        child_agents_in_order: List[RecursiveAgent] = []
         child_contexts: List[TaskContext] = []
         for llm_subtask_obj in limited_subtasks:
             # Convert LLMTaskObject to the internal TaskObject, assigning a UUID
@@ -546,8 +554,27 @@ class RecursiveAgent:
                 parent=self,
                 context=child_context,
             )
-            child_agents[child_agent.uuid] = child_agent
+            child_agents_in_order.append(child_agent)
             child_contexts.append(child_context)
+
+        # 1a. Create a mapping from 1-based index to UUID for new sibling tasks
+        index_to_uuid_map = {
+            str(i + 1): agent.uuid for i, agent in enumerate(child_agents_in_order)
+        }
+
+        # 1b. Translate index-based dependencies to UUID-based dependencies for all new agents
+        for agent in child_agents_in_order:
+            if agent.task_obj.depends_on:
+                # Use .get(dep, dep) to keep existing UUIDs and translate only indices
+                translated_deps = [
+                    index_to_uuid_map.get(dep, dep) for dep in agent.task_obj.depends_on
+                ]
+                agent.task_obj.depends_on = translated_deps
+
+        # 1c. Create the final dictionary of child agents and set siblings
+        child_agents: Dict[str, RecursiveAgent] = {
+            agent.uuid: agent for agent in child_agents_in_order
+        }
 
         # Set siblings for all created children
         for agent in child_agents.values():
@@ -620,6 +647,7 @@ class RecursiveAgent:
                 agent.context.dependency_results = {
                     dep_uuid: completed_tasks[dep_uuid]
                     for dep_uuid in agent.task_obj.depends_on
+                    if dep_uuid in completed_tasks
                 }
 
                 result = agent.run()
@@ -915,12 +943,16 @@ class RecursiveAgent:
                                         )
                                         tool_executed_successfully_this_iteration = True
                                 else:
-                                    individual_tool_span.add_event(
-                                        f"Executing non-search tool: {tool_name}"
-                                    )
-                                    current_tool_output_payload = tool_to_execute(
-                                        **tool_args
-                                    )
+                                    if hasattr(tool_to_execute, "invoke"):
+                                        individual_tool_span.add_event(
+                                            f"Executing non-search tool (using .invoke()): {tool_name}"
+                                        )
+                                        current_tool_output_payload = asyncio.run(self.run_structured_tool(tool_to_execute, tool_args))
+                                    else:
+                                        individual_tool_span.add_event(
+                                            f"Executing non-search tool: {tool_name}"
+                                        )
+                                        current_tool_output_payload = tool_to_execute(**tool_args)
                                     tool_executed_successfully_this_iteration = True
 
                                 individual_tool_span.add_event(
@@ -1087,10 +1119,6 @@ class RecursiveAgent:
             )
             return final_result_content
 
-    # In llm_agent_x/agents/recursive_agent.py
-
-    # ... inside the RecursiveAgent class ...
-
     def _split_task(self) -> SplitTask:
         agent_span = self.current_span
         parent_context_for_split = (
@@ -1106,7 +1134,6 @@ class RecursiveAgent:
             task_history_for_splitting = self._build_task_split_history()
             max_subtasks = self._get_max_subtasks()
 
-            # --- MODIFICATION: Build a list of valid, completed tasks for dependency ---
             ancestor_uuids = set()
             current_agent_for_traversal = self
             while current_agent_for_traversal:
@@ -1117,9 +1144,6 @@ class RecursiveAgent:
             if self.options.task_registry:
                 valid_dependency_candidates = []
                 for task_uuid, agent_instance in self.options.task_registry.items():
-                    # A task can only be a dependency if it meets ALL of the following criteria:
-                    # 1. It is NOT an ancestor of the current task (prevents circularity).
-                    # 2. It has a status of 'succeeded' (prevents deadlocks with pending parallel tasks).
                     if task_uuid in ancestor_uuids:
                         continue
                     if agent_instance.status != "succeeded":
@@ -1143,8 +1167,7 @@ class RecursiveAgent:
                         existing_tasks_summary.append(
                             f'- Task: "{agent_instance.task}"\n  UUID: {agent_instance.uuid}\n  Status: {status_info}'
                         )
-            # --- END OF MODIFICATION ---
-
+            
             existing_tasks_str = "\n".join(existing_tasks_summary)
             if not existing_tasks_summary:
                 existing_tasks_str = (
@@ -1156,23 +1179,30 @@ class RecursiveAgent:
                 {"task": self.task, "max_subtasks_allowed": max_subtasks},
             )
 
-            tools_to_use = list(set(self.options.tools_dict.values()))
-            tools_to_use = sorted(tools_to_use, key=lambda t: t.__name__)
+            tools_to_use = list(self.options.tools_dict.values())
+            tools_to_use = sorted(tools_to_use, key=lambda t: t.__name__ if hasattr(t, '__name__') else t.name)
+
+            tools_dict = {}
+            for tool in tools_to_use:
+                tools_dict[tool.name if hasattr(tool, 'name') else tool.__name__] = tool
+            tools_to_use = sorted(tools_dict.values(), key=lambda t: t.name if hasattr(t, 'name') else t.__name__)
+
             import inspect
 
             tools_with_docstrings = "\n".join(
                 [
-                    f"{tool.__name__}: {inspect.cleandoc(tool.__doc__)}"
+                    f"{tool.name if not hasattr(tool, '__name__') else tool.__name__}: {getattr(tool, 'description', '') or inspect.cleandoc(tool.__doc__)}"
                     for tool in tools_to_use
-                    if tool.__doc__
+                    if tool.__doc__ or getattr(tool, 'description', '')
                 ]
             )
-
+            # --- MODIFICATION START: Updated instructions for dependency creation ---
             system_msg_content = (
                 f"Split this task into smaller subtasks only if it's complex. You can create up to {max_subtasks} subtasks. "
-                "You can also create dependencies between tasks by referencing tasks that are already completed.\n\n"
-                "=== AVAILABLE TASKS FOR DEPENDENCIES ===\n"
+                "You can create dependencies on previously completed tasks (using their UUIDs) or on new tasks you are creating now (using their index).\n\n"
+                "=== AVAILABLE TASKS FOR DEPENDENCIES (use their UUID) ===\n"
                 f"{existing_tasks_str}\n\n"
+                "**Do not create dependencies on tasks that are not yet completed or don't exist.**\n\n"
                 "=== CONTEXTUAL HISTORY (ancestors, siblings) ===\n"
                 f"{task_history_for_splitting}\n\n"
                 f"=== CURRENT TASK TO SPLIT ===\n'{self.task}'\n\n"
@@ -1180,11 +1210,11 @@ class RecursiveAgent:
                 "1. Analyze the CURRENT TASK. If it's simple, set `needs_subtasks` to `false`.\n"
                 "2. If it's complex, break it into a logical sequence of smaller, independent subtasks.\n"
                 "3. If a subtask requires the result of a PREVIOUSLY COMPLETED task, add its UUID to the `depends_on` list.\n"
-                "4. You CANNOT create dependencies on other subtasks you are creating in the same list. Dependencies can only be on tasks from the 'AVAILABLE TASKS' list.\n"
+                "4. To create a dependency on another subtask you are creating in this same list, use its 1-based index number (as a string) in the `depends_on` field. For example, for the third subtask to depend on the first, its `depends_on` would be `['1']`.\n"
                 f"5. Do not exceed {max_subtasks} subtasks in total for this split.\n\n"
                 f"The tasks you create can also use these tools: \n{tools_with_docstrings}"
             )
-
+            # --- MODIFICATION END ---
             logger.debug(ic.format(system_msg_content))
             if self.u_inst:
                 system_msg_content += (
@@ -1980,6 +2010,7 @@ class RecursiveAgent:
             f'  "subtasks": [\n'
             f'    {{ "task": "First, research topic A.", "type": "research", "subtasks": 0, "allow_search": true, "allow_tools": true, "depends_on": [] }},\n'
             f'    {{ "task": "Then, using the findings from the research on topic A, write a summary.", "type": "text/reasoning", "subtasks": 0, "allow_search": false, "allow_tools": false, "depends_on": ["uuid-of-task-A"] }}\n'
+            f'    {{ "task": "Finally, after the summary is written, analyze it for sentiment.", "type": "text/reasoning", "subtasks": 0, "allow_search": false, "allow_tools": false, "depends_on": ["2"] }}\n'
             f"  ]\n"
             f"}}\n```\n\n"
             f"Example (NO subtasks):\n"
@@ -2003,3 +2034,7 @@ class RecursiveAgent:
             "Provide ONLY the JSON object as your response."
         )
         return HumanMessage(prompt_content)
+    
+    async def run_structured_tool(self, tool: StructuredTool, args: Dict):
+        ic(tool)
+        return await tool.ainvoke(input=args)

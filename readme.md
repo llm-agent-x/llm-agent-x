@@ -13,7 +13,7 @@ LLM Agent X is a task execution framework that leverages language models to perf
     ```
 
 2.  Install the package:
-    *   From PyPI (once published):
+    *   From PyPI:
         ```sh
         pip install llm-agent-x
         ```
@@ -64,6 +64,8 @@ llm-agent-x "Your task description here" --max_layers 2 --output output.md --mod
 ```sh
 llm-agent-x "Research the impact of climate change on polar bears" --max_layers 3 --output climate_change_report.md --model gpt-4o-mini
 ```
+
+See the [samples](./samples) folder for more examples, including their outputs.
 
 ## Example flowchart output
 
