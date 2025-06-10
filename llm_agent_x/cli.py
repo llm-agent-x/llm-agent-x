@@ -1,10 +1,13 @@
 import argparse
+import asyncio
+import json
 import sys
 from os import getenv, environ
 from pathlib import Path
 import nltk
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from typing import Optional  # Import Dict, Optional
 from enum import Enum  # Import Enum for TaskType
 from typing import Literal
@@ -26,6 +29,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from icecream import ic
 
 from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
     pre_tasks_executed,
@@ -82,6 +86,26 @@ def main():
         "web_search": brave_web_search,
         "brave_web_search": brave_web_search,
     }
+
+    mcp_config = args.mcp_config
+    if mcp_config:
+        try:
+            with open(mcp_config, "r") as f:
+                config = json.load(f)
+            mcp_client = MultiServerMCPClient(config)
+            mcp_tools = asyncio.run(mcp_client.get_tools())
+            available_tools.extend(mcp_tools)
+
+            # tools_dict_for_agent.update(mcp_client.get_tools_dict())
+            # mcp_client.get_tools_dict() doesn't exist, so we must construct a dictionary based on each tool's __name__ and the tool itself
+            for tool in mcp_tools:
+                ic(tool.name)
+                ic(type(tool.name))
+                if tool.name not in tools_dict_for_agent:
+                    tools_dict_for_agent[tool.name] = tool
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
+    ic(tools_dict_for_agent.values())
 
     if args.enable_python_execution:
         available_tools.append(exec_python)
@@ -152,10 +176,11 @@ def main():
         save_flowchart(output_dir)
 
         # Save Response
-        output_file = output_dir / args.output
-        with output_file.open("w") as output_f:
-            output_f.write(response)
-        console.print(f"Agent response saved to {output_file}")
+        if args.output is not None:
+            output_file = output_dir / args.output
+            with output_file.open("w") as output_f:
+                output_f.write(response)
+            console.print(f"Agent response saved to {output_file}")
         console.print("\nFinal Response:\n", style="bold green")
         console.print(response)
 

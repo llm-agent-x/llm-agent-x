@@ -24,7 +24,7 @@ parser.add_argument(
     help="The maximum number of layers (deprecated, use task_limit).",
 )
 parser.add_argument(
-    "--output", type=str, default="output.md", help="The output file path"
+    "--output", type=str, default=None, help="The output file path"
 )
 parser.add_argument(
     "--model",
@@ -68,4 +68,10 @@ parser.add_argument(
 parser.add_argument(
     "--enable-python-execution",
     help="Enable the exec_python tool for the agent. (Requires Docker for sandbox mode)",
+)
+
+parser.add_argument(
+    "--mcp-config",
+    type=str,
+    help="Path to the MCP config file",
 )
