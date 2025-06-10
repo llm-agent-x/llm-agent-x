@@ -1,161 +1,143 @@
 import json
-import uuid
+import traceback
 from pydantic import BaseModel, Field
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import (
-    SystemMessage,
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-    ToolCall,
-)
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from icecream import ic
-import re
-import ast
-from typing import Callable, Any, Dict
+from typing import Callable, Any, Dict, List, Type
 
+from llm_agent_x.tools.exec_python import exec_python
 
-def is_valid_python(code):
-    """
-    Check if the provided string is valid Python code using the AST module.
-    """
-    try:
-        ast.parse(code)
-        return True
-    except SyntaxError:
-        return False
+class CodeExecutor:
+    """Safely executes Python code using the sandboxed exec_python tool."""
+    def __init__(self, tools: List[Callable] = None):
+        self.tool_schema = convert_to_openai_tool(exec_python)
 
-
-def extract_valid_python_blocks(text):
-    """
-    Extract all valid Python code blocks and check if they have matching triple backticks.
-    Returns a list of tuples containing the code block and whether it has matching backticks.
-    """
-    matches = list(re.finditer(r"```python", text))
-    valid_code_blocks = []
-
-    for match in reversed(matches):
-        start_index = match.end()  # Start right after ` ```python `
-        code = text[start_index:]  # Slice text from this point onward
-
-        # Check for closing triple backticks
-        end_index = code.find("```")
-        if end_index != -1:
-            code_block = code[:end_index].strip()
-            has_matching_backticks = True
-        else:
-            code_block = code.strip()
-            has_matching_backticks = False
-
-        # Validate the code block
-        if is_valid_python(code_block):
-            valid_code_blocks.append((code_block, has_matching_backticks))
-
-    return valid_code_blocks[::-1]  # Return results in original order
-
-
-class SequentialCodeAgentOptions(BaseModel):
-    llm: BaseChatModel = None
-
-
-class IsDone(BaseModel):
-    is_complete: bool = Field(
-        description="Whether or not the conversation history has enough context to answer the original user question, or if the original user task is complete"
-    )
-
+    def execute(self, code: str) -> Dict[str, Any]:
+        """Executes the given code via the sandbox and returns the resulting dictionary."""
+        ic("Passing code to sandboxed exec_python")
+        return exec_python(code=code)
 
 class SequentialCodeAgent:
-    def __init__(
-        self, options: SequentialCodeAgentOptions, execute: Callable[[str, Dict], Any]
-    ):
-        self.options = options
-        self.llm = self.options.llm.bind(stop="```\n")
+    def __init__(self, llm: BaseChatModel, tools: List[Callable] = None):
+        self.llm = llm
+        self.tools = tools or []
+        self.executor = CodeExecutor()
+        self.llm_with_tools = self.llm.bind_tools([self.executor.tool_schema])
+        self.system_prompt = self._create_system_prompt()
+        self.msgs = [SystemMessage(content=self.system_prompt)]
 
-        self.continue_llm = self.options.llm.with_structured_output(schema=IsDone)
-        self.execute = execute
-
-        self.msgs = [
-            SystemMessage(
-                f"You are an AI agent. Your task is to assist the user. To help you do that, you have the ability "
-                f"to execute python. If you include a valid python code block, it will be executed with `exec()`. "
-                f"Keep in mind, you can't access a filesystem. You can't make any system calls. "
-                f"if the user provides you any context, it will be saved in a variable `context`. "
-                f"When you need to use this variable, first include a block of code to understand the "
-                f"structure of the object. There are also functions that you can call, to help complete tasks. "
-                f"These will be specified by the user. Keep in mind, the user doesn't need to run any code. "
-                f"As soon as you output the *closing triple backticks*, your generation will be paused, and a "
-                f"user message will be appended to give you the results. Once you get the result to the python "
-                f"code block, just answer the question for the user if you have enough to answer the question. "
-                f"If an entry in the function list has type hints, don't use code to attempt to understand the structure. "
-                f"If you need to see the result of a codeblock, assign it to the `result` variable, and the system will show you "
-                f"the response after execution. "
-            )
-        ]
-        self.code_execution_starting_namespace = {}
-        self.code_execution_namespace = {}
-        self.code_execution_namespace.update(self.code_execution_starting_namespace)
-
-    def reset_code_execution_namespace(self):
-        self.code_execution_namespace.clear()
-        self.code_execution_namespace.update(self.code_execution_starting_namespace)
-
-    def run(self, prompt):
-        self.msgs.append(
-            HumanMessage(
-                f"USER: {prompt}\n\n"
-                f"If it helps you, this is the state of the global variables in the code execution namespace: \n\n"
-                f"{json.dumps(self.code_execution_namespace)}"
-            )
+    # --- CHANGE #1: A new system prompt that correctly describes the STATELESS sandbox ---
+    def _create_system_prompt(self) -> str:
+        """Generates the system prompt with correct instructions for the stateless sandbox."""
+        base_prompt = (
+            "You are a helpful AI assistant that writes and executes Python code in a secure, sandboxed environment to answer questions.\n\n"
+            "**CRITICAL INSTRUCTIONS FOR USING THE SANDBOX:**\n"
+            "1. You have one tool: `exec_python`.\n"
+            "2. The sandbox is **STATELESS**. Each call to `exec_python` is a completely new environment. Variables DO NOT persist between calls.\n"
+            "3. To perform multi-step tasks, you **MUST** carry the context from previous steps into the next code block. For example, if you retrieve a value in step 1, you must re-declare it as a variable in step 2.\n"
+            "4. To see the result of any operation, you **MUST** `print()` it. The content of `stdout` will be returned to you.\n"
+            "5. The sandbox does not have access to any functions unless you define them within the code you provide.\n\n"
+            "When you have the final answer, respond directly to the user."
         )
 
-        done = False
-        while not done:
-            c = self.llm.invoke(self.msgs).content
-            response = AIMessage(f"{c}\n```")
-            ic(c)
+        if not self.tools:
+            return base_prompt
 
-            # Use extract_valid_python_blocks to extract all valid code blocks
-            valid_blocks = extract_valid_python_blocks(c)
+        tool_descriptions = "\n\n**HELPER FUNCTION DEFINITIONS:**\n"
+        tool_descriptions += "To use the following helper functions, you must copy their complete function definition into the code block you send to `exec_python`.\n"
+        for tool in self.tools:
+            import inspect
+            try:
+                source_code = inspect.getsource(tool)
+                tool_descriptions += f"\n```python\n{source_code}```\n"
+            except (TypeError, OSError):
+                tool_descriptions += f"# Could not retrieve source for {tool.__name__}\n"
 
-            if not valid_blocks:
-                return c
+        return base_prompt + tool_descriptions
 
-            # Take the last valid code block
-            code_block = valid_blocks[-1][0].strip()
-            ic(code_block)
+    # --- CHANGE #2: A more robust formatter that cleans up output ---
+    def _format_sandbox_result(self, result: Dict[str, Any]) -> str:
+        """Formats the dictionary from the sandbox into a simple string for the LLM."""
+        if not isinstance(result, dict):
+            ic("Warning: Sandbox result was not a dictionary.", result)
+            return f"An unexpected error occurred. Tool returned: {str(result)}"
 
-            self.execute(code_block, self.code_execution_namespace)
-            result = self.code_execution_namespace.get("result", None)
-            if result is None:
-                result = ValueError(
-                    "Error executing code; This may be because the user didn't approve code execution, "
-                    "because the system detected malicious code or denied code execution priveliges for "
-                    "other reasons, or a catch-all code execution callback. "
-                    "This could also be because the code didn't assign anything to the `result` variable. "
-                    "This may or may not be normal behaviour. It is up to you to decide."
-                )
-            ic(result)
+        # Clean up stdout by removing empty lines and lines that are exactly 'None'
+        stdout_raw = result.get('stdout', '')
+        stdout_lines = [line for line in stdout_raw.strip().split('\n') if line.strip() and line.strip() != 'None']
+        stdout = '\n'.join(stdout_lines)
 
-            self.msgs.append(
-                ToolMessage(
-                    content=str(result),
-                    tool_call_id=f"run_python_snippet_{str(uuid.uuid4())}",
-                )
-            )
+        stderr = result.get('stderr', '').strip()
 
-            # Check if the task is complete
+        if stderr:
+            return f"Execution failed with an error.\nSTDERR:\n{stderr}"
+        elif stdout:
+            return f"Execution successful.\nSTDOUT:\n{stdout}"
+        else:
+            return "Execution successful. No output was produced on stdout."
 
-            complete = self.continue_llm.invoke(
-                self.msgs[1:]
-                + [
-                    HumanMessage(
-                        "Now, is this question sufficiently answered, or the task sufficiently completed? "
-                        "Respond following this JSON schema:\n\n"
-                        f"{IsDone.model_json_schema()}"
-                    )
-                ]
-            )
+    def reset(self):
+        """Resets the conversation history."""
+        ic("Resetting agent state.")
+        self.msgs = [SystemMessage(content=self.system_prompt)]
 
-            done = complete.is_complete
+    def run(self, prompt: str):
+        """Runs the agent loop for a given prompt."""
+        self.msgs.append(HumanMessage(content=prompt))
+        max_turns = 10
+        for _ in range(max_turns):
+            ic(f"Invoking LLM with {len(self.msgs)} messages...")
+            response: AIMessage = self.llm_with_tools.invoke(self.msgs)
+            self.msgs.append(response)
 
-        return self.llm.invoke(self.msgs).content
+            if not response.tool_calls:
+                ic("LLM provided a final answer.")
+                return response.content
+
+            ic(f"LLM requested {len(response.tool_calls)} tool calls.")
+            for tool_call in response.tool_calls:
+                if tool_call["name"] == self.executor.tool_schema['function']['name']:
+                    code_to_execute = tool_call["args"]["code"]
+                    ic("Code to be executed in sandbox:", code_to_execute)
+                    sandbox_result = self.executor.execute(code_to_execute)
+                    ic("Raw sandbox result:", sandbox_result)
+                    formatted_result = self._format_sandbox_result(sandbox_result)
+                    ic("Formatted result for LLM:", formatted_result)
+                    self.msgs.append(ToolMessage(content=formatted_result, tool_call_id=tool_call["id"]))
+                else:
+                    error_msg = f"Error: Agent tried to call an unknown tool '{tool_call['name']}'. Only 'exec_python' is available."
+                    self.msgs.append(ToolMessage(content=error_msg, tool_call_id=tool_call["id"]))
+        
+        return "Agent stopped after reaching the maximum number of turns."
+
+# --- Example Usage (no changes needed here) ---
+if __name__ == "__main__":
+    from langchain_openai import ChatOpenAI
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    def get_user_email_address(user_name: str) -> str:
+        """Looks up the email address for a given user name."""
+        email_db = {"Alice": "alice@example.com", "Bob": "bob@work.net"}
+        return email_db.get(user_name, "User not found.")
+
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    agent = SequentialCodeAgent(llm=llm, tools=[get_user_email_address])
+    
+    user_prompt = "What is the email for a user named Alice? Then, can you tell me the domain name of that email address?"
+    ic.enable()
+    final_answer = agent.run(user_prompt)
+    print("\n--- FINAL AGENT ANSWER ---")
+    print(final_answer)
+    print("--------------------------")
+
+    print("\n--- DEMONSTRATING ERROR HANDLING ---")
+    agent.reset()
+    user_prompt_fail = "Please divide 100 by 0 and tell me the result."
+    final_answer_fail = agent.run(user_prompt_fail)
+    print("\n--- FINAL AGENT ANSWER (FAILURE) ---")
+    print(final_answer_fail)
+    print("------------------------------------")
