@@ -13,7 +13,7 @@ LLM Agent X is a task execution framework that leverages language models to perf
     ```
 
 2.  Install the package:
-    *   From PyPI (once published):
+    *   From PyPI:
         ```sh
         pip install llm-agent-x
         ```
