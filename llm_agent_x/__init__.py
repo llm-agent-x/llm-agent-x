@@ -7,7 +7,7 @@ from .agents.recursive_agent import (
     TaskLimit,
     TaskLimitConfig,
 )
-from .agents.sequential_agent import SequentialCodeAgent, SequentialCodeAgentOptions
+from .agents.sequential_agent import SequentialCodeAgent
 from .backend.exceptions import TaskFailedException
 import llm_agent_x.tools
 from .utils import int_to_base26
