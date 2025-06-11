@@ -7,7 +7,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from icecream import ic
 from typing import Callable, Any, Dict, List, Type
 
-from llm_agent_x.tools.exec_python import exec_python
+from llm_agent_x.tools.exec_python import exec_python, exec_python_local
 
 class CodeExecutor:
     """Safely executes Python code using the sandboxed exec_python tool."""
@@ -18,12 +18,15 @@ class CodeExecutor:
         """Executes the given code via the sandbox and returns the resulting dictionary."""
         ic("Passing code to sandboxed exec_python")
         return exec_python(code=code)
+class LocalCodeExecutor(CodeExecutor):
+    def execute(self, code, globals_dict=None, locals_dict=None):
+        return exec_python_local(code=code, globals=globals_dict, locals=locals_dict)
 
 class SequentialCodeAgent:
-    def __init__(self, llm: BaseChatModel, tools: List[Callable] = None):
+    def __init__(self, llm: BaseChatModel, tools: List[Callable] = None, code_executor = None):
         self.llm = llm
         self.tools = tools or []
-        self.executor = CodeExecutor()
+        self.executor = code_executor or CodeExecutor()
         self.llm_with_tools = self.llm.bind_tools([self.executor.tool_schema])
         self.system_prompt = self._create_system_prompt()
         self.msgs = [SystemMessage(content=self.system_prompt)]
