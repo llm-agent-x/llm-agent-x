@@ -28,6 +28,9 @@ cloudpickle = "^3.1.1"
 uvicorn = "^0.34.3"
 sentence-transformers = "^4.1.0"
 langchain-mcp-adapters = {version = "^0.1.7", python = ">=3.10,<3.14"}
+pydantic-ai = "^0.2.16"
+pydantic-ai-slim = {extras = ["openai"], version = "^0.2.16"}
+mcp = {version = ">=1.9.3", python = ">=3.10,<3.14"}
 
 [tool.poetry.scripts]
 llm-agent-x = "llm_agent_x.cli:main"

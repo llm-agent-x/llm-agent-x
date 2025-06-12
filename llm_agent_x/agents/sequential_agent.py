@@ -1,146 +1,120 @@
-import json
+import ast
 import traceback
-from pydantic import BaseModel, Field
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-from langchain_core.utils.function_calling import convert_to_openai_tool
+from pydantic import BaseModel, Field, AfterValidator
+from pydantic_ai import Agent
 from icecream import ic
-from typing import Callable, Any, Dict, List, Type
+from typing import Annotated, Any, Dict, List, Union
 
-from llm_agent_x.tools.exec_python import exec_python, exec_python_local
+# Mock implementation for self-contained example
+def exec_python_local(code: str, globals: Dict = None, locals: Dict = None) -> Dict[str, Any]:
+    from io import StringIO
+    import sys
+    if globals is None: globals = {}
+    if locals is None: locals = {}
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    redirected_stdout = sys.stdout = StringIO()
+    redirected_stderr = sys.stderr = StringIO()
+    try:
+        exec(code, globals, locals)
+    except Exception:
+        tb = traceback.format_exc()
+        redirected_stderr.write(tb)
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+    return { "stdout": redirected_stdout.getvalue(), "stderr": redirected_stderr.getvalue() }
 
-class CodeExecutor:
-    """Safely executes Python code using the sandboxed exec_python tool."""
-    def __init__(self, tools: List[Callable] = None):
-        self.tool_schema = convert_to_openai_tool(exec_python)
+# --- THE FIX: A validator that checks syntax but returns the original string ---
+def check_and_return_code(code_string: str) -> str:
+    """
+    Validates that the input string is syntactically correct Python.
+    If it is, it returns the original string.
+    If not, it raises a ValueError, which Pydantic handles.
+    """
+    try:
+        ast.parse(code_string)
+    except SyntaxError as e:
+        raise ValueError(f"Invalid Python syntax: {e}")
+    return code_string
 
-    def execute(self, code: str) -> Dict[str, Any]:
-        """Executes the given code via the sandbox and returns the resulting dictionary."""
-        ic("Passing code to sandboxed exec_python")
-        return exec_python(code=code)
-class LocalCodeExecutor(CodeExecutor):
-    def execute(self, code, globals_dict=None, locals_dict=None):
-        return exec_python_local(code=code, globals=globals_dict, locals=locals_dict)
+# --- CHANGE: Update the Pydantic model to use the new validator ---
+class Code(BaseModel):
+    """A Pydantic model for a string of Python code that is validated to be syntactically correct."""
+    code: Annotated[str, AfterValidator(check_and_return_code)] = Field(
+        description="A string containing valid Python code to be executed."
+    )
 
 class SequentialCodeAgent:
-    def __init__(self, llm: BaseChatModel, tools: List[Callable] = None, code_executor = None):
-        self.llm = llm
-        self.tools = tools or []
-        self.executor = code_executor or CodeExecutor()
-        self.llm_with_tools = self.llm.bind_tools([self.executor.tool_schema])
-        self.system_prompt = self._create_system_prompt()
-        self.msgs = [SystemMessage(content=self.system_prompt)]
+    def __init__(self, llm: str, max_turns: int = 5):
+        self.agent = Agent(
+            model=llm,
+            system_prompt=self._create_system_prompt(),
+            output_type=Union[str, Code]
+        )
+        self.namespace_globals = {}
+        self.namespace_locals = {}
+        self.max_turns = max_turns
+        self.history = []
 
-    # --- CHANGE #1: A new system prompt that correctly describes the STATELESS sandbox ---
     def _create_system_prompt(self) -> str:
-        """Generates the system prompt with correct instructions for the stateless sandbox."""
-        base_prompt = (
-            "You are a helpful AI assistant that writes and executes Python code in a secure, sandboxed environment to answer questions.\n\n"
-            "**CRITICAL INSTRUCTIONS FOR USING THE SANDBOX:**\n"
-            "1. You have one tool: `exec_python`.\n"
-            "2. The sandbox is **STATELESS**. Each call to `exec_python` is a completely new environment. Variables DO NOT persist between calls.\n"
-            "3. To perform multi-step tasks, you **MUST** carry the context from previous steps into the next code block. For example, if you retrieve a value in step 1, you must re-declare it as a variable in step 2.\n"
-            "4. To see the result of any operation, you **MUST** `print()` it. The content of `stdout` will be returned to you.\n"
-            "5. The sandbox does not have access to any functions unless you define them within the code you provide.\n\n"
-            "When you have the final answer, respond directly to the user."
+        """Generates the system prompt with correct instructions for the stateful sandbox."""
+        return (
+            "You are a helpful AI assistant that writes and executes Python code to answer user questions.\n\n"
+            "**INSTRUCTIONS:**\n"
+            "1. You can write and execute Python code to help you solve the problem.\n"
+            "2. To execute code, you must output a JSON object with a single key 'code' containing the Python code as a string. For example: `{\"code\": \"x = 10\\nprint(x * 2)\"}`.\n"
+            "3. The Python execution environment is STATEFUL. Any variables, functions, or imports you define will persist in subsequent code executions.\n"
+            "4. The output of the code execution (`stdout` and `stderr`) will be returned to you in the next turn. You MUST use the `print()` function to see the result of any operation.\n"
+            "5. When you have the final answer, or if you need to ask the user a clarifying question, respond with a plain string instead of a code JSON object."
         )
 
-        if not self.tools:
-            return base_prompt
-
-        tool_descriptions = "\n\n**HELPER FUNCTION DEFINITIONS:**\n"
-        tool_descriptions += "To use the following helper functions, you must copy their complete function definition into the code block you send to `exec_python`.\n"
-        for tool in self.tools:
-            import inspect
-            try:
-                source_code = inspect.getsource(tool)
-                tool_descriptions += f"\n```python\n{source_code}```\n"
-            except (TypeError, OSError):
-                tool_descriptions += f"# Could not retrieve source for {tool.__name__}\n"
-
-        return base_prompt + tool_descriptions
-
-    # --- CHANGE #2: A more robust formatter that cleans up output ---
-    def _format_sandbox_result(self, result: Dict[str, Any]) -> str:
-        """Formats the dictionary from the sandbox into a simple string for the LLM."""
-        if not isinstance(result, dict):
-            ic("Warning: Sandbox result was not a dictionary.", result)
-            return f"An unexpected error occurred. Tool returned: {str(result)}"
-
-        # Clean up stdout by removing empty lines and lines that are exactly 'None'
-        stdout_raw = result.get('stdout', '')
-        stdout_lines = [line for line in stdout_raw.strip().split('\n') if line.strip() and line.strip() != 'None']
-        stdout = '\n'.join(stdout_lines)
-
-        stderr = result.get('stderr', '').strip()
-
-        if stderr:
-            return f"Execution failed with an error.\nSTDERR:\n{stderr}"
-        elif stdout:
-            return f"Execution successful.\nSTDOUT:\n{stdout}"
-        else:
-            return "Execution successful. No output was produced on stdout."
-
-    def reset(self):
-        """Resets the conversation history."""
-        ic("Resetting agent state.")
-        self.msgs = [SystemMessage(content=self.system_prompt)]
+    def _execute_code_in_sandbox(self, code: str) -> Dict[str, Any]:
+        """Executes code using the stateful namespaces."""
+        ic("Passing code to exec_python_local with stateful namespace")
+        return exec_python_local(code=code, globals=self.namespace_globals, locals=self.namespace_locals)
 
     def run(self, prompt: str):
         """Runs the agent loop for a given prompt."""
-        self.msgs.append(HumanMessage(content=prompt))
-        max_turns = 10
-        for _ in range(max_turns):
-            ic(f"Invoking LLM with {len(self.msgs)} messages...")
-            response: AIMessage = self.llm_with_tools.invoke(self.msgs)
-            self.msgs.append(response)
+        current_prompt = f"Here is your task: \n\n\"{prompt}\""
+        for i in range(self.max_turns):
+            ic(f"--- Turn {i+1}/{self.max_turns} ---")
+            response = self.agent.run_sync(current_prompt, message_history=self.history)
+            self.history = response.all_messages()
+            if isinstance(response.output, Code):
+                # Now, response.output.code is guaranteed to be a string
+                code_to_run = response.output.code
+                ic(f"Executing code:\n---\n{code_to_run}\n---")
+                python_result = self._execute_code_in_sandbox(code=code_to_run)
+                ic(f"Execution result: {python_result}")
+                stdout = python_result.get('stdout', '').strip()
+                stderr = python_result.get('stderr', '').strip()
+                current_prompt = "The code execution produced the following output. Continue with your task."
+                if stdout:
+                    current_prompt += f"\n\nSTDOUT:\n```\n{stdout}\n```"
+                if stderr:
+                    current_prompt += f"\n\nSTDERR:\n```\n{stderr}\n```"
+                if not stdout and not stderr:
+                    current_prompt += "\n\nNOTE: The code ran without error and produced no output to stdout."
+            elif isinstance(response.output, str):
+                final_answer = response.output
+                ic(f"Final answer received: {final_answer}")
+                return final_answer
+            else:
+                error_message = f"Error: Unexpected response type from agent: {type(response.output)}"
+                ic(error_message)
+                return error_message
+        print("Agent reached maximum turns without providing a final answer.")
+        return None
 
-            if not response.tool_calls:
-                ic("LLM provided a final answer.")
-                return response.content
-
-            ic(f"LLM requested {len(response.tool_calls)} tool calls.")
-            for tool_call in response.tool_calls:
-                if tool_call["name"] == self.executor.tool_schema['function']['name']:
-                    code_to_execute = tool_call["args"]["code"]
-                    ic("Code to be executed in sandbox:", code_to_execute)
-                    sandbox_result = self.executor.execute(code_to_execute)
-                    ic("Raw sandbox result:", sandbox_result)
-                    formatted_result = self._format_sandbox_result(sandbox_result)
-                    ic("Formatted result for LLM:", formatted_result)
-                    self.msgs.append(ToolMessage(content=formatted_result, tool_call_id=tool_call["id"]))
-                else:
-                    error_msg = f"Error: Agent tried to call an unknown tool '{tool_call['name']}'. Only 'exec_python' is available."
-                    self.msgs.append(ToolMessage(content=error_msg, tool_call_id=tool_call["id"]))
-        
-        return "Agent stopped after reaching the maximum number of turns."
-
-# --- Example Usage (no changes needed here) ---
+# --- Example Usage ---
 if __name__ == "__main__":
-    from langchain_openai import ChatOpenAI
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
-    def get_user_email_address(user_name: str) -> str:
-        """Looks up the email address for a given user name."""
-        email_db = {"Alice": "alice@example.com", "Bob": "bob@work.net"}
-        return email_db.get(user_name, "User not found.")
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    agent = SequentialCodeAgent(llm=llm, tools=[get_user_email_address])
-    
-    user_prompt = "What is the email for a user named Alice? Then, can you tell me the domain name of that email address?"
-    ic.enable()
-    final_answer = agent.run(user_prompt)
-    print("\n--- FINAL AGENT ANSWER ---")
-    print(final_answer)
-    print("--------------------------")
-
-    print("\n--- DEMONSTRATING ERROR HANDLING ---")
-    agent.reset()
-    user_prompt_fail = "Please divide 100 by 0 and tell me the result."
-    final_answer_fail = agent.run(user_prompt_fail)
-    print("\n--- FINAL AGENT ANSWER (FAILURE) ---")
-    print(final_answer_fail)
-    print("------------------------------------")
+    try:
+        agent = SequentialCodeAgent(llm="openai:gpt-4o-mini")
+        final_result = agent.run(
+            "First, create a list of the first 5 prime numbers and assign it to a variable called `primes`. "
+            "Then, in a second step, print each of those prime numbers multiplied by 2."
+        )
+        print("\n--- AGENT'S FINAL RESPONSE ---")
+        print(final_result)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        print("Please ensure your OPENAI_API_KEY is set as an environment variable.")
