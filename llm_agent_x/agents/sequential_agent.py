@@ -11,13 +11,13 @@ from pydantic_ai import Agent
 # MCP Imports
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamablehttp_client
+from io import StringIO
+import sys
+import ast
+import astunparse
 
 # --- Asynchronous Python Executor (Unchanged) ---
 async def aexec_python_local(code: str, globals: Dict = None, locals: Dict = None) -> Dict[str, Any]:
-    from io import StringIO
-    import sys
-    import ast
-    import astunparse
 
     if globals is None: globals = {}
     if locals is None: locals = {}
@@ -246,7 +246,7 @@ async def main():
             
             # Using a more explicit prompt to reduce ambiguity for the agent.
             prompt = (
-                "send emails to agent1@criticalagents.net through agent10@criticalagents.net, in parallel using `asyncio.gather()`. i need this done fast. tell each of them to contact their manager."
+                "get the weather in tokyo, san francisco, and los angeles. use `asyncio.gather()` to run multiple tool calls in parallel. "
             )
             final_result = await agent.run(prompt)
             print("\n--- AGENT'S FINAL RESPONSE ---")
