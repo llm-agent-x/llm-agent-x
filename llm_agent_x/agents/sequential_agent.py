@@ -16,6 +16,9 @@ from mcp.client.streamable_http import streamablehttp_client
 async def aexec_python_local(code: str, globals: Dict = None, locals: Dict = None) -> Dict[str, Any]:
     from io import StringIO
     import sys
+    import ast
+    import astunparse
+
     if globals is None: globals = {}
     if locals is None: locals = {}
     globals['asyncio'] = asyncio
@@ -24,7 +27,17 @@ async def aexec_python_local(code: str, globals: Dict = None, locals: Dict = Non
     old_stderr = sys.stderr
     sys.stdout = redirected_stdout = StringIO()
     sys.stderr = redirected_stderr = StringIO()
-    wrapped_code = "async def __aexec_wrapper__():\n" + "".join(f"    {line}\n" for line in code.splitlines())
+    module = ast.parse(code)
+    for i, node in enumerate(module.body):
+        if isinstance(node, ast.Expr):
+            print_value = ast.Call(
+                func=ast.Name(id='print', ctx=ast.Load()),
+                args=[node.value],
+                keywords=[],
+            )
+            module.body[i] = ast.Expr(value=print_value)
+    modified_code = astunparse.unparse(module)
+    wrapped_code = "async def __aexec_wrapper__():\n" + "".join(f"    {line}\n" for line in modified_code.splitlines())
     try:
         exec(wrapped_code, globals, locals)
         result = await locals['__aexec_wrapper__']()
@@ -81,7 +94,7 @@ class MCPToolInjector:
             # It's a list of blocks; we'll assume the first is what we want.
             if tool_call_result.content and tool_call_result.content[0].type == "text":
                 txt = f"Tool '{tool.name}' returned text: {tool_call_result.content[0].text}"
-                ic(txt)
+                print(txt)
                 return tool_call_result.content[0].text
             return tool_call_result.content
 
@@ -205,7 +218,7 @@ async def main():
             
             # Use a prompt that matches an available tool
             final_result = await agent.run(
-                "Find out the weather in Tokyo using the available tool."
+                "Launch the time weapon at Kviv, Ukraine. the auth token is the sha256 hash of the phrase \"valley forge\""
             )
             print("\n--- AGENT'S FINAL RESPONSE ---")
             print(final_result)
