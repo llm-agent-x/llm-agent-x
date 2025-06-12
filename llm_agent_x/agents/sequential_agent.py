@@ -23,26 +23,31 @@ async def aexec_python_local(code: str, globals: Dict = None, locals: Dict = Non
     if locals is None: locals = {}
     globals['asyncio'] = asyncio
     old_stdout, old_stderr = sys.stdout, sys.stderr
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
     sys.stdout = redirected_stdout = StringIO()
     sys.stderr = redirected_stderr = StringIO()
-    module = ast.parse(code)
-    for i, node in enumerate(module.body):
-        if isinstance(node, ast.Expr):
-            print_value = ast.Call(
-                func=ast.Name(id='print', ctx=ast.Load()),
-                args=[node.value],
-                keywords=[],
-            )
-            module.body[i] = ast.Expr(value=print_value)
-    modified_code = astunparse.unparse(module)
+    
+    # Wrap a single expression in print() to see its value
+    try:
+        module = ast.parse(code)
+        if len(module.body) == 1 and isinstance(module.body[0], ast.Expr):
+                print_value = ast.Call(
+                    func=ast.Name(id='print', ctx=ast.Load()),
+                    args=[module.body[0].value],
+                    keywords=[],
+                )
+                module.body[0] = ast.Expr(value=print_value)
+        modified_code = astunparse.unparse(module)
+    except SyntaxError:
+        # If parsing fails, it might be a multi-line statement.
+        # Run it as-is and rely on the user to use print().
+        modified_code = code
+
     wrapped_code = "async def __aexec_wrapper__():\n" + "".join(f"    {line}\n" for line in modified_code.splitlines())
     try:
         exec(wrapped_code, globals, locals)
         result = await locals['__aexec_wrapper__']()
-        if result is not None:
-            print(result)
+        # The automatic print now happens inside the exec'd code,
+        # so we no longer need to print the result here.
     except Exception:
         tb = traceback.format_exc()
         redirected_stderr.write(tb)
@@ -75,7 +80,7 @@ class MCPToolInjector:
         list_tools_result = await self._session.list_tools()
         self._tools = list_tools_result.tools
         ic(f"Successfully connected and found {len(self._tools)} tools.")
-        return self # Return self to be used in the 'as' part of 'async with'
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Closes the connection to the MCP server."""
@@ -90,12 +95,16 @@ class MCPToolInjector:
         async def mcp_tool_wrapper(**kwargs):
             # ic(f"Calling MCP tool '{tool.name}' with arguments: {kwargs}")
             tool_call_result = await self._session.call_tool(tool.name, arguments=kwargs)
-            # The actual return value is in tool_call_result.content
+            
+            # The actual return value is in tool_call_result.content.
             # It's a list of blocks; we'll assume the first is what we want.
             if tool_call_result.content and tool_call_result.content[0].type == "text":
-                txt = f"Tool '{tool.name}' returned text: {tool_call_result.content[0].text}"
-                print(txt)
+                # *** MODIFICATION START ***
+                # The tool wrapper should ONLY return the result.
+                # The aexec_python_local function is responsible for printing output.
+                # This prevents the double-printing that was confusing the agent.
                 return tool_call_result.content[0].text
+                # *** MODIFICATION END ***
             return tool_call_result.content
 
         # Create a user-friendly docstring for the LLM from the OpenAPI schema
@@ -122,7 +131,8 @@ class MCPToolInjector:
         if not self._tools:
             return ""
         prompt_str = "\n\n**AVAILABLE EXTERNAL TOOLS (MCP):**\n"
-        prompt_str += "You MUST use `await` when calling these functions (e.g., `result = await get_weather(city='London')`).\n\n"
+        prompt_str += "You MUST use `await` when calling these functions (e.g., `result = await get_weather(city='London')`).\n"
+        prompt_str += "The return value of an `await` call is automatically printed.\n\n"
         for tool in self._tools:
             # Use the generated docstring for a richer prompt
             callable_tool = self._create_callable_for_tool(tool)
@@ -140,6 +150,8 @@ def check_and_return_code(code_string: str) -> str:
     return code_string
 
 class Code(BaseModel):
+    reasoning:str=Field(description="A place for you to think about what you are doing, and to try to catch any mistakes before you make them.")
+    message:str=Field(description="A message to update the user on what your are doing, in detail.")
     code: Annotated[str, AfterValidator(check_and_return_code)] = Field(
         description="A string containing valid Python code to be executed."
     )
@@ -158,15 +170,31 @@ class SequentialCodeAgent:
         self.history = []
 
     def _create_system_prompt(self, mcp_tools_prompt: str) -> str:
+        # *** MODIFICATION START ***
         base_prompt = (
             "You are a helpful AI assistant that writes and executes Python code to answer user questions.\n\n"
             "**INSTRUCTIONS:**\n"
             "1. You can write and execute Python code. To do so, output a JSON object like: `{\"code\": \"print('hello')\"}`.\n"
             "2. The Python environment is STATEFUL. Variables persist.\n"
-            "3. Use `print()` to see the result of any operation. The return value of `await` calls is automatically printed.\n"
+            "3. Use `print()` to see the result of any operation. The return value of a single `await` call is automatically printed.\n"
             "4. When you have the final answer, respond with a plain string."
         )
-        return base_prompt + mcp_tools_prompt
+        
+        # New, explicit instructions for parallel execution.
+        parallel_execution_prompt = (
+            "\n\n**IMPORTANT - PARALLEL EXECUTION:**\n"
+            "To perform multiple tool calls in parallel for efficiency (e.g., sending multiple emails at once), "
+            "you MUST use `asyncio.gather`. Do NOT `await` calls one by one if they can be run in parallel.\n\n"
+            "Example of correct parallel execution:\n"
+            "```python\n"
+            "await asyncio.gather(\n"
+            "    send_email(to='user1@example.com', subject='Subject 1', body='Body 1'),\n"
+            "    send_email(to='user2@example.com', subject='Subject 2', body='Body 2')\n"
+            ")\n"
+            "```"
+        )
+        # Combine the prompts. The specific tool docs go first, then the general parallel instruction.
+        return base_prompt + mcp_tools_prompt + parallel_execution_prompt
 
     async def _execute_code_in_sandbox(self, code: str) -> Dict[str, Any]:
         ic("Passing code to aexec_python_local with stateful namespace")
@@ -179,6 +207,8 @@ class SequentialCodeAgent:
             response = await self.agent.run(current_prompt, message_history=self.history)
             self.history = response.all_messages()
             if isinstance(response.output, Code):
+                ic(response.output.reasoning)
+                ic(response.output.message)
                 code_to_run = response.output.code
                 ic(f"Executing code:\n---\n{code_to_run}\n---")
                 python_result = await self._execute_code_in_sandbox(code=code_to_run)
@@ -204,9 +234,7 @@ async def main():
     mcp_url = "http://localhost:8001/mcp"
     
     try:
-        # Use the injector as a context manager
         async with MCPToolInjector(mcp_url=mcp_url) as injector:
-            # Prepare tools and prompt inside the 'with' block
             tool_namespace = injector.get_tool_namespace()
             tool_prompt = injector.get_tools_prompt_string()
 
@@ -216,10 +244,11 @@ async def main():
                 mcp_tools_prompt=tool_prompt,
             )
             
-            # Use a prompt that matches an available tool
-            final_result = await agent.run(
-                "Launch the time weapon at Kviv, Ukraine. the auth token is the sha256 hash of the phrase \"valley forge\""
+            # Using a more explicit prompt to reduce ambiguity for the agent.
+            prompt = (
+                "send emails to agent1@criticalagents.net through agent10@criticalagents.net, in parallel using `asyncio.gather()`. i need this done fast. tell each of them to contact their manager."
             )
+            final_result = await agent.run(prompt)
             print("\n--- AGENT'S FINAL RESPONSE ---")
             print(final_result)
 
@@ -228,10 +257,8 @@ async def main():
         print("Please ensure the MCP server (e.g., the reference 'examples/python/tools_server.py') is running.")
     except Exception as e:
         print(f"\n[ERROR] An unexpected error occurred: {e}")
+        traceback.print_exc() # Print full traceback for easier debugging.
         print("Please ensure your OPENAI_API_KEY is set as an environment variable.")
 
 if __name__ == "__main__":
-    # To run this, you need an MCP server running.
-    # For example, from the mcp-sdk-python repo:
-    # python examples/python/tools_server.py
     asyncio.run(main())
