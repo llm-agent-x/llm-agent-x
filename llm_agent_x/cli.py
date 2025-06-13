@@ -87,24 +87,24 @@ def main():
         "brave_web_search": brave_web_search,
     }
 
-    mcp_config = args.mcp_config
-    if mcp_config:
-        try:
-            with open(mcp_config, "r") as f:
-                config = json.load(f)
-            mcp_client = MultiServerMCPClient(config)
-            mcp_tools = asyncio.run(mcp_client.get_tools())
-            available_tools.extend(mcp_tools)
+    # mcp_config = args.mcp_config
+    # if mcp_config:
+    #     try:
+    #         # with open(mcp_config, "r") as f:
+    #             # config = json.load(f)
+    #         # mcp_client = MultiServerMCPClient(config)
+    #         # mcp_tools = asyncio.run(mcp_client.get_tools())
+    #         # available_tools.extend(mcp_tools)
 
-            # tools_dict_for_agent.update(mcp_client.get_tools_dict())
-            # mcp_client.get_tools_dict() doesn't exist, so we must construct a dictionary based on each tool's __name__ and the tool itself
-            for tool in mcp_tools:
-                ic(tool.name)
-                ic(type(tool.name))
-                if tool.name not in tools_dict_for_agent:
-                    tools_dict_for_agent[tool.name] = tool
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
+    #         # tools_dict_for_agent.update(mcp_client.get_tools_dict())
+    #         # mcp_client.get_tools_dict() doesn't exist, so we must construct a dictionary based on each tool's __name__ and the tool itself
+    #         # for tool in mcp_tools:
+    #         #     ic(tool.name)
+    #         #     ic(type(tool.name))
+    #         #     if tool.name not in tools_dict_for_agent:
+    #         #         tools_dict_for_agent[tool.name] = tool
+    #     except FileNotFoundError:
+    #         raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
     ic(tools_dict_for_agent.values())
 
     if args.enable_python_execution:
@@ -138,8 +138,8 @@ def main():
                 pre_task_executed=pre_tasks_executed,
                 on_task_executed=on_task_executed,
                 on_tool_call_executed=on_tool_call_executed,
-                llm=(model_tree),
-                tools=[],
+                llm="openai:gpt-4o-mini",
+                tools=available_tools,
                 allow_search=True,
                 allow_tools=True,
                 tools_dict=tools_dict_for_agent,
@@ -155,9 +155,9 @@ def main():
         try:
             if live is not None:
                 with live:  # Execute the agent
-                    response = agent.run()
+                    response = asyncio.run(agent.run())
             else:
-                response = agent.run()
+                response = asyncio.run(agent.run())
 
         except TaskFailedException as e:
             console.print_exception()  # Output exception to console

@@ -21,6 +21,8 @@ def get_page_text_content(element):
 
 
 async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
+    print("Running Brave Web Search...")
+    print("Query:", query)
     # Setup Redis
     try:
         r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
