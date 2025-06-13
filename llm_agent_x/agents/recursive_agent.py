@@ -6,7 +6,7 @@ from typing import Any, Callable, Literal, Optional, List, Dict, Union
 
 # --- Pydantic-AI Imports ---
 from pydantic_ai import Agent
-from pydantic_ai.messages import ToolCallPart as ToolCall   
+from pydantic_ai.messages import ToolCallPart as ToolCall
 
 # --- Original Imports (some will be replaced) ---
 from llm_agent_x.backend.dot_tree import DotTree
@@ -318,7 +318,7 @@ class RecursiveAgent:
                     if non_sibling_deps_met and all(dep_uuid in completed_tasks for dep_uuid in dependencies): runnable_agents.append(agent)
             if not runnable_agents and pending_agents:
                 error_msg = f"Circular or unresolved dependency. Pending: {[a.task for a in pending_agents.values()]}"
-                self.logger.error(error_msg); 
+                self.logger.error(error_msg);
                 if span: span.add_event("Dependency Error", {"details": error_msg})
                 raise TaskFailedException(error_msg)
             for agent in runnable_agents:
@@ -422,7 +422,7 @@ class RecursiveAgent:
                 split_task_result.subtasks = split_task_result.subtasks[:max_subtasks]
                 split_task_result.needs_subtasks = bool(split_task_result.subtasks)
             return split_task_result
-            
+
     async def _verify_result_internal(self, subtask_results_map: Optional[Dict[str, str]] = None) -> bool:
         agent_span = self.current_span; parent_context = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
         with self.tracer.start_as_current_span("Verify Result Operation", context=parent_context) as verify_span:
@@ -460,11 +460,11 @@ class RecursiveAgent:
                 self.status = "failed"
                 fix_span.add_event("Fix Attempt Skipped: Max attempts reached.", {"max_attempts": self.max_fix_attempts})
                 raise TaskFailedException(f"Fix attempt for '{self.task}' failed: max attempts ({self.max_fix_attempts}) reached.")
-            
+
             self.fix_attempt_count += 1
             original_task_str = self.task
             failed_result_str = str(self.result if self.result is not None else "No result was produced.")
-            
+
             fix_instructions_parts = [
                 f"The original task was: '{original_task_str}'.",
                 f"A previous attempt resulted in: '{failed_result_str[:700]}...'. This was deemed unsatisfactory.",
@@ -473,16 +473,39 @@ class RecursiveAgent:
                 fix_instructions_parts.append("The failed attempt may have involved these subtasks:")
                 for sub_task, sub_result in failed_subtask_results_map.items():
                     fix_instructions_parts.append(f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}...")
-            
+
             context_for_fix = self._build_context_information()
             formatted_context_for_fix = "\n".join(self._format_history_parts(context_for_fix, "fixing a failed task"))
             if formatted_context_for_fix: fix_instructions_parts.append(f"\nRelevant history:\n{formatted_context_for_fix}")
             if self.u_inst: fix_instructions_parts.append(f"\nOriginal user instructions: {self.u_inst}")
-            
+
             fix_instructions_parts.append(f"\nYour objective is to FIX this failure. Provide a corrected and complete solution to the original task: '{original_task_str}'.")
             full_fix_instructions = "\n".join(fix_instructions_parts)
 
             fixer_options = self.options.model_copy()
+            
+            # --- FIX STARTS HERE ---
+            # The agent is at a layer that might prevent subtask creation due to depth limits.
+            # We will extend the depth limit specifically for this fixer agent to give it a chance
+            # to break down the problem again.
+            current_limits = fixer_options.task_limits.limits
+            if self.current_layer >= len(current_limits):
+                # We are at or beyond the max depth. The fixer needs its own layer defined
+                # to be able to create subtasks.
+                # Use the last available limit as a template, or a default of 2 if none exist.
+                new_subtask_limit = current_limits[-1] if current_limits else 2
+                
+                # Extend the list to cover up to and including the current layer.
+                num_layers_to_add = (self.current_layer - len(current_limits)) + 1
+                current_limits.extend([new_subtask_limit] * num_layers_to_add)
+                
+                if fix_span:
+                    fix_span.add_event(
+                        "Extended task depth limit for fix agent.",
+                        {"new_limits": str(current_limits)}
+                    )
+            # --- FIX ENDS HERE ---
+
             if self.max_fix_attempts < 1:
                 raise TaskFailedException(f"Fix attempt for '{self.task}' failed: max attempts ({self.max_fix_attempts}) reached.")
             fixer_agent = RecursiveAgent(
@@ -523,14 +546,14 @@ class RecursiveAgent:
                 for i, (task_item, result_item) in enumerate(zip(tasks, subtask_results)):
                     status_update_parts.append(f"Sub-action {i+1}: {task_item}"); status_update_parts.append(f"  Result: {str(result_item)}")
             return "\n".join(status_update_parts)
-        
+
         agent_span = self.current_span
         parent_context = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
         with self.tracer.start_as_current_span("Summarize Subtasks Operation", context=parent_context) as summary_span:
             if not subtask_results: return "No subtask results to summarize."
             documents_to_merge = [f"SUBTASK QUESTION: {q}\n\nSUBTASK ANSWER:\n{a}" for q, a in zip(tasks, subtask_results) if a]
             if not documents_to_merge: return "All subtasks yielded empty results."
-            
+
             llm_for_merge_str = self.llm
             llm_for_merge = self.llm
 
