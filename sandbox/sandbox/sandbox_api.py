@@ -239,9 +239,12 @@ async def execute_code(
         sys.stdout = old_stdout
         sys.stderr = old_stderr
 
+
 @app.post("/install")
 async def install_packages(
-    packages: List[str], index_url: str = None, credentials: HTTPAuthorizationCredentials = Depends()
+    packages: List[str],
+    index_url: str = None,
+    credentials: HTTPAuthorizationCredentials = Depends(),
 ):
     """
     Install packages to the sandbox environment.

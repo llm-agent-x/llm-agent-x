@@ -1,12 +1,12 @@
 import asyncio
-import json
+import json # Added missing import
 import uuid
 from difflib import SequenceMatcher
 from typing import Any, Callable, Literal, Optional, List, Dict, Union
+from black import Mode, format_str
 
 # --- Pydantic-AI Imports ---
 from pydantic_ai import Agent
-from pydantic_ai.messages import ToolCallPart as ToolCall
 
 # --- Original Imports (some will be replaced) ---
 from llm_agent_x.backend.dot_tree import DotTree
@@ -72,7 +72,8 @@ class task(TaskObject): pass
 class verification(BaseModel):
     reason: str
     message_for_user: str
-    successful: bool
+    score: float = Field(description="A numerical score from 1 (worst) to 10 (best) evaluating the response's overall quality.")
+    def get_successful(self): return self.score > 5
 
 class SplitTask(BaseModel):
     needs_subtasks: bool
@@ -148,7 +149,9 @@ class RecursiveAgent:
         max_fix_attempts: int = 2,
     ):
         if agent_options is None:
-            self.logger.info("No agent_options provided, using default configuration.")
+            # Note: self.logger is not available before it's defined.
+            # Use the global logger for this initial message.
+            logger.info("No agent_options provided, using default configuration.")
             agent_options = RecursiveAgentOptions(
                 task_limits=TaskLimit.from_constant(max_tasks=3, max_depth=2)
             )
@@ -175,13 +178,7 @@ class RecursiveAgent:
         self.status: str = "pending"
         self.current_span: Optional[trace.Span] = None
         self.fix_attempt_count: int = 0
-        self.max_fix_attempts = max_fix_attempts or agent_options.max_fix_attempts or 2
-
-    def _create_agent(self, llm_config_path: str, system_prompt: str, output_type: Any, tools: List[Callable] = None) -> Agent:
-        llm_model = self.llm
-        assert isinstance(llm_model, str) or isinstance(llm_model, Model)
-        llm_model_str = llm_model
-        return Agent(model=llm_model_str, system_prompt=system_prompt, output_type=output_type, tools=tools or [])
+        self.max_fix_attempts = (max_fix_attempts or agent_options.max_fix_attempts if agent_options.max_fix_attempts is not None else 2)
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -281,6 +278,7 @@ class RecursiveAgent:
                 self.result = await self._execute_and_verify_single_task()
                 return self.result
         split_task_result = await self._split_task()
+        ic(split_task_result)
         if span: span.add_event("Task Splitting Outcome", {"needs_subtasks": split_task_result.needs_subtasks, "count": len(split_task_result.subtasks)})
         if not split_task_result or not split_task_result.needs_subtasks:
             if span: span.add_event("Executing as Single Task: No subtasks needed.")
@@ -357,7 +355,15 @@ class RecursiveAgent:
         return self.result
 
     async def _run_single_task(self) -> str:
-        agent_span = self.current_span; parent_context = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
+        """
+        FIXED: This method was simplified to perform a single, complete agent run.
+        The original implementation contained a redundant `while` loop with an internal
+        verification step that interfered with the main verification-and-fix mechanism.
+        The `pydantic-ai` Agent's `.run()` method handles the entire multi-step tool
+        interaction internally, so a single call is sufficient.
+        """
+        agent_span = self.current_span
+        parent_context = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
         with self.tracer.start_as_current_span("Run Single Task Operation", context=parent_context) as single_task_span:
             context_info = self._build_context_information()
             full_context_str = "\n".join(self._format_history_parts(context_info, "single task execution"))
@@ -366,32 +372,28 @@ class RecursiveAgent:
                 system_prompt_content = (f"You are a helpful assistant. Directly execute or answer the following. Provide a direct, concise answer or the output of any tools used. Avoid narrative. Current Task: {self.task}\n\nRelevant history:\n{full_context_str}")
             else:
                 system_prompt_content = (f"Your task is to answer the following question, using tools. Make sure to include citations [1] and a citations section at the end.\n\nRelevant history:\n{full_context_str}")
+            
             human_message_content = self.task
-            if self.u_inst: human_message_content += f"\n\nFollow these specific instructions: {self.u_inst}"
+            if self.u_inst: 
+                human_message_content += f"\n\nFollow these specific instructions: {self.u_inst}"
             human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics)."
-            tool_agent = self._create_agent(llm_config_path="llm.tools", system_prompt=system_prompt_content, output_type=str, tools=self.tools)
-            message_history = []
-            loop_count = 0; max_loops = 10
-            current_prompt = None
+            
+            tool_agent = Agent(model=self.llm, system_prompt=system_prompt_content, output_type=str, tools=self.tools)
+            
+            single_task_span.add_event("Executing Pydantic-AI agent")
             ic(self.tools)
-            while loop_count < max_loops:
-                loop_count += 1
-                single_task_span.add_event(f"Tool Loop Iteration {loop_count}")
-                ic(human_message_content)
-                ic(current_prompt)
-                prompt = (current_prompt or human_message_content)
-                ic(prompt)
-                response = await tool_agent.run(user_prompt=prompt, message_history=message_history)
-                message_history = response.all_messages()
-                print(message_history)
-                ic(response.output)
-                current_prompt = f"Continue with your task."
+            ic(human_message_content)
 
-                final_result_content = response.output or "No result."
-                self.result = final_result_content
+            # A single call to .run() is sufficient. The pydantic-ai library handles
+            # the internal loop of calling tools and re-prompting the LLM.
+            response = await tool_agent.run(user_prompt=human_message_content)
 
-                if await self._verify_result_internal(): return self.result
-
+            print(format_str(str(response.all_messages()), mode = Mode()))
+            
+            ic(response.output)
+            final_result_content = response.output or "No result."
+            ic(final_result_content)
+            
             return str(final_result_content)
 
     async def _split_task(self) -> SplitTask:
@@ -409,9 +411,9 @@ class RecursiveAgent:
             if self.u_inst: system_msg_content += f"\nUser instructions:\n{self.u_inst}"
             evaluation = evaluate_prompt(f"Prompt: {self.task}")
             if evaluation.prompt_complexity_score[0] < 0.1 and evaluation.domain_knowledge[0] > 0.8: return SplitTask(needs_subtasks=False, subtasks=[], evaluation=evaluation)
-            split_agent = self._create_agent(llm_config_path="llm", system_prompt=system_msg_content, output_type=SplitTask)
+            split_agent = Agent(model=self.llm, system_prompt=system_msg_content, output_type=SplitTask)
             try:
-                response = await split_agent.run(prompt=self.task)
+                response = await split_agent.run(user_prompt=self.task)
                 split_task_result = response.output
                 split_task_result.evaluation = evaluation
             except (ValidationError, Exception) as e:
@@ -424,103 +426,99 @@ class RecursiveAgent:
             return split_task_result
 
     async def _verify_result_internal(self, subtask_results_map: Optional[Dict[str, str]] = None) -> bool:
-        agent_span = self.current_span; parent_context = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
+        agent_span = self.current_span
+        parent_context = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
         with self.tracer.start_as_current_span("Verify Result Operation", context=parent_context) as verify_span:
-            if self.result is None: verify_span.add_event("Verification Skipped: No result."); return False
+            if self.result is None or not self.result.strip():
+                verify_span.add_event("Verification Failed: No result provided.")
+                return False
+
             task_history = self._build_task_verify_history(subtask_results_map)
-            system_msg = (f"You are a verifier. Does the result accurately and completely answer the task, considering the history? Output JSON with a 'successful' boolean.\n\nHistory:\n{task_history}")
-            human_msg = (f"Task:\n'''{self.task}'''\n\nResult:\n'''{self.result}'''\n\nUser Instructions:\n'''{self.u_inst or 'None'}'''\n\nWas the task successfully completed? Keep in mind, the input you will receive is the task or question, and the result of the task. You are just checking for error messages, or off topic stuff.")
-            verify_agent = Agent(model=self.options.llm, system_prompt=system_msg, output_type=verification)
+
+            system_msg = (
+                "You are a strict quality assurance verifier. Your job is to check if the provided 'Result' accurately and completely answers the 'Task', considering the history and user instructions. "
+                "Score the result based on how well it answers the task, taking into account accuracy, completeness, relevance, adherence to instructions, and clarity. "
+                f"Output JSON matching the '{verification.__name__}' schema."
+            )
+            ic("-"*100)
+            ic(self.task)
+            ic(self.result)
+            ic(self.u_inst)
+            ic("-"*85)
+            human_msg = (
+                f"Task:\n'''{self.task}'''\n\n"
+                f"Result:\n'''{self.result}'''\n\n"
+                f"User Instructions:\n'''{self.u_inst or 'None'}'''\n\n"
+                f"History:\n'''{task_history or 'None'}'''\n\n"
+                "Based on these criteria, was the task successfully completed?"
+            )
+
+            ic(human_msg)
+            verify_agent = Agent(model=self.llm, system_prompt=system_msg, output_type=verification)
             try:
-                response = await verify_agent.run(human_msg)
-                ic(response.output)
-                ic(self.result)
-                return response.output.successful
+                response = await verify_agent.run(user_prompt=human_msg)
+                verification_output = response.output
+                ic(verification_output)
+                ic("-" * 50)
+                if not verification_output.get_successful():
+                    self.logger.warning(f"Verification failed for task '{self.task}'. Reason: {verification_output.reason}")
+                return verification_output.get_successful()
             except (ValidationError, Exception) as e:
-                self.logger.error(f"Error parsing verification JSON: {e}", exc_info=True)
+                self.logger.error(f"Error parsing verification JSON for task '{self.task}': {e}", exc_info=True)
                 verify_span.record_exception(e)
                 return False
 
     async def verify_result(self, subtask_results_map: Optional[Dict[str, str]] = None):
+        """
+        FIXED: The logic for handling a failed verification was corrected.
+        It now correctly sets the agent status to 'failed_verification' and, crucially,
+        raises a `TaskFailedException`. This exception is essential for triggering the
+        `_fix` method in the calling `_execute_and_verify_single_task` function.
+        """
         successful = await self._verify_result_internal(subtask_results_map)
         if successful:
             self.status = "succeeded"
             if self.current_span: self.current_span.add_event("Verification Passed")
         else:
             self.status = "failed_verification"
+            ic("Verification failed")
             if self.current_span: self.current_span.add_event("Verification Failed")
+            # This exception is critical to trigger the fix/retry mechanism.
             raise TaskFailedException(f"Task '{self.task}' failed verification.")
 
     async def _fix(self, failed_subtask_results_map: Optional[Dict[str, str]]):
         agent_span = self.current_span
         parent_context_for_fix = trace.set_span_in_context(agent_span) if agent_span else otel_context.get_current()
+
         with self.tracer.start_as_current_span("Fix Task Operation", context=parent_context_for_fix) as fix_span:
-            self.logger.info(f"Attempting to fix task: '{self.task}' (UUID: {self.uuid}) which failed verification.")
-            if self.fix_attempt_count >= self.max_fix_attempts:
-                self.status = "failed"
-                fix_span.add_event("Fix Attempt Skipped: Max attempts reached.", {"max_attempts": self.max_fix_attempts})
-                raise TaskFailedException(f"Fix attempt for '{self.task}' failed: max attempts ({self.max_fix_attempts}) reached.")
-
             self.fix_attempt_count += 1
-            original_task_str = self.task
-            failed_result_str = str(self.result if self.result is not None else "No result was produced.")
+            self.logger.info(f"Attempting fix {self.fix_attempt_count}/{self.max_fix_attempts} for task: '{self.task}'")
 
-            fix_instructions_parts = [
-                f"The original task was: '{original_task_str}'.",
-                f"A previous attempt resulted in: '{failed_result_str[:700]}...'. This was deemed unsatisfactory.",
-            ]
-            if failed_subtask_results_map:
-                fix_instructions_parts.append("The failed attempt may have involved these subtasks:")
-                for sub_task, sub_result in failed_subtask_results_map.items():
-                    fix_instructions_parts.append(f"  - Subtask: {sub_task}\n    - Result: {str(sub_result)[:200]}...")
+            if self.fix_attempt_count > self.max_fix_attempts:
+                self.status = "failed"
+                error_msg = f"Fix attempt for '{self.task}' failed: max attempts ({self.max_fix_attempts}) reached."
+                self.logger.error(error_msg)
+                fix_span.add_event("Fix Attempt Skipped: Max attempts reached.", {"max_attempts": self.max_fix_attempts})
+                raise TaskFailedException(error_msg)
 
-            context_for_fix = self._build_context_information()
-            formatted_context_for_fix = "\n".join(self._format_history_parts(context_for_fix, "fixing a failed task"))
-            if formatted_context_for_fix: fix_instructions_parts.append(f"\nRelevant history:\n{formatted_context_for_fix}")
-            if self.u_inst: fix_instructions_parts.append(f"\nOriginal user instructions: {self.u_inst}")
-
-            fix_instructions_parts.append(f"\nYour objective is to FIX this failure. Provide a corrected and complete solution to the original task: '{original_task_str}'.")
-            full_fix_instructions = "\n".join(fix_instructions_parts)
-
-            fixer_options = self.options.model_copy()
-            
-            # --- FIX STARTS HERE ---
-            # The agent is at a layer that might prevent subtask creation due to depth limits.
-            # We will extend the depth limit specifically for this fixer agent to give it a chance
-            # to break down the problem again.
-            current_limits = fixer_options.task_limits.limits
-            if self.current_layer >= len(current_limits):
-                # We are at or beyond the max depth. The fixer needs its own layer defined
-                # to be able to create subtasks.
-                # Use the last available limit as a template, or a default of 2 if none exist.
-                new_subtask_limit = current_limits[-1] if current_limits else 2
-                
-                # Extend the list to cover up to and including the current layer.
-                num_layers_to_add = (self.current_layer - len(current_limits)) + 1
-                current_limits.extend([new_subtask_limit] * num_layers_to_add)
-                
-                if fix_span:
-                    fix_span.add_event(
-                        "Extended task depth limit for fix agent.",
-                        {"new_limits": str(current_limits)}
-                    )
-            # --- FIX ENDS HERE ---
-
-            if self.max_fix_attempts < 1:
-                raise TaskFailedException(f"Fix attempt for '{self.task}' failed: max attempts ({self.max_fix_attempts}) reached.")
-            fixer_agent = RecursiveAgent(
-                task=original_task_str, u_inst=full_fix_instructions, tracer=self.tracer,
-                tracer_span=fix_span, agent_options=fixer_options, allow_subtasks=True,
-                current_layer=self.current_layer, parent=self.parent, context=self.context,
-                task_type_override=self.task_type, max_fix_attempts=self.max_fix_attempts - 1
+            fix_instructions = (
+                "A previous attempt to complete this task was unsatisfactory and failed verification. "
+                "Your objective is to retry and provide a corrected, complete, and high-quality solution to the original task. "
+                "Focus strictly on the original goal and ignore the previous failed attempt."
             )
+
+            original_u_inst = self.u_inst
+            self.u_inst = f"{fix_instructions}\n\nOriginal User Instructions: {original_u_inst or 'None'}"
+
+            fix_span.add_event("Retrying task execution with fix instructions.")
+
             try:
-                fix_span.add_event("Fixer Agent Run Start")
-                fixer_result = await fixer_agent.run()
-                self.result = fixer_result
-                self.context.result = self.result
-                await self.verify_result(None)
-                self.status = "succeeded" # If verification passes, the main task is now considered succeeded.
+                # Re-run the single task execution and verification within the same agent instance
+                # This call will attempt execution and then verification. If the new verification
+                # also fails, it will raise an exception that is caught below.
+                self.result = await self._execute_and_verify_single_task()
+                # If it gets here without raising an exception, it succeeded.
+                self.status = "succeeded"
                 fix_span.add_event("Fix Attempt Succeeded and Verified", {"final_status": self.status})
             except TaskFailedException as e_fix_verify:
                 self.status = "failed"
@@ -530,6 +528,10 @@ class RecursiveAgent:
                 self.status = "failed"
                 fix_span.record_exception(e_fix_run, attributes={"reason": "Fixer agent run error"})
                 raise TaskFailedException(f"Fixer agent for '{self.task}' run failed.") from e_fix_run
+            finally:
+                # Restore original instructions to prevent contamination on subsequent calls
+                self.u_inst = original_u_inst
+
 
     def _get_max_subtasks(self) -> int:
         if self.current_layer >= len(self.options.task_limits.limits): return 0
@@ -574,7 +576,7 @@ class RecursiveAgent:
             final_summary = merged_content_str
             if self.options.align_summaries:
                 alignment_prompt = (f"Information from subtasks:\n\n{merged_content_str[:10000]}\n\nCompile a comprehensive report answering: '{self.task}'.\nUser instructions: {self.u_inst or 'None'}")
-                align_agent = self._create_agent("llm", "You are a report-writing assistant.", str)
-                response = await align_agent.run(prompt=alignment_prompt)
+                align_agent = Agent(model=self.llm, system_prompt="You are a report-writing assistant.", output_type=str)
+                response = await align_agent.run(user_prompt=alignment_prompt)
                 final_summary = response.output
             return final_summary

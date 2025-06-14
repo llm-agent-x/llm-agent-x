@@ -24,7 +24,10 @@ parser.add_argument(
     help="The maximum number of layers (deprecated, use task_limit).",
 )
 parser.add_argument(
-    "--output", type=str, default=None, help="The output file path"
+    "--output",
+    type=str,
+    default=None,
+    help="The output file path"
 )
 parser.add_argument(
     "--model",
