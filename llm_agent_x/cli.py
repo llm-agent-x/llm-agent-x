@@ -44,7 +44,7 @@ from llm_agent_x.tools.brave_web_search import brave_web_search
 
 from llm_agent_x.cli_args_parser import parser
 from llm_agent_x.tools.exec_python import exec_python
-
+from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
 
 nltk.download("punkt_tab", force=False)
 
@@ -87,24 +87,32 @@ def main():
         "brave_web_search": brave_web_search,
     }
 
-    # mcp_config = args.mcp_config
-    # if mcp_config:
-    #     try:
-    #         # with open(mcp_config, "r") as f:
-    #             # config = json.load(f)
-    #         # mcp_client = MultiServerMCPClient(config)
-    #         # mcp_tools = asyncio.run(mcp_client.get_tools())
-    #         # available_tools.extend(mcp_tools)
+    mcp_config = args.mcp_config
+    mcp_servers = []
+    if mcp_config:
+        try:
+            with open(mcp_config, "r") as f:
+                config = json.load(f)
+            ic(config)
+            
+            assert type(config) == dict
+            for key, value in config.items():
+                mcp_client = None
+                if value.get("transport") == "streamable_http":
+                    mcp_client = MCPServerStreamableHTTP(
+                        url=value.get("url"),
+                    )
+                if value.get("transport") == "stdio":
+                    mcp_client = MCPServerStdio(
+                        command=value.get("command"),
+                        args=value.get("args"),
+                    )
+                assert mcp_client is not None
+                mcp_servers.append(mcp_client)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
 
-    #         # tools_dict_for_agent.update(mcp_client.get_tools_dict())
-    #         # mcp_client.get_tools_dict() doesn't exist, so we must construct a dictionary based on each tool's __name__ and the tool itself
-    #         # for tool in mcp_tools:
-    #         #     ic(tool.name)
-    #         #     ic(type(tool.name))
-    #         #     if tool.name not in tools_dict_for_agent:
-    #         #         tools_dict_for_agent[tool.name] = tool
-    #     except FileNotFoundError:
-    #         raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
+
     ic(tools_dict_for_agent.values())
 
     if args.enable_python_execution:
@@ -127,6 +135,7 @@ def main():
         live = None  # Clear live display manager after use
 
     with tracer.start_as_current_span("agent run") as span:
+        ic("Running agent...")
         agent = RecursiveAgent(
             task=args.task,
             task_type_override=args.task_type,
@@ -140,6 +149,7 @@ def main():
                 on_tool_call_executed=on_tool_call_executed,
                 llm="openai:gpt-4o-mini",
                 tools=available_tools,
+                mcp_servers=mcp_servers,
                 allow_search=True,
                 allow_tools=True,
                 tools_dict=tools_dict_for_agent,
@@ -186,4 +196,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print("Starting agent...")
     main()

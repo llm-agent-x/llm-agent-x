@@ -20,6 +20,7 @@ import logging
 import tiktoken
 from llm_agent_x.tools.summarize import summarize
 from pydantic_ai.models import Model
+from pydantic_ai.mcp import MCPServer
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class RecursiveAgentOptions(BaseModel):
     task_tree: list[Any] = []
     llm: Any = None
     tools: list = []
+    mcp_servers: List[MCPServer]
     allow_search: bool = True
     allow_tools: bool = False
     tools_dict: dict = {}
@@ -378,7 +380,7 @@ class RecursiveAgent:
                 human_message_content += f"\n\nFollow these specific instructions: {self.u_inst}"
             human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics)."
             
-            tool_agent = Agent(model=self.llm, system_prompt=system_prompt_content, output_type=str, tools=self.tools)
+            tool_agent = Agent(model=self.llm, system_prompt=system_prompt_content, output_type=str, tools=self.tools, mcp_servers=self.options.mcp_servers)
             
             single_task_span.add_event("Executing Pydantic-AI agent")
             ic(self.tools)
@@ -386,7 +388,8 @@ class RecursiveAgent:
 
             # A single call to .run() is sufficient. The pydantic-ai library handles
             # the internal loop of calling tools and re-prompting the LLM.
-            response = await tool_agent.run(user_prompt=human_message_content)
+            async with tool_agent.run_mcp_servers():
+                response = await tool_agent.run(user_prompt=human_message_content)
 
             print(format_str(str(response.all_messages()), mode = Mode()))
             
