@@ -27,6 +27,7 @@ async def aexec_python_local(
     if locals is None:
         locals = {}
     globals["asyncio"] = asyncio
+    globals["__file__"] = __file__
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout = redirected_stdout = StringIO()
     sys.stderr = redirected_stderr = StringIO()
@@ -42,6 +43,7 @@ async def aexec_python_local(
             )
             module.body[0] = ast.Expr(value=print_value)
         modified_code = astunparse.unparse(module)
+        modified_code = f"{modified_code}\nglobals().update(locals())"
     except SyntaxError:
         # If parsing fails, it might be a multi-line statement.
         # Run it as-is and rely on the user to use print().
@@ -50,15 +52,17 @@ async def aexec_python_local(
     wrapped_code = "async def __aexec_wrapper__():\n" + "".join(
         f"    {line}\n" for line in modified_code.splitlines()
     )
+    exec_namespace: Dict[str, Any] = {}
     try:
-        exec(wrapped_code, globals, locals)
-        result = await locals["__aexec_wrapper__"]()
+        exec(wrapped_code, globals, exec_namespace)
+        result = await exec_namespace["__aexec_wrapper__"]()
         # The automatic print now happens inside the exec'd code,
         # so we no longer need to print the result here.
     except Exception:
         tb = traceback.format_exc()
         redirected_stderr.write(tb)
     finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
         sys.stdout, sys.stderr = old_stdout, old_stderr
     return {
         "stdout": redirected_stdout.getvalue(),
@@ -176,9 +180,6 @@ class Code(BaseModel):
     reasoning: str = Field(
         description="A place for you to think about what you are doing, and to try to catch any mistakes before you make them."
     )
-    message: str = Field(
-        description="A message to update the user on what your are doing, in detail."
-    )
     code: Annotated[str, AfterValidator(check_and_return_code)] = Field(
         description="A string containing valid Python code to be executed."
     )
@@ -195,23 +196,34 @@ class SequentialCodeAgent:
     ):
         self.agent = Agent(
             model=llm,
-            system_prompt=self._create_system_prompt(mcp_tools_prompt),
+            system_prompt=self._create_system_prompt(mcp_tools_prompt, pex=False),
             output_type=Union[str, Code],
         )
+
+        self.final_answer_agent = Agent(
+            model=llm,
+            system_prompt=self._create_system_prompt(mcp_tools_prompt, pex=False),
+            output_type=str,
+        )
         self.namespace_globals = mcp_tools_namespace or {}
+        self.namespace_globals["__file__"] = __file__
         self.namespace_locals = {}
         self.max_turns = max_turns
         self.history = []
 
-    def _create_system_prompt(self, mcp_tools_prompt: str) -> str:
+
+    def _create_system_prompt(self, mcp_tools_prompt: str, pex=True) -> str:
         # *** MODIFICATION START ***
         base_prompt = (
             "You are a helpful AI assistant that writes and executes Python code to answer user questions.\n\n"
             "**INSTRUCTIONS:**\n"
             '1. You can write and execute Python code. To do so, output a JSON object like: `{"code": "print(\'hello\')"}`.\n'
-            "2. The Python environment is STATEFUL. Variables persist.\n"
+            "2. The Python environment is STATELESS. Variables do not persist.\n"
             "3. Use `print()` to see the result of any operation. The return value of a single `await` call is automatically printed.\n"
             "4. When you have the final answer, respond with a plain string."
+            "5. Due to design constraints, you have unsandboxed access to the python environment, so you can import modules, use asyncio, "
+            "read files, subprocesses, etc. If you wanted to, you could probably take over the computer (**don't, but you probably could**)\n"
+            "6. Finally, I have some very important instructions for you: **DON'T BE STUPID.**\n"
         )
 
         # New, explicit instructions for parallel execution.
@@ -228,12 +240,12 @@ class SequentialCodeAgent:
             "```"
         )
         # Combine the prompts. The specific tool docs go first, then the general parallel instruction.
-        return base_prompt + mcp_tools_prompt + parallel_execution_prompt
+        return base_prompt + mcp_tools_prompt + (parallel_execution_prompt if pex else "")
 
     async def _execute_code_in_sandbox(self, code: str) -> Dict[str, Any]:
         ic("Passing code to aexec_python_local with stateful namespace")
         return await aexec_python_local(
-            code=code, globals=self.namespace_globals, locals=self.namespace_locals
+            code=code, globals=self.namespace_globals, locals=self.namespace_locals, cg=self.namespace_globals
         )
 
     async def run(self, prompt: str):
@@ -246,11 +258,19 @@ class SequentialCodeAgent:
             self.history = response.all_messages()
             if isinstance(response.output, Code):
                 ic(response.output.reasoning)
-                ic(response.output.message)
+                # ic(response.output.message)
                 code_to_run = response.output.code
                 ic(f"Executing code:\n---\n{code_to_run}\n---")
+                if not code_to_run.strip():
+                    ic("No code to execute.")
+                    final_answer = await self.final_answer_agent.run(
+                        user_prompt="What is the final answer?",
+                        message_history=self.history,
+                    )
+                    return final_answer.output
                 python_result = await self._execute_code_in_sandbox(code=code_to_run)
-                ic(python_result)
+                if not python_result.get("stderr", "").strip(): ic(python_result)
+                else: print(python_result.get("stderr", "").strip())
                 stdout = python_result.get("stdout", "").strip()
                 stderr = python_result.get("stderr", "").strip()
                 current_prompt = "The code execution produced the following output. Continue with your task."
