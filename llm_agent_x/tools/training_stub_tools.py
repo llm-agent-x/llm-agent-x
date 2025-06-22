@@ -2671,13 +2671,13 @@ ic(categories)
 
 
 def get_random_subset_from_distribution(
-    distribution: Dict[str, float],  # Category name -> proportion (0.0 to 1.0)
-    total_count: int,  # Total number of functions to select
+    distribution: Dict[str, float],
+    total_count: int,
     functions_source: Dict[
         str, List[Callable]
-    ] = categorized_functions,  # Default to using global categorized_functions, can be changed.
-    allow_duplicates: bool = False,  # If true, functions can appear more than once in the returned set.
-    require_all_categories_present: bool = True,  # Require all keys in distribution to exist as categories?
+    ] = categorized_functions,
+    allow_duplicates: bool = False,
+    require_all_categories_present: bool = True,
 ) -> List[Callable]:
     """
     Selects a random subset of functions based on a specified distribution across categories.
@@ -2686,26 +2686,18 @@ def get_random_subset_from_distribution(
         distribution: A dictionary mapping category names to their desired proportion in the subset.
             Values should be floats between 0.0 and 1.0, and the sum of all proportions should ideally be 1.0.
             Keys should match the keys of the `functions_source` dictionary (e.g., "Communication", "FileManagement").
-        total_count: The total number of functions to select in the subset.  If it can't be fulfilled exactly
-          due to rounding, the returned list can be up to len(distribution) off.
-        functions_source: A dictionary mapping category names to lists of function references (like `categorized_functions`).
-            Defaults to the globally defined `categorized_functions`, but can be overridden for testing or to use a different data source.
-        allow_duplicates: Whether or not the same function can be included multiple times in the result.
-            If False (default), each function from the source will appear at most once.
-        require_all_categories_present: If True (default), raise a ValueError if the distribution specifies categories
-            not found in the `functions_source`. If False, only present categories in `functions_source` will be used.
+        total_count: The total number of functions to select in the subset.
+        functions_source: A dictionary mapping category names to lists of function references.
+            Defaults to the globally defined `categorized_functions`.
+        allow_duplicates: Whether the same function can be included multiple times in the result.
+        require_all_categories_present: If True, raise a ValueError if the distribution specifies categories
+            not found in the `functions_source`.
 
     Returns:
-        A list of function references, representing the randomly selected subset.  The length of the list
-        should ideally be close to `total_count` but can be slightly off due to rounding.
+        A list of function references, representing the randomly selected subset.
 
     Raises:
-        ValueError:
-            - If `distribution` contains categories not present in `functions_source` and `require_all_categories_present` is True.
-            - If the proportions in `distribution` don't sum close to 1.0.
-            - If a category specified in `distribution` is empty in `functions_source`.
-            - If the value for a given distribution key is < 0 or > 1.
-
+        ValueError: If validation fails.
     """
 
     if require_all_categories_present:
@@ -2717,70 +2709,84 @@ def get_random_subset_from_distribution(
                 f"Categories specified in distribution not found in functions_source: {invalid_categories}"
             )
 
-    # Filter out non-existent categories
     valid_categories = [cat for cat in distribution if cat in functions_source]
 
     if not valid_categories:
         raise ValueError("No valid categories to sample from in the distribution.")
 
-    # Handle the case of proportions not summing to 1.0 by normalizing
     total_proportion = sum(distribution[cat] for cat in valid_categories)
-    if not (
-        0.99 <= total_proportion <= 1.01
-    ):  # Allow slight floating-point imprecision
+    if not (0.99 <= total_proportion <= 1.01):
         print(
-            "Normalizing distribution because total proportion is not approximately 1.0"
-        )  # warning, but proceeds
+            f"Warning: Normalizing distribution because total proportion is {total_proportion:.2f}, not 1.0."
+        )
         distribution = {
             cat: distribution[cat] / total_proportion for cat in valid_categories
         }
 
+    # --- START: Corrected Logic for Calculating Counts ---
+
+    # Step 1: Calculate initial counts for each category by rounding the ideal count.
+    # This prevents the "all-for-the-last-category" bug by treating all categories equally at first.
     counts_per_category = {}
-    remaining_count = total_count
-
-    # Determine how many items to select from each category
-    for i, category in enumerate(valid_categories):
-        if distribution[category] < 0 or distribution[category] > 1:
+    for category in valid_categories:
+        if not (0 <= distribution[category] <= 1):
             raise ValueError(f"Invalid category weight: {distribution[category]}")
-
-        if len(functions_source[category]) == 0:
+        if not functions_source.get(category):
             raise ValueError(f"Source for {category} is empty, can't sample.")
+        
+        ideal_count = distribution[category] * total_count
+        counts_per_category[category] = int(round(ideal_count))
 
-        if i == (len(valid_categories) - 1):
-            n_items = remaining_count  # Last key takes up the rest
-        else:
-            n_items = round(distribution[category] * total_count)
-            remaining_count -= n_items  # Keep track of how many remaining
+    # Step 2: Correct the total count to match `total_count` exactly,
+    # distributing any rounding errors.
+    current_total = sum(counts_per_category.values())
+    diff = total_count - current_total
 
-        counts_per_category[category] = n_items
+    # To distribute the difference fairly, we'll repeatedly add/remove items
+    # by cycling through a shuffled list of categories.
+    cats_to_adjust = valid_categories[:]
+    random.shuffle(cats_to_adjust)
 
-    # Select the functions
+    idx = 0
+    while diff != 0:
+        cat = cats_to_adjust[idx % len(cats_to_adjust)]
+        
+        if diff > 0:
+            counts_per_category[cat] += 1
+            diff -= 1
+        elif diff < 0:
+            if counts_per_category[cat] > 0: # Only remove if count is > 0
+                counts_per_category[cat] -= 1
+                diff += 1
+        
+        idx += 1
+        # Failsafe to prevent rare infinite loops if logic were to fail
+        if idx > total_count * 2:
+            break
+
+    # --- END: Corrected Logic ---
+
+    # Step 3: Select the functions based on the corrected counts.
     selected_functions = []
-
     for category, count in counts_per_category.items():
+        if count == 0:
+            continue
+            
         source_functions = functions_source[category]
         num_source_functions = len(source_functions)
 
         if allow_duplicates:
-            # Use random.choices to allow duplicates (sample with replacement)
             selected_functions.extend(random.choices(source_functions, k=count))
         else:
-            # Sample without replacement (unique items)
-            try:
-                selected_functions.extend(
-                    random.sample(source_functions, min(count, num_source_functions))
-                )  # handles the edge case where source_functions has less then count.
-            except ValueError as e:
-                print(
-                    f"Warning: Can't retrieve unique samples from {category}, decreasing number of elements to retrieve. {e}"
-                )  # warning, but proceeds
-
-                selected_functions.extend(
-                    random.sample(source_functions, num_source_functions)
-                )  # just take everything.
+            # Sample without replacement. The min() call prevents requesting
+            # more unique samples than are available, which would cause a ValueError.
+            num_to_sample = min(count, num_source_functions)
+            if num_to_sample < count:
+                print(f"Warning: Requested {count} unique samples from '{category}', but only {num_source_functions} are available. Taking {num_to_sample}.")
+            
+            selected_functions.extend(random.sample(source_functions, num_to_sample))
 
     return selected_functions
-
 
 # List all available categories (to show the users the keys for generating a distribution)
 available_categories = list(categorized_functions.keys())
