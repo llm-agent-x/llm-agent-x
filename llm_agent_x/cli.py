@@ -5,20 +5,14 @@ import sys
 from os import getenv, environ
 from pathlib import Path
 import nltk
-from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from typing import Optional  # Import Dict, Optional
-from enum import Enum  # Import Enum for TaskType
 from typing import Literal
-from sumy.parsers.html import HtmlParser
 
 from llm_agent_x import (  # Changed from . to llm_agent_x
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
-    TaskObject,  # Import TaskObject
-    TaskFailedException,  # Import TaskFailedException
+    TaskFailedException,
 )
 from llm_agent_x.backend import (
     AppendMerger,
@@ -57,16 +51,6 @@ exporter = OTLPSpanExporter(
 )
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
-# Load environment variables
-
-
-# Initialize LLM and Search
-# llm = ChatOpenAI(
-#     base_url=openai_base_url,
-#     api_key=openai_api_key,
-#     model=getenv("DEFAULT_LLM", "gpt-4o-mini"),
-#     temperature=0.5,
-# )
 search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 
