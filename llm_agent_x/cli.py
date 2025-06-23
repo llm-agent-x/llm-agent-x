@@ -51,7 +51,7 @@ exporter = OTLPSpanExporter(
 )
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
 
-search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
+# search = SearxSearchWrapper(searx_host=getenv("SEARX_HOST", "http://localhost:8080"))
 output_dir = Path(getenv("OUTPUT_DIR", "./output/"))
 
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
@@ -103,10 +103,6 @@ def main():
         available_tools.append(exec_python)
         tools_dict_for_agent["exec_python"] = exec_python
         tools_dict_for_agent["exec"] = exec_python  # Alias
-
-    tool_llm = llm.bind_tools(available_tools)
-    model_tree.update("llm.tools", tool_llm)
-    model_tree.update("llm.small.tools", tool_llm)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
