@@ -78,7 +78,7 @@ def main():
             with open(mcp_config, "r") as f:
                 config = json.load(f)
             ic(config)
-            
+
             assert type(config) == dict
             for key, value in config.items():
                 mcp_client = None
@@ -95,7 +95,6 @@ def main():
                 mcp_servers.append(mcp_client)
         except FileNotFoundError:
             raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
-
 
     ic(tools_dict_for_agent.values())
 

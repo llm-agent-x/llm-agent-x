@@ -35,9 +35,7 @@ from llm_agent_x.llm_manager import model_tree
 
 from pydantic_ai import Agent
 
-nltk.download(
-    "punkt_tab", quiet=True
-)
+nltk.download("punkt_tab", quiet=True)
 # --- OpenTelemetry Setup ---
 trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer(__name__)
@@ -147,11 +145,12 @@ class JudgeEvaluation(BaseModel):
         description="A score from 1 (not helpful) to 10 (very helpful) for how helpful the response is for the user's query."
     )
 
+
 system_prompt = (
-        "You are an impartial and meticulous AI evaluator. Your task is to assess the quality of an AI agent's response "
-        "to a given task and user instructions. Provide a numerical score, detailed reasoning, and specific feedback "
-        "based on the criteria of Accuracy, Completeness, Relevance, Adherence to Instructions, Clarity, and Helpfulness."
-    )
+    "You are an impartial and meticulous AI evaluator. Your task is to assess the quality of an AI agent's response "
+    "to a given task and user instructions. Provide a numerical score, detailed reasoning, and specific feedback "
+    "based on the criteria of Accuracy, Completeness, Relevance, Adherence to Instructions, Clarity, and Helpfulness."
+)
 
 judge_agent = Agent(
     model=judge_llm,
@@ -184,23 +183,24 @@ async def evaluate_response_with_llm(
         "- **Helpfulness (1-10):** How helpful is this response in achieving the user's goal as stated in the task?\n\n"
         "Provide your evaluation as a JSON object matching the required schema."
         "\n\n"
-        f"Here is the task: \"{task_description}\"\n\n"
-        f"Here are the user instructions: \"{user_instructions}\"\n\n"
-        f"Here is the agent's response: \"{agent_response}\""
+        f'Here is the task: "{task_description}"\n\n'
+        f'Here are the user instructions: "{user_instructions}"\n\n'
+        f'Here is the agent\'s response: "{agent_response}"'
     )
 
-    response = await judge_agent.run(
-        human_prompt = task_description
-    )
+    response = await judge_agent.run(human_prompt=task_description)
     return response.output
 
 
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
+
 def async_wrapper(func):
     def wrapper(*args, **kwargs):
         return asyncio.run(func(*args, **kwargs))
+
     return wrapper
+
 
 @async_wrapper
 async def main():
@@ -364,7 +364,7 @@ async def main():
             #         else None
             #     ),
             #     llm=agent_llm,
-            tools_dict={  # Ensure tools are correctly mapped
+            tools_dict = {  # Ensure tools are correctly mapped
                 "brave_web_search": brave_web_search,
                 "web_search": brave_web_search,  # Alias
             }
@@ -532,9 +532,6 @@ async def main():
             console.print(f"Successful Agent Runs: {successful_agent_runs} (0.00%)")
         console.print(f"Average Judge Score: {avg_score:.2f}/10")
         console.print(f"Average Judge Helpfulness Score: {avg_helpfulness:.2f}/10")
-
-
-
 
 
 if __name__ == "__main__":

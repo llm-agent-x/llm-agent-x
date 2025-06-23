@@ -2,10 +2,13 @@ import asyncio
 import json
 import time
 from typing import Dict, List
+
 # from langchain_openai import ChatOpenAI
 from llm_agent_x.constants import openai_base_url, openai_api_key
+
 # from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
+
 # from langchain_core.output_parsers import JsonOutputParser
 from inspect import getdoc, signature
 from icecream import ic
@@ -34,12 +37,22 @@ c = console.Console()
 
 load_dotenv(".env", override=True)
 
+
 class Task(BaseModel):
     task: str
     tools_required: List[str]
-    details: Dict = Field(description="Additional details for the task. Can be empty. **Make up** any details in here that may come in handy for the task, like auth tokens, user metadata, etc.")
+    details: Dict = Field(
+        description="Additional details for the task. Can be empty. **Make up** any details in here that may come in handy for the task, like auth tokens, user metadata, etc."
+    )
 
-agent = Agent(model="gpt-4.1-nano", system_prompt="You are a helpful assistant.", output_type=Task, result_retries=3)
+
+agent = Agent(
+    model="gpt-4.1-nano",
+    system_prompt="You are a helpful assistant.",
+    output_type=Task,
+    result_retries=3,
+)
+
 
 async def generate_task():
     # Make a line across the console to divide iterations
@@ -74,14 +87,10 @@ async def generate_task():
         f"{Task(task='Get my location. Find restaurants open at the current time, near me.', tools_required=['search', 'get_user_local_time', 'get_user_location'], details={'user':{'allergies': 'peanuts', 'diet': None}}).model_dump_json()}\n\n"
         "Or, if the tool was `send_email`, the prompt could be something like: \n\n"
         f"{Task(task='Send an email to the project manager about the status of the project.', tools_required=['send_email'], details={'status': 'in progress', 'estimate': '2 weeks', 'project_manager': {'name': 'John Doe', 'email': '1d3l4@example.com', 'phone': '123-456-7890'}}).model_dump_json()}\n\n"
-
     )
 
     ic(response.output)
     return response.output
-
-    
-
 
 
 # generate string to describe the tools chosen, given their names, arguments, and their docstrings using the inspect module

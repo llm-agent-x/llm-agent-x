@@ -2673,9 +2673,7 @@ ic(categories)
 def get_random_subset_from_distribution(
     distribution: Dict[str, float],
     total_count: int,
-    functions_source: Dict[
-        str, List[Callable]
-    ] = categorized_functions,
+    functions_source: Dict[str, List[Callable]] = categorized_functions,
     allow_duplicates: bool = False,
     require_all_categories_present: bool = True,
 ) -> List[Callable]:
@@ -2733,7 +2731,7 @@ def get_random_subset_from_distribution(
             raise ValueError(f"Invalid category weight: {distribution[category]}")
         if not functions_source.get(category):
             raise ValueError(f"Source for {category} is empty, can't sample.")
-        
+
         ideal_count = distribution[category] * total_count
         counts_per_category[category] = int(round(ideal_count))
 
@@ -2750,15 +2748,15 @@ def get_random_subset_from_distribution(
     idx = 0
     while diff != 0:
         cat = cats_to_adjust[idx % len(cats_to_adjust)]
-        
+
         if diff > 0:
             counts_per_category[cat] += 1
             diff -= 1
         elif diff < 0:
-            if counts_per_category[cat] > 0: # Only remove if count is > 0
+            if counts_per_category[cat] > 0:  # Only remove if count is > 0
                 counts_per_category[cat] -= 1
                 diff += 1
-        
+
         idx += 1
         # Failsafe to prevent rare infinite loops if logic were to fail
         if idx > total_count * 2:
@@ -2771,7 +2769,7 @@ def get_random_subset_from_distribution(
     for category, count in counts_per_category.items():
         if count == 0:
             continue
-            
+
         source_functions = functions_source[category]
         num_source_functions = len(source_functions)
 
@@ -2782,11 +2780,14 @@ def get_random_subset_from_distribution(
             # more unique samples than are available, which would cause a ValueError.
             num_to_sample = min(count, num_source_functions)
             if num_to_sample < count:
-                print(f"Warning: Requested {count} unique samples from '{category}', but only {num_source_functions} are available. Taking {num_to_sample}.")
-            
+                print(
+                    f"Warning: Requested {count} unique samples from '{category}', but only {num_source_functions} are available. Taking {num_to_sample}."
+                )
+
             selected_functions.extend(random.sample(source_functions, num_to_sample))
 
     return selected_functions
+
 
 # List all available categories (to show the users the keys for generating a distribution)
 available_categories = list(categorized_functions.keys())

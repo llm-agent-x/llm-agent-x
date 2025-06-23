@@ -211,7 +211,6 @@ class SequentialCodeAgent:
         self.max_turns = max_turns
         self.history = []
 
-
     def _create_system_prompt(self, mcp_tools_prompt: str, pex=True) -> str:
         # *** MODIFICATION START ***
         base_prompt = (
@@ -240,12 +239,17 @@ class SequentialCodeAgent:
             "```"
         )
         # Combine the prompts. The specific tool docs go first, then the general parallel instruction.
-        return base_prompt + mcp_tools_prompt + (parallel_execution_prompt if pex else "")
+        return (
+            base_prompt + mcp_tools_prompt + (parallel_execution_prompt if pex else "")
+        )
 
     async def _execute_code_in_sandbox(self, code: str) -> Dict[str, Any]:
         ic("Passing code to aexec_python_local with stateful namespace")
         return await aexec_python_local(
-            code=code, globals=self.namespace_globals, locals=self.namespace_locals, cg=self.namespace_globals
+            code=code,
+            globals=self.namespace_globals,
+            locals=self.namespace_locals,
+            cg=self.namespace_globals,
         )
 
     async def run(self, prompt: str):
@@ -269,8 +273,10 @@ class SequentialCodeAgent:
                     )
                     return final_answer.output
                 python_result = await self._execute_code_in_sandbox(code=code_to_run)
-                if not python_result.get("stderr", "").strip(): ic(python_result)
-                else: print(python_result.get("stderr", "").strip())
+                if not python_result.get("stderr", "").strip():
+                    ic(python_result)
+                else:
+                    print(python_result.get("stderr", "").strip())
                 stdout = python_result.get("stdout", "").strip()
                 stderr = python_result.get("stderr", "").strip()
                 current_prompt = "The code execution produced the following output. Continue with your task."
