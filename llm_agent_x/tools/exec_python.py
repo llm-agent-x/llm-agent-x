@@ -27,6 +27,7 @@ import base64
 import cloudpickle
 from llm_agent_x.constants import SANDBOX_API_URL
 
+
 def exec_python_factory(use_docker_sandbox: bool = True):
     def exec_python(
         code: str,
@@ -44,7 +45,7 @@ def exec_python_factory(use_docker_sandbox: bool = True):
                     "stderr": "PYTHON_SANDBOX_API_URL environment variable is not set.",
                     "error": "Configuration error",
                 }
-                
+
             if packages:
                 install_packages(packages, packages_index_url)
 
@@ -56,11 +57,14 @@ def exec_python_factory(use_docker_sandbox: bool = True):
                         with open(file_path, "rb") as f:
                             file_name = os.path.basename(file_path)
                             response = requests.post(
-                                f"{SANDBOX_API_URL}/upload", files={"file": (file_name, f)}
+                                f"{SANDBOX_API_URL}/upload",
+                                files={"file": (file_name, f)},
                             )
                             response.raise_for_status()
                     except FileNotFoundError:
-                        results["stderr"] += f"Error: File not found for upload: {file_path}\n"
+                        results[
+                            "stderr"
+                        ] += f"Error: File not found for upload: {file_path}\n"
                         results["error"] = "File upload error"
                         return results
                     except requests.exceptions.RequestException as e:
@@ -77,10 +81,14 @@ def exec_python_factory(use_docker_sandbox: bool = True):
                         )
                         response.raise_for_status()
                     except requests.exceptions.RequestException as e:
-                        results["stderr"] += f"Error loading cloudpickle file {cp_file_path}: {e}\n"
+                        results[
+                            "stderr"
+                        ] += f"Error loading cloudpickle file {cp_file_path}: {e}\n"
                         try:
                             error_detail = response.json()
-                            results["stderr"] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
+                            results[
+                                "stderr"
+                            ] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
                         except ValueError:
                             results["stderr"] += f"Sandbox response: {response.text}\n"
                         results["error"] = "Cloudpickle load error"
@@ -97,15 +105,21 @@ def exec_python_factory(use_docker_sandbox: bool = True):
                 results["stderr"] += exec_result.get("stderr", "")
                 if exec_result.get("error"):
                     results["error"] = exec_result.get("error")
-                    results["stderr"] += f"Execution error from sandbox: {exec_result.get('error')}\n"
+                    results[
+                        "stderr"
+                    ] += f"Execution error from sandbox: {exec_result.get('error')}\n"
                     if exec_result.get("trace"):
-                        results["stderr"] += f"Sandbox Trace: {exec_result.get('trace')}\n"
+                        results[
+                            "stderr"
+                        ] += f"Sandbox Trace: {exec_result.get('trace')}\n"
 
             except requests.exceptions.RequestException as e:
                 results["stderr"] += f"Error executing code in sandbox: {e}\n"
                 try:
                     error_detail = response.json()
-                    results["stderr"] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
+                    results[
+                        "stderr"
+                    ] += f"Sandbox response: {error_detail.get('error', '')} - {error_detail.get('trace', '')}\n"
                 except ValueError:
                     results["stderr"] += f"Sandbox response: {response.text}\n"
                 results["error"] = "Code execution error"
@@ -144,7 +158,7 @@ def exec_python_factory(use_docker_sandbox: bool = True):
                     "stderr": f"[Local execution error: {str(e)}]",
                     "error": str(e),
                 }
-    
+
     return exec_python
 
 

@@ -1,38 +1,24 @@
 import argparse
+import asyncio
 import json
-import math
 import sys
-import time
-from os import getenv, environ
+from os import getenv
 from pathlib import Path
 from dotenv import load_dotenv
 import nltk
-import requests
 from rich.console import Console
 from rich.tree import Tree
 from rich.live import Live
 from rich.text import Text
 from langchain_openai import ChatOpenAI
-from langchain_community.utilities import SearxSearchWrapper
-from bs4 import BeautifulSoup
 from typing import Dict, List, Optional, Any  # Added Any
-from enum import Enum
 from typing import Literal
-import hashlib
-from sumy.parsers.html import HtmlParser
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lsa import LsaSummarizer as Summarizer
-from sumy.nlp.stemmers import Stemmer
-from sumy.utils import get_stop_words
 import redis
 
 from llm_agent_x import (
-    int_to_base26,
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
-    TaskObject,
     TaskFailedException,
 )
 from llm_agent_x.backend import AppendMerger, LLMMerger, AlgorithmicMerger
@@ -40,9 +26,6 @@ from opentelemetry import trace, context as otel_context
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 
 from llm_agent_x.console import console, task_tree, live
@@ -50,10 +33,9 @@ from llm_agent_x.constants import openai_api_key, openai_base_url
 from llm_agent_x.tools.brave_web_search import brave_web_search
 from llm_agent_x.llm_manager import model_tree
 
-nltk.download(
-    "punkt", quiet=True
-)  # Changed from punkt_tab, ensure 'punkt' tokenizer is available
+from pydantic_ai import Agent
 
+nltk.download("punkt_tab", quiet=True)
 # --- OpenTelemetry Setup ---
 trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer(__name__)
@@ -76,7 +58,7 @@ console = Console()
 
 # --- LLM and Search Initialization ---
 # Judge LLM (can be configured separately)
-judge_llm_instance = None  # To be initialized in main
+judge_llm = "openai:gpt-4o"
 
 output_dir = Path(getenv("OUTPUT_DIR", "./output_eval/"))  # Changed default output dir
 
@@ -164,22 +146,26 @@ class JudgeEvaluation(BaseModel):
     )
 
 
-def evaluate_response_with_llm(
+system_prompt = (
+    "You are an impartial and meticulous AI evaluator. Your task is to assess the quality of an AI agent's response "
+    "to a given task and user instructions. Provide a numerical score, detailed reasoning, and specific feedback "
+    "based on the criteria of Accuracy, Completeness, Relevance, Adherence to Instructions, Clarity, and Helpfulness."
+)
+
+judge_agent = Agent(
+    model=judge_llm,
+    system_prompt=system_prompt,
+    output_type=JudgeEvaluation,
+    result_retries=3,
+)
+
+
+async def evaluate_response_with_llm(
     task_description: str,
     user_instructions: str,
     agent_response: str,
-    judge_llm: ChatOpenAI,  # Pass the initialized LLM instance
-    pydantic_object_parser: JsonOutputParser,
 ) -> Dict:
-
-    system_prompt = (
-        "You are an impartial and meticulous AI evaluator. Your task is to assess the quality of an AI agent's response "
-        "to a given task and user instructions. Provide a numerical score, detailed reasoning, and specific feedback "
-        "based on the criteria of Accuracy, Completeness, Relevance, Adherence to Instructions, Clarity, and Helpfulness.\n"
-        f"Output your evaluation strictly in the following JSON format:\n{pydantic_object_parser.get_format_instructions()}"
-    )
-
-    human_prompt_template = (
+    human_prompt = (
         "Please evaluate the following AI agent's performance based on the provided task, user instructions, and the agent's response. "
         "Be critical and fair.\n\n"
         "**Original Task:**\n```\n{task}\n```\n\n"
@@ -196,55 +182,28 @@ def evaluate_response_with_llm(
         "- **Adherence to Instructions:** Were specific user instructions (e.g., length, tone, format) followed?\n"
         "- **Helpfulness (1-10):** How helpful is this response in achieving the user's goal as stated in the task?\n\n"
         "Provide your evaluation as a JSON object matching the required schema."
+        "\n\n"
+        f'Here is the task: "{task_description}"\n\n'
+        f'Here are the user instructions: "{user_instructions}"\n\n'
+        f'Here is the agent\'s response: "{agent_response}"'
     )
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(
-            content=human_prompt_template.format(
-                task=task_description,
-                u_inst=user_instructions if user_instructions else "None provided.",
-                agent_response=(
-                    agent_response
-                    if agent_response
-                    else "No response provided by agent."
-                ),
-            )
-        ),
-    ]
-
-    raw_response_content = ""
-    try:
-        console.log("Invoking Judge LLM...")
-        ai_message = judge_llm.invoke(messages)
-        raw_response_content = ai_message.content
-        # console.log(f"Judge LLM Raw Response: {raw_response_content[:500]}")
-        parsed_evaluation = pydantic_object_parser.invoke(ai_message)
-        return parsed_evaluation  # This will be a JudgeEvaluation object or dict
-    except Exception as e:
-        console.log(f"[bold red]Error during LLM Judge evaluation: {e}[/bold red]")
-        console.log(f"Judge LLM Raw content on error: {raw_response_content}")
-        # Return an error structure matching JudgeEvaluation if possible
-        error_eval = JudgeEvaluation(
-            score=0,
-            reasoning=f"Error during evaluation: {e}. Raw LLM response: {raw_response_content[:500]}",
-            strengths=[],
-            weaknesses=[f"Evaluation process failed: {e}"],
-            is_complete=False,
-            is_accurate=False,
-            is_relevant=False,
-            followed_instructions=False,
-            helpfulness=0,
-        ).model_dump()  # Convert to dict
-        error_eval["error_details"] = str(e)
-        return error_eval
+    response = await judge_agent.run(human_prompt=task_description)
+    return response.output
 
 
 TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 
-def main():
-    global agent_llm  # , judge_llm_instance, live_display, task_tree, flowchart
+def async_wrapper(func):
+    def wrapper(*args, **kwargs):
+        return asyncio.run(func(*args, **kwargs))
+
+    return wrapper
+
+
+@async_wrapper
+async def main():
 
     parser = argparse.ArgumentParser(description="Run the LLM agent evaluation.")
     parser.add_argument(
@@ -307,22 +266,6 @@ def main():
 
     args = parser.parse_args()
 
-    # --- Initialize/Update LLMs based on args ---
-    if args.agent_model != agent_llm.model_name:
-        agent_llm = ChatOpenAI(
-            base_url=openai_base_url,
-            api_key=openai_api_key,
-            model=args.agent_model,
-            temperature=0.5,
-        )
-        console.log(f"Agent LLM set to: {args.agent_model}")
-
-    judge_llm_instance = ChatOpenAI(
-        base_url=openai_base_url,
-        api_key=openai_api_key,
-        model=args.judge_model,
-        temperature=0.2,  # Judge should be more deterministic
-    )
     console.log(f"Judge LLM set to: {args.judge_model}")
 
     # --- Load Prompts ---
@@ -347,20 +290,6 @@ def main():
 
     all_evaluations_data = []
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # --- Setup Judge Parser ---
-    judge_parser = JsonOutputParser(pydantic_object=JudgeEvaluation)
-
-    # --- Main Evaluation Loop ---
-    if not args.no_live_tree:
-        task_tree = Tree("Agent Execution Evaluation")  # Initialize the main tree
-        live_display = Live(
-            task_tree,
-            console=console,
-            refresh_per_second=4,
-            vertical_overflow="visible",
-        )
-        live_display.start()  # Start live display manually
 
     # Create subset, if argument==-1, use all prompts
     if args.prompt_range == "-1":
@@ -409,9 +338,7 @@ def main():
         }
 
         # Bind fresh tool LLM for each agent instance if tools are stateful or vary
-        agent_tool_llm = agent_llm.bind_tools(
-            [brave_web_search]
-        )  # Add other tools if needed: , exec_python
+        agent_llm = "openai:gpt-4o-mini"
 
         with tracer.start_as_current_span(
             f"evaluation_run_{prompt_id}"
@@ -419,33 +346,51 @@ def main():
             eval_run_span.set_attribute("task", task_description)
             eval_run_span.set_attribute("prompt.id", prompt_id)
 
+            # agent_options = RecursiveAgentOptions(
+            #     search_tool=brave_web_search,  # For direct access if needed
+            #     pre_task_executed=(
+            #         pre_tasks_executed
+            #         if not args.no_live_tree or args.save_flowcharts
+            #         else None
+            #     ),
+            #     on_task_executed=(
+            #         on_task_executed
+            #         if not args.no_live_tree or args.save_flowcharts
+            #         else None
+            #     ),
+            #     on_tool_call_executed=(
+            #         on_tool_call_executed
+            #         if not args.no_live_tree or args.save_flowcharts
+            #         else None
+            #     ),
+            #     llm=agent_llm,
+            tools_dict = {  # Ensure tools are correctly mapped
+                "brave_web_search": brave_web_search,
+                "web_search": brave_web_search,  # Alias
+            }
+            available_tools = [brave_web_search]
+            #     task_limits=TaskLimit.from_array(
+            #         eval(prompt_data.get("task_limit", args.task_limit))
+            #     ),  # Use eval carefully
+            #     merger={
+            #         "ai": LLMMerger,
+            #         "append": AppendMerger,
+            #         "algorithmic": AlgorithmicMerger,
+            #     }[args.merger],
+            # )
+
             agent_options = RecursiveAgentOptions(
-                search_tool=brave_web_search,  # For direct access if needed
-                pre_task_executed=(
-                    pre_tasks_executed
-                    if not args.no_live_tree or args.save_flowcharts
-                    else None
-                ),
-                on_task_executed=(
-                    on_task_executed
-                    if not args.no_live_tree or args.save_flowcharts
-                    else None
-                ),
-                on_tool_call_executed=(
-                    on_tool_call_executed
-                    if not args.no_live_tree or args.save_flowcharts
-                    else None
-                ),
-                llm=model_tree,
-                tool_llm=agent_tool_llm,
-                tools_dict={  # Ensure tools are correctly mapped
-                    "brave_web_search": brave_web_search,
-                    "web_search": brave_web_search,  # Alias
-                    # "exec_python": exec_python, # If you want to enable code execution
-                },
-                task_limits=TaskLimit.from_array(
-                    eval(prompt_data.get("task_limit", args.task_limit))
-                ),  # Use eval carefully
+                search_tool=brave_web_search,
+                pre_task_executed=pre_tasks_executed,
+                on_task_executed=on_task_executed,
+                on_tool_call_executed=on_tool_call_executed,
+                llm="openai:gpt-4o-mini",
+                tools=list(available_tools),
+                mcp_servers=[],
+                allow_search=True,
+                allow_tools=True,
+                tools_dict=tools_dict,
+                task_limits=TaskLimit.from_array(eval(args.task_limit)),
                 merger={
                     "ai": LLMMerger,
                     "append": AppendMerger,
@@ -463,7 +408,7 @@ def main():
 
             try:
                 console.log("Starting agent run...")
-                response_obj = agent.run()
+                response_obj = await agent.run()
                 agent_response_text = str(response_obj)
                 outputs.append(
                     {
@@ -498,12 +443,10 @@ def main():
 
             # --- LLM Judge Evaluation ---
             console.log("Proceeding to Judge LLM evaluation...")
-            judge_eval_result = evaluate_response_with_llm(
+            judge_eval_result = await evaluate_response_with_llm(
                 task_description,
                 user_instructions,
                 agent_response_text,
-                judge_llm_instance,
-                judge_parser,
             )
             # Ensure it's a dict (evaluate_response_with_llm returns dict from Pydantic model or error dict)
             judge_evaluation_dict = (
@@ -536,9 +479,6 @@ def main():
             )
             all_evaluations_data.append(current_eval_data)
 
-    if live_display:
-        live_display.stop()  # Stop live display after all evaluations
-
     # --- Save All Evaluation Results ---
     eval_output_path = output_dir / args.eval_output
 
@@ -553,7 +493,7 @@ def main():
 
     for output in outputs:
         filename_noprefix = output["filename"]
-        output_path = eval_output_path / f"{filename_noprefix}.md"
+        output_path = eval_output_path.parent / f"{filename_noprefix}.md"
         if not output_path.parent.exists():
             output_path.parent.mkdir(parents=True)
         with output_path.open("w") as f_out:
@@ -595,4 +535,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
