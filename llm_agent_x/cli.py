@@ -41,10 +41,6 @@ from llm_agent_x.cli_args_parser import parser
 from llm_agent_x.tools.exec_python import exec_python
 from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
 
-import nest_asyncio
-
-nest_asyncio.apply()
-
 from openai import AsyncOpenAI
 
 from pydantic_ai import Agent

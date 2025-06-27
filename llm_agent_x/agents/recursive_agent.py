@@ -5,12 +5,14 @@ from difflib import SequenceMatcher
 from os import getenv
 from typing import Any, Callable, Literal, Optional, List, Dict, Union
 from black import Mode, format_str
+from langsmith.run_helpers import is_async
 from opentelemetry.trace import Status
 # from grpc import Status
 from openinference.semconv.trace import SpanAttributes
 
 # --- Pydantic-AI Imports ---
 from pydantic_ai import Agent
+from pydantic_ai.agent import AgentRunResult
 
 # --- Original Imports (some will be replaced) ---
 from llm_agent_x.backend.dot_tree import DotTree
@@ -806,7 +808,7 @@ Make sure to include citations [1] and a citations section at the end.
                 output_type=str,
                 tools=self.tools,
                 mcp_servers=self.options.mcp_servers,
-                instrument=True,
+
             )
 
             single_task_span.add_event("Executing Pydantic-AI agent")
@@ -891,7 +893,7 @@ Make sure to include citations [1] and a citations section at the end.
                     needs_subtasks=False, subtasks=[], evaluation=evaluation
                 )
             split_agent = Agent(
-                model=self.llm, system_prompt=system_msg_content, output_type=SplitTask, instrument=True,
+                model=self.llm, system_prompt=system_msg_content, output_type=SplitTask,
             )
             try:
                 # FIXED: Execute agent run in a separate thread to prevent blocking.
@@ -953,7 +955,7 @@ Make sure to include citations [1] and a citations section at the end.
 
             ic(human_msg)
             verify_agent = Agent(
-                model=self.llm, system_prompt=system_msg, output_type=verification, instrument=True,
+                model=self.llm, system_prompt=system_msg, output_type=verification,
             )
             try:
                 # FIXED: Execute agent run in a separate thread to prevent blocking.
@@ -1110,7 +1112,6 @@ Make sure to include citations [1] and a citations section at the end.
             if not documents_to_merge:
                 return "All subtasks yielded empty results."
 
-            llm_for_merge_str = self.llm
             llm_for_merge = self.llm
 
             merged_content_str = ""
@@ -1124,9 +1125,18 @@ Make sure to include citations [1] and a citations section at the end.
                     )
                     merger = self.options.merger(merge_options)
                     # Run the synchronous merge_documents in a separate thread
-                    merged_content_str = await asyncio.to_thread(
-                        merger.merge_documents, documents_to_merge
-                    )
+                    ic("Running merger in a separate thread...")
+                    if is_async(merger.merge_documents):
+                        merged_content = await merger.merge_documents(documents_to_merge)
+                    else:
+                        merged_content = merger.merge_documents(documents_to_merge)
+
+                    if isinstance(merged_content, AgentRunResult):
+                        self.cost += await self.calculate_cost_and_update_span(
+                            merged_content, summary_span
+                        )
+                        merged_content_str = merged_content.output
+                    ic("Merger completed.")
                 except Exception as e_merge:
                     self.logger.warning(
                         f"LLMMerger failed: {e_merge}. Using simple join.",
@@ -1141,7 +1151,6 @@ Make sure to include citations [1] and a citations section at the end.
                     model=self.llm,
                     system_prompt="You are a report-writing assistant.",
                     output_type=str,
-                    instrument=True,
                 )
                 # FIXED: Execute agent run in a separate thread to prevent blocking.
                 response = await self._execute_agent_run(align_agent, alignment_prompt)
