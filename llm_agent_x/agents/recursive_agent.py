@@ -2,8 +2,12 @@ import asyncio
 import json  # Added missing import
 import uuid
 from difflib import SequenceMatcher
+from os import getenv
 from typing import Any, Callable, Literal, Optional, List, Dict, Union
 from black import Mode, format_str
+from opentelemetry.trace import Status
+# from grpc import Status
+from openinference.semconv.trace import SpanAttributes
 
 # --- Pydantic-AI Imports ---
 from pydantic_ai import Agent
@@ -245,6 +249,7 @@ class RecursiveAgent:
             if agent_options.max_fix_attempts is not None
             else 2
         )
+        self.cost = 0
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -318,7 +323,30 @@ class RecursiveAgent:
             "broader_family_contexts": broader_family_contexts_data,
             "dependency_contexts": dependency_contexts_data,
         }
+    def _build_task_hierarchy_str(self) -> str:
+        """
+        Builds a string representing the task's position in the hierarchy,
+        showing parent and grandparent tasks.
+        """
+        path = []
+        # Traverse up from the parent of the current task
+        current_ctx = self.context.parent_context
+        while current_ctx:
+            path.append(current_ctx.task)
+            current_ctx = current_ctx.parent_context
 
+        if not path:
+            return f"Current Task: {self.task}\n(This is a root task with no parents)"
+
+        # Reverse the list to display from the top-level parent down
+        path.reverse()
+        hierarchy_str = "You are executing a sub-task. Here is the hierarchy of parent tasks:\n"
+        for i, task_str in enumerate(path):
+            hierarchy_str += f"{'  ' * i}L- {task_str}\n"
+
+        # Add the current task at the end for full context
+        hierarchy_str += f"{'  ' * len(path)}--> (Your Current Task) {self.task}"
+        return hierarchy_str
     def _format_history_parts(
         self,
         context_info: dict,
@@ -580,6 +608,9 @@ class RecursiveAgent:
                     if dep_uuid in completed_tasks
                 }
                 result = await agent.run()
+
+                self.cost += agent.cost
+
                 completed_tasks[agent.uuid] = (
                     result if result is not None else "No result."
                 )
@@ -657,6 +688,11 @@ class RecursiveAgent:
         verification step that interfered with the main verification-and-fix mechanism.
         The `pydantic-ai` Agent's `.run()` method handles the entire multi-step tool
         interaction internally, so a single call is sufficient.
+
+        MODIFIED: This method now constructs a much more focused context for the LLM.
+        Instead of passing all sibling/ancestor results, it provides:
+        1. A "task hierarchy tree" to show the current task's place in the plan.
+        2. The results of ONLY the tasks this task explicitly depends on.
         """
         agent_span = self.current_span
         parent_context = (
@@ -665,17 +701,55 @@ class RecursiveAgent:
             else otel_context.get_current()
         )
         with self.tracer.start_as_current_span(
-            "Run Single Task Operation", context=parent_context
+                "Run Single Task Operation", context=parent_context
         ) as single_task_span:
-            context_info = self._build_context_information()
-            full_context_str = "\n".join(
-                self._format_history_parts(context_info, "single task execution")
-            )
+
+            # MODIFIED: Build the specific, focused context for execution.
+            # 1. Get the hierarchy of parent task descriptions.
+            task_hierarchy_str = self._build_task_hierarchy_str()
+
+            # 2. Get the results ONLY from direct dependencies.
+            dependency_context_parts = []
+            if self.context.dependency_results:
+                dependency_context_parts.append(
+                    "You have been provided with the following results from tasks you explicitly depend on. Use this data to accomplish your goal:"
+                )
+                for dep_uuid, dep_result in self.context.dependency_results.items():
+                    # Find the dependency's original task description
+                    dep_agent = self.options.task_registry.get(dep_uuid)
+                    dep_task_desc = dep_agent.task if dep_agent else "Unknown Task"
+                    dependency_context_parts.append(
+                        f"- Dependency Task: {dep_task_desc}\n  - Result: {dep_result}"
+                    )
+            dependency_context_str = "\n".join(dependency_context_parts)
+
+            # MODIFIED: Construct the new system prompt with the focused context.
             current_task_type = getattr(self, "task_type", "research")
             if current_task_type in ["basic", "task"]:
-                system_prompt_content = f"You are a helpful assistant. Directly execute or answer the following. Provide a direct, concise answer or the output of any tools used. Avoid narrative. Current Task: {self.task}\n\nRelevant history:\n{full_context_str}"
-            else:
-                system_prompt_content = f"Your task is to answer the following question, using tools. Make sure to include citations [1] and a citations section at the end.\n\nRelevant history:\n{full_context_str}"
+                # For basic tasks, the prompt is more direct.
+                system_prompt_template = """You are a helpful assistant. Directly execute or answer the task.
+Provide a direct, concise answer or the output of any tools used. Avoid narrative.
+
+=== TASK CONTEXT ===
+{task_hierarchy}
+
+{dependency_data}
+"""
+            else:  # For research/reasoning tasks, provide more guidance.
+                system_prompt_template = """Your job is to execute your assigned task, using tools if necessary.
+Make sure to include citations [1] and a citations section at the end.
+
+=== TASK CONTEXT ===
+{task_hierarchy}
+
+=== AVAILABLE DATA FROM DEPENDENCIES ===
+{dependency_data}
+"""
+
+            system_prompt_content = system_prompt_template.format(
+                task_hierarchy=task_hierarchy_str,
+                dependency_data=dependency_context_str or "No data from dependencies provided."
+            ).strip()
 
             human_message_content = self.task
             if self.u_inst:
@@ -690,6 +764,7 @@ class RecursiveAgent:
                 output_type=str,
                 tools=self.tools,
                 mcp_servers=self.options.mcp_servers,
+                instrument=True,
             )
 
             single_task_span.add_event("Executing Pydantic-AI agent")
@@ -701,13 +776,29 @@ class RecursiveAgent:
             async with tool_agent.run_mcp_servers():
                 response = await tool_agent.run(user_prompt=human_message_content)
 
-            print(format_str(str(response.all_messages()), mode=Mode()))
+                self.cost += await self.calculate_cost_and_update_span(response, single_task_span)
+
+            # print(format_str(str(response.all_messages()), mode=Mode()))
 
             ic(response.output)
             final_result_content = response.output or "No result."
             ic(final_result_content)
 
             return str(final_result_content)
+
+    async def calculate_cost_and_update_span(self, response, single_task_span):
+        input_token_cost = float(getenv("INPUT_TOKEN_COST", 0))
+        output_token_cost = float(getenv("OUTPUT_TOKEN_COST", 0))
+        request_tokens = response.usage().request_tokens
+        single_task_span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, request_tokens)
+        response_tokens = response.usage().response_tokens
+        single_task_span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, response_tokens)
+        total_tokens = response.usage().total_tokens
+        single_task_span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, total_tokens)
+        total_cost = (input_token_cost * request_tokens) + (output_token_cost * response_tokens)
+        single_task_span.set_attribute(SpanAttributes.LLM_COST_TOTAL,
+                                       total_cost)
+        return total_cost
 
     async def _split_task(self) -> SplitTask:
         agent_span = self.current_span
@@ -761,12 +852,16 @@ class RecursiveAgent:
                     needs_subtasks=False, subtasks=[], evaluation=evaluation
                 )
             split_agent = Agent(
-                model=self.llm, system_prompt=system_msg_content, output_type=SplitTask
+                model=self.llm, system_prompt=system_msg_content, output_type=SplitTask, instrument=True,
             )
             try:
                 response = await split_agent.run(user_prompt=self.task)
+
+                self.cost += await self.calculate_cost_and_update_span(response, split_span)
+
                 split_task_result = response.output
                 split_task_result.evaluation = evaluation
+
             except (ValidationError, Exception) as e:
                 self.logger.error(
                     f"Error parsing LLM JSON for splitting: {e}.", exc_info=True
@@ -818,11 +913,16 @@ class RecursiveAgent:
 
             ic(human_msg)
             verify_agent = Agent(
-                model=self.llm, system_prompt=system_msg, output_type=verification
+                model=self.llm, system_prompt=system_msg, output_type=verification, instrument=True,
             )
             try:
                 response = await verify_agent.run(user_prompt=human_msg)
+
+                self.cost += await self.calculate_cost_and_update_span(response, verify_span)
+
                 verification_output = response.output
+
+
                 ic(verification_output)
                 ic("-" * 50)
                 if not verification_output.get_successful():
@@ -999,7 +1099,11 @@ class RecursiveAgent:
                     model=self.llm,
                     system_prompt="You are a report-writing assistant.",
                     output_type=str,
+                    instrument=True,
                 )
                 response = await align_agent.run(user_prompt=alignment_prompt)
+
+                self.cost += await self.calculate_cost_and_update_span(response, summary_span)
+
                 final_summary = response.output
             return final_summary

@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from os import getenv, environ
 from pathlib import Path
 import nltk
@@ -39,6 +40,10 @@ from llm_agent_x.tools.brave_web_search import brave_web_search
 from llm_agent_x.cli_args_parser import parser
 from llm_agent_x.tools.exec_python import exec_python
 from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
+
+import nest_asyncio
+
+nest_asyncio.apply()
 
 nltk.download("punkt_tab", force=False)
 
@@ -172,6 +177,10 @@ def main():
             console.print(f"Agent response saved to {output_file}")
         console.print("\nFinal Response:\n", style="bold green")
         console.print(response)
+
+        # Delay before exiting
+        time.sleep(.2)
+        ic(agent.cost)
 
 
 if __name__ == "__main__":
