@@ -45,6 +45,15 @@ import nest_asyncio
 
 nest_asyncio.apply()
 
+from openai import AsyncOpenAI
+
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+client = AsyncOpenAI(max_retries=3)
+model = OpenAIModel('gpt-4o-mini', provider=OpenAIProvider(openai_client=client))
+
 nltk.download("punkt_tab", force=False)
 
 # Setup (only needed once)
@@ -131,7 +140,7 @@ def main():
                 pre_task_executed=pre_tasks_executed,
                 on_task_executed=on_task_executed,
                 on_tool_call_executed=on_tool_call_executed,
-                llm="openai:gpt-4o-mini",
+                llm=model, # "openai:gpt-4o-mini",
                 tools=available_tools,
                 mcp_servers=mcp_servers,
                 allow_search=True,

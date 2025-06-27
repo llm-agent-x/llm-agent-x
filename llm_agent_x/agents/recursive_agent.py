@@ -1,5 +1,5 @@
 import asyncio
-import json  # Added missing import
+import json
 import uuid
 from difflib import SequenceMatcher
 from os import getenv
@@ -251,6 +251,31 @@ class RecursiveAgent:
         )
         self.cost = 0
 
+    async def _execute_agent_run(self, agent: Agent, user_prompt: str) -> Any:
+        """
+        FIXED: Executes the agent's run method in a separate thread to prevent
+        it from blocking the main asyncio event loop. This is a workaround
+        for agent methods that might contain synchronous, blocking I/O
+        despite being declared as async, which can cause deadlocks.
+        """
+        loop = asyncio.get_running_loop()
+
+        # Define the async operation we want to run.
+        # It includes the MCP server context if needed.
+        async def operation():
+            async with agent.run_mcp_servers():
+                return await agent.run(user_prompt=user_prompt)
+
+        # Define a synchronous wrapper that will be executed in a thread.
+        def sync_runner():
+            # asyncio.run() creates and manages a new event loop in the current
+            # (worker) thread, runs our async operation, and returns the result.
+            return asyncio.run(operation())
+
+        # Schedule the synchronous wrapper to run in the default thread pool
+        # and await its completion without blocking the main event loop.
+        return await loop.run_in_executor(None, sync_runner)
+
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
             try:
@@ -428,6 +453,8 @@ class RecursiveAgent:
             )
             try:
                 result = await self._run()
+                ic("Agent run complete")
+
                 span.set_attribute("agent.final_status", self.status)
                 span.add_event(
                     "Agent Run End",
@@ -607,7 +634,9 @@ class RecursiveAgent:
                     for dep_uuid in agent.task_obj.depends_on
                     if dep_uuid in completed_tasks
                 }
+                ic("Agent Running")
                 result = await agent.run()
+                ic("Agent Finished")
 
                 self.cost += agent.cost
 
@@ -616,6 +645,7 @@ class RecursiveAgent:
                 )
                 del pending_agents[agent.uuid]
                 if span:
+                    ic("Adding event")
                     span.add_event(
                         f"Task Completed",
                         {
@@ -624,6 +654,8 @@ class RecursiveAgent:
                             "result_preview": str(result)[:100],
                         },
                     )
+                    ic("Added event")
+
         if pending_agents:
             self.logger.warning(
                 f"Loop finished with pending agents: {list(pending_agents.keys())}"
@@ -634,9 +666,11 @@ class RecursiveAgent:
         subtask_results = [
             result for uuid, result in completed_tasks.items() if uuid in child_agents
         ]
+        ic("Summarizing subtask results")
         self.result = await self._summarize_subtask_results(
             subtask_tasks, subtask_results
         )
+        ic("Summarized subtask results")
         if span:
             span.set_attribute("result", self.result)
         self.context.result = self.result
@@ -646,18 +680,25 @@ class RecursiveAgent:
             if uuid in child_agents
         }
         try:
+            ic("Verifying result")
             await self.verify_result(subtask_results_map)
+            ic("Verification passed")
         except TaskFailedException:
             if span:
                 span.add_event("Verification Failed, Attempting Fix")
+            ic("Verification failed, attempting fix")
             await self._fix(subtask_results_map)
+            ic("Fixed")
         if self.options.on_task_executed:
+            ic("Calling on_task_executed")
             self.options.on_task_executed(
                 self.task,
                 self.uuid,
                 self.result,
                 self.parent.uuid if self.parent else None,
             )
+            ic("Called on_task_executed")
+        ic("Returning result")
         return self.result
 
     async def _execute_and_verify_single_task(self) -> str:
@@ -665,6 +706,7 @@ class RecursiveAgent:
         self.context.result = self.result
         try:
             await self.verify_result(None)
+            ic("Verification passed")
         except TaskFailedException:
             if self.current_span:
                 self.current_span.add_event(
@@ -771,14 +813,11 @@ Make sure to include citations [1] and a citations section at the end.
             ic(self.tools)
             ic(human_message_content)
 
-            # A single call to .run() is sufficient. The pydantic-ai library handles
-            # the internal loop of calling tools and re-prompting the LLM.
-            async with tool_agent.run_mcp_servers():
-                response = await tool_agent.run(user_prompt=human_message_content)
+            # FIXED: Execute the agent run in a separate thread to prevent blocking the event loop,
+            # which could cause deadlocks.
+            response = await self._execute_agent_run(tool_agent, human_message_content)
 
-                self.cost += await self.calculate_cost_and_update_span(response, single_task_span)
-
-            # print(format_str(str(response.all_messages()), mode=Mode()))
+            self.cost += await self.calculate_cost_and_update_span(response, single_task_span)
 
             ic(response.output)
             final_result_content = response.output or "No result."
@@ -855,7 +894,8 @@ Make sure to include citations [1] and a citations section at the end.
                 model=self.llm, system_prompt=system_msg_content, output_type=SplitTask, instrument=True,
             )
             try:
-                response = await split_agent.run(user_prompt=self.task)
+                # FIXED: Execute agent run in a separate thread to prevent blocking.
+                response = await self._execute_agent_run(split_agent, self.task)
 
                 self.cost += await self.calculate_cost_and_update_span(response, split_span)
 
@@ -916,7 +956,8 @@ Make sure to include citations [1] and a citations section at the end.
                 model=self.llm, system_prompt=system_msg, output_type=verification, instrument=True,
             )
             try:
-                response = await verify_agent.run(user_prompt=human_msg)
+                # FIXED: Execute agent run in a separate thread to prevent blocking.
+                response = await self._execute_agent_run(verify_agent, human_msg)
 
                 self.cost += await self.calculate_cost_and_update_span(response, verify_span)
 
@@ -946,6 +987,7 @@ Make sure to include citations [1] and a citations section at the end.
         `_fix` method in the calling `_execute_and_verify_single_task` function.
         """
         successful = await self._verify_result_internal(subtask_results_map)
+        ic(successful)
         if successful:
             self.status = "succeeded"
             if self.current_span:
@@ -1101,7 +1143,8 @@ Make sure to include citations [1] and a citations section at the end.
                     output_type=str,
                     instrument=True,
                 )
-                response = await align_agent.run(user_prompt=alignment_prompt)
+                # FIXED: Execute agent run in a separate thread to prevent blocking.
+                response = await self._execute_agent_run(align_agent, alignment_prompt)
 
                 self.cost += await self.calculate_cost_and_update_span(response, summary_span)
 
