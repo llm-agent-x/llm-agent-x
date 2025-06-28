@@ -30,7 +30,6 @@ from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
     pre_tasks_executed,
     on_task_executed,
     on_tool_call_executed,
-    save_flowchart,
 )
 from llm_agent_x.console import console, live
 from llm_agent_x.cli_args_parser import parser
@@ -41,6 +40,7 @@ from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from llm_agent_x.tools.brave_web_search import brave_web_search
 from llm_agent_x.tools.exec_python import exec_python
+from llm_agent_x.backend.utils import ic_dev
 
 # Keep all initialization code at the global level
 provider = TracerProvider()
@@ -52,18 +52,20 @@ exporter = OTLPSpanExporter(
 )
 provider.add_span_processor(BatchSpanProcessor(exporter))
 
+
 # --- FIX: Register the shutdown function with atexit ---
 # This function will be called reliably upon script exit.
 def shutdown_telemetry():
-    print("atexit: Shutting down OpenTelemetry provider...")
+    # print("atexit: Shutting down OpenTelemetry provider...")
     provider.shutdown()
-    print("atexit: Shutdown complete.")
+    # print("atexit: Shutdown complete.")
+
 
 atexit.register(shutdown_telemetry)
 # ---------------------------------------------------------
 
 client = AsyncOpenAI(max_retries=3)
-model = OpenAIModel('gpt-4o-mini', provider=OpenAIProvider(openai_client=client))
+model = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
 
 nltk.download("punkt_tab", force=False)
 
@@ -92,7 +94,7 @@ def main():
             try:
                 with open(mcp_config, "r") as f:
                     config = json.load(f)
-                ic(config)
+                ic_dev(config)
 
                 assert type(config) == dict
                 for key, value in config.items():
@@ -100,13 +102,15 @@ def main():
                     if value.get("transport") == "streamable_http":
                         mcp_client = MCPServerStreamableHTTP(url=value.get("url"))
                     if value.get("transport") == "stdio":
-                        mcp_client = MCPServerStdio(command=value.get("command"), args=value.get("args"))
+                        mcp_client = MCPServerStdio(
+                            command=value.get("command"), args=value.get("args")
+                        )
                     assert mcp_client is not None
                     mcp_servers.append(mcp_client)
             except FileNotFoundError:
                 raise FileNotFoundError(f"Config file '{mcp_config}' not found.")
 
-        ic(tools_dict_for_agent.values())
+        ic_dev(tools_dict_for_agent.values())
 
         if args.enable_python_execution:
             available_tools.append(exec_python)
@@ -142,7 +146,11 @@ def main():
                     allow_tools=True,
                     tools_dict=tools_dict_for_agent,
                     task_limits=TaskLimit.from_array(eval(args.task_limit)),
-                    merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],
+                    merger={
+                        "ai": LLMMerger,
+                        "append": AppendMerger,
+                        "algorithmic": AlgorithmicMerger,
+                    }[args.merger],
                 ),
             )
 
@@ -167,11 +175,9 @@ def main():
                     live.stop()
                 live = None
 
-            save_flowchart(output_dir)
-
             if args.output is not None:
                 output_file = output_dir / args.output
-                with output_file.open("w", encoding='utf-8') as output_f:
+                with output_file.open("w", encoding="utf-8") as output_f:
                     output_f.write(response)
                 console.print(f"Agent response saved to {output_file}")
             console.print("\nFinal Response:\n", style="bold green")
@@ -182,11 +188,12 @@ def main():
     except Exception as e:
         # Catch any exceptions from the main logic so we still exit cleanly
         console.print_exception()
-        console.print(f"A critical error occurred in main execution: {e}", style="bold red")
+        console.print(
+            f"A critical error occurred in main execution: {e}", style="bold red"
+        )
 
 
 if __name__ == "__main__":
     print("Starting agent...")
     main()
     print("Main function finished. Exiting.")
-    # The time.sleep() is no longer needed here, atexit will handle the timing.

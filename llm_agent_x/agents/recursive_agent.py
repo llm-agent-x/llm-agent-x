@@ -1,14 +1,10 @@
-import asyncio
-import json
 import uuid
 from difflib import SequenceMatcher
 from os import getenv
 from typing import Any, Callable, Literal, Optional, List, Dict, Union
 
-from attr.validators import is_callable
-from black import Mode, format_str
 from langsmith.run_helpers import is_async
-from opentelemetry.trace import Status
+
 # from grpc import Status
 from openinference.semconv.trace import SpanAttributes
 
@@ -17,17 +13,14 @@ from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
 
 # --- Original Imports (some will be replaced) ---
-from llm_agent_x.backend.dot_tree import DotTree
 from llm_agent_x.backend.exceptions import TaskFailedException
 from opentelemetry import trace, context as otel_context
 from pydantic import BaseModel, Field, validator, ValidationError
 from llm_agent_x.backend.mergers.LLMMerger import MergeOptions, LLMMerger
-from icecream import ic
+
+from llm_agent_x.backend.utils import ic_dev
 from llm_agent_x.complexity_model import TaskEvaluation, evaluate_prompt
 import logging
-import tiktoken
-from llm_agent_x.tools.summarize import summarize
-from pydantic_ai.models import Model
 from pydantic_ai.mcp import MCPServer
 
 # Configure logging
@@ -52,7 +45,7 @@ class TaskLimitConfig:
 
     @staticmethod
     def falloff(
-            initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
+        initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
     ) -> List[int]:
         return [falloff_func(i) for i in range(max_depth)]
 
@@ -76,7 +69,7 @@ class TaskLimit(BaseModel):
 
     @classmethod
     def from_falloff(
-            cls, initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
+        cls, initial_tasks: int, max_depth: int, falloff_func: Callable[[int], int]
     ):
         return cls(
             limits=TaskLimitConfig.falloff(initial_tasks, max_depth, falloff_func)
@@ -170,7 +163,7 @@ def calculate_raw_similarity(text1: str, text2: str) -> float:
 
 
 def _serialize_lc_messages_for_preview(
-        messages: List[Dict[str, Any]], max_len: int = 500
+    messages: List[Dict[str, Any]], max_len: int = 500
 ) -> str:
     if not messages:
         return "[]"
@@ -186,7 +179,7 @@ def _serialize_lc_messages_for_preview(
 
 
 def _build_history(
-        system_prompt: str, human_prompt: str, conversation: List[Dict] = None
+    system_prompt: str, human_prompt: str, conversation: List[Dict] = None
 ) -> List[Dict[str, Any]]:
     history = [{"role": "system", "content": system_prompt}]
     if conversation:
@@ -197,19 +190,19 @@ def _build_history(
 
 class RecursiveAgent:
     def __init__(
-            self,
-            task: Any,
-            u_inst: str,
-            tracer: Optional[trace.Tracer] = None,
-            tracer_span: Optional[trace.Span] = None,
-            agent_options: Optional[RecursiveAgentOptions] = None,
-            allow_subtasks: bool = True,
-            current_layer: int = 0,
-            parent: Optional["RecursiveAgent"] = None,
-            context: Optional[TaskContext] = None,
-            siblings: Optional[List["RecursiveAgent"]] = None,
-            task_type_override: Optional[str] = None,
-            max_fix_attempts: int = 2,
+        self,
+        task: Any,
+        u_inst: str,
+        tracer: Optional[trace.Tracer] = None,
+        tracer_span: Optional[trace.Span] = None,
+        agent_options: Optional[RecursiveAgentOptions] = None,
+        allow_subtasks: bool = True,
+        current_layer: int = 0,
+        parent: Optional["RecursiveAgent"] = None,
+        context: Optional[TaskContext] = None,
+        siblings: Optional[List["RecursiveAgent"]] = None,
+        task_type_override: Optional[str] = None,
+        max_fix_attempts: int = 2,
     ):
         if agent_options is None:
             # Note: self.logger is not available before it's defined.
@@ -238,7 +231,7 @@ class RecursiveAgent:
         self.tracer = tracer if tracer else trace.get_tracer(__name__)
         self.tracer_span = tracer_span
         self.allow_subtasks = allow_subtasks
-        self.llm: DotTree = self.options.llm
+        self.llm: Any = self.options.llm
         self.tools = self.options.tools
         self.current_layer = current_layer
         self.parent = parent
@@ -331,6 +324,7 @@ class RecursiveAgent:
             "broader_family_contexts": broader_family_contexts_data,
             "dependency_contexts": dependency_contexts_data,
         }
+
     def _build_task_hierarchy_str(self) -> str:
         """
         Builds a string representing the task's position in the hierarchy,
@@ -348,13 +342,16 @@ class RecursiveAgent:
 
         # Reverse the list to display from the top-level parent down
         path.reverse()
-        hierarchy_str = "You are executing a sub-task. Here is the hierarchy of parent tasks:\n"
+        hierarchy_str = (
+            "You are executing a sub-task. Here is the hierarchy of parent tasks:\n"
+        )
         for i, task_str in enumerate(path):
             hierarchy_str += f"{'  ' * i}L- {task_str}\n"
 
         # Add the current task at the end for full context
         hierarchy_str += f"{'  ' * len(path)}--> (Your Current Task) {self.task}"
         return hierarchy_str
+
     def _format_history_parts(
         self,
         context_info: dict,
@@ -436,7 +433,7 @@ class RecursiveAgent:
             )
             try:
                 result = await self._run()
-                ic("Agent run complete")
+                ic_dev("Agent run complete")
 
                 span.set_attribute("agent.final_status", self.status)
                 span.add_event(
@@ -508,7 +505,7 @@ class RecursiveAgent:
                 self.result = await self._execute_and_verify_single_task()
                 return self.result
         split_task_result = await self._split_task()
-        ic(split_task_result)
+        ic_dev(split_task_result)
         if span:
             span.add_event(
                 "Task Splitting Outcome",
@@ -617,9 +614,9 @@ class RecursiveAgent:
                     for dep_uuid in agent.task_obj.depends_on
                     if dep_uuid in completed_tasks
                 }
-                ic("Agent Running")
+                ic_dev("Agent Running")
                 result = await agent.run()
-                ic("Agent Finished")
+                ic_dev("Agent Finished")
 
                 self.cost += agent.cost
 
@@ -628,7 +625,7 @@ class RecursiveAgent:
                 )
                 del pending_agents[agent.uuid]
                 if span:
-                    ic("Adding event")
+                    ic_dev("Adding event")
                     span.add_event(
                         f"Task Completed",
                         {
@@ -637,7 +634,7 @@ class RecursiveAgent:
                             "result_preview": str(result)[:100],
                         },
                     )
-                    ic("Added event")
+                    ic_dev("Added event")
 
         if pending_agents:
             self.logger.warning(
@@ -649,11 +646,11 @@ class RecursiveAgent:
         subtask_results = [
             result for uuid, result in completed_tasks.items() if uuid in child_agents
         ]
-        ic("Summarizing subtask results")
+        ic_dev("Summarizing subtask results")
         self.result = await self._summarize_subtask_results(
             subtask_tasks, subtask_results
         )
-        ic("Summarized subtask results")
+        ic_dev("Summarized subtask results")
         if span:
             span.set_attribute("result", self.result)
         self.context.result = self.result
@@ -663,25 +660,25 @@ class RecursiveAgent:
             if uuid in child_agents
         }
         try:
-            ic("Verifying result")
+            ic_dev("Verifying result")
             await self.verify_result(subtask_results_map)
-            ic("Verification passed")
+            ic_dev("Verification passed")
         except TaskFailedException:
             if span:
                 span.add_event("Verification Failed, Attempting Fix")
-            ic("Verification failed, attempting fix")
+            ic_dev("Verification failed, attempting fix")
             await self._fix(subtask_results_map)
-            ic("Fixed")
+            ic_dev("Fixed")
         if self.options.on_task_executed:
-            ic("Calling on_task_executed")
+            ic_dev("Calling on_task_executed")
             self.options.on_task_executed(
                 self.task,
                 self.uuid,
                 self.result,
                 self.parent.uuid if self.parent else None,
             )
-            ic("Called on_task_executed")
-        ic("Returning result")
+            ic_dev("Called on_task_executed")
+        ic_dev("Returning result")
         return self.result
 
     async def _execute_and_verify_single_task(self) -> str:
@@ -689,7 +686,7 @@ class RecursiveAgent:
         self.context.result = self.result
         try:
             await self.verify_result(None)
-            ic("Verification passed")
+            ic_dev("Verification passed")
         except TaskFailedException:
             if self.current_span:
                 self.current_span.add_event(
@@ -714,7 +711,7 @@ class RecursiveAgent:
             else otel_context.get_current()
         )
         with self.tracer.start_as_current_span(
-                "Run Single Task Operation", context=parent_context
+            "Run Single Task Operation", context=parent_context
         ) as single_task_span:
             task_hierarchy_str = self._build_task_hierarchy_str()
             dependency_context_parts = []
@@ -751,7 +748,8 @@ Make sure to include citations [1] and a citations section at the end.
 """
             system_prompt_content = system_prompt_template.format(
                 task_hierarchy=task_hierarchy_str,
-                dependency_data=dependency_context_str or "No data from dependencies provided."
+                dependency_data=dependency_context_str
+                or "No data from dependencies provided.",
             ).strip()
             human_message_content = self.task
             if self.u_inst:
@@ -767,8 +765,8 @@ Make sure to include citations [1] and a citations section at the end.
                 mcp_servers=self.options.mcp_servers,
             )
             single_task_span.add_event("Executing Pydantic-AI agent")
-            ic(self.tools)
-            ic(human_message_content)
+            ic_dev(self.tools)
+            ic_dev(human_message_content)
 
             # --- FIX: Replaced _execute_agent_run with a direct await call ---
             # This is the correct, simple way to run an async function.
@@ -776,10 +774,12 @@ Make sure to include citations [1] and a citations section at the end.
             async with tool_agent.run_mcp_servers():
                 response = await tool_agent.run(user_prompt=human_message_content)
 
-            self.cost += await self.calculate_cost_and_update_span(response, single_task_span)
-            ic(response.output)
+            self.cost += await self.calculate_cost_and_update_span(
+                response, single_task_span
+            )
+            ic_dev(response.output)
             final_result_content = response.output or "No result."
-            ic(final_result_content)
+            ic_dev(final_result_content)
             return str(final_result_content)
 
     async def calculate_cost_and_update_span(self, response: AgentRunResult, span):
@@ -792,7 +792,9 @@ Make sure to include citations [1] and a citations section at the end.
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, response_tokens)
         total_tokens = usage.total_tokens
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, total_tokens)
-        total_cost = (input_token_cost * request_tokens) + (output_token_cost * response_tokens)
+        total_cost = (input_token_cost * request_tokens) + (
+            output_token_cost * response_tokens
+        )
         span.set_attribute(SpanAttributes.LLM_COST_TOTAL, total_cost)
         return total_cost
 
@@ -804,7 +806,7 @@ Make sure to include citations [1] and a citations section at the end.
             else otel_context.get_current()
         )
         with self.tracer.start_as_current_span(
-                "Split Task Operation", context=parent_context
+            "Split Task Operation", context=parent_context
         ) as split_span:
             # ... (code to build system message is unchanged) ...
             task_history = self._build_task_split_history()
@@ -820,15 +822,16 @@ Make sure to include citations [1] and a citations section at the end.
                 if uuid not in ancestor_uuids and agent.status == "succeeded"
             ]
             existing_tasks_str = (
-                    "\n".join(
-                        [
-                            f'- Task: "{a.task}"\n  UUID: {a.uuid}'
-                            for a in sorted(valid_deps, key=lambda a: a.task)
-                        ]
-                    )
-                    or "No other tasks can be depended on."
+                "\n".join(
+                    [
+                        f'- Task: "{a.task}"\n  UUID: {a.uuid}'
+                        for a in sorted(valid_deps, key=lambda a: a.task)
+                    ]
+                )
+                or "No other tasks can be depended on."
             )
             import inspect
+
             tools_docs = "\n".join(
                 [
                     f"{t.name}: {getattr(t, 'description', '') or inspect.cleandoc(t.__doc__)}"
@@ -842,14 +845,16 @@ Make sure to include citations [1] and a citations section at the end.
 
             evaluation = evaluate_prompt(f"Prompt: {self.task}")
             if (
-                    evaluation.prompt_complexity_score[0] < 0.1
-                    and evaluation.domain_knowledge[0] > 0.8
+                evaluation.prompt_complexity_score[0] < 0.1
+                and evaluation.domain_knowledge[0] > 0.8
             ):
                 return SplitTask(
                     needs_subtasks=False, subtasks=[], evaluation=evaluation
                 )
             split_agent = Agent(
-                model=self.llm, system_prompt=system_msg_content, output_type=SplitTask,
+                model=self.llm,
+                system_prompt=system_msg_content,
+                output_type=SplitTask,
             )
             try:
                 # --- FIX: Replaced _execute_agent_run with a direct await call ---
@@ -857,7 +862,9 @@ Make sure to include citations [1] and a citations section at the end.
                 async with split_agent.run_mcp_servers():
                     response = await split_agent.run(user_prompt=self.task)
 
-                self.cost += await self.calculate_cost_and_update_span(response, split_span)
+                self.cost += await self.calculate_cost_and_update_span(
+                    response, split_span
+                )
                 split_task_result = response.output
                 split_task_result.evaluation = evaluation
             except (ValidationError, Exception) as e:
@@ -874,7 +881,7 @@ Make sure to include citations [1] and a citations section at the end.
             return split_task_result
 
     async def _verify_result_internal(
-            self, subtask_results_map: Optional[Dict[str, str]] = None
+        self, subtask_results_map: Optional[Dict[str, str]] = None
     ) -> bool:
         agent_span = self.current_span
         parent_context = (
@@ -883,7 +890,7 @@ Make sure to include citations [1] and a citations section at the end.
             else otel_context.get_current()
         )
         with self.tracer.start_as_current_span(
-                "Verify Result Operation", context=parent_context
+            "Verify Result Operation", context=parent_context
         ) as verify_span:
             if self.result is None or not self.result.strip():
                 verify_span.add_event("Verification Failed: No result provided.")
@@ -896,11 +903,11 @@ Make sure to include citations [1] and a citations section at the end.
                 "Score the result based on how well it answers the task, taking into account accuracy, completeness, relevance, adherence to instructions, and clarity. "
                 f"Output JSON matching the '{verification.__name__}' schema."
             )
-            ic("-" * 100)
-            ic(self.task)
-            ic(self.result)
-            ic(self.u_inst)
-            ic("-" * 85)
+            ic_dev("-" * 100)
+            ic_dev(self.task)
+            ic_dev(self.result)
+            ic_dev(self.u_inst)
+            ic_dev("-" * 85)
             human_msg = (
                 f"Task:\n'''{self.task}'''\n\n"
                 f"Result:\n'''{self.result}'''\n\n"
@@ -910,7 +917,9 @@ Make sure to include citations [1] and a citations section at the end.
             )
 
             verify_agent = Agent(
-                model=self.llm, system_prompt=system_msg, output_type=verification,
+                model=self.llm,
+                system_prompt=system_msg,
+                output_type=verification,
             )
             try:
                 # --- FIX: Replaced _execute_agent_run with a direct await call ---
@@ -918,10 +927,12 @@ Make sure to include citations [1] and a citations section at the end.
                 async with verify_agent.run_mcp_servers():
                     response = await verify_agent.run(user_prompt=human_msg)
 
-                self.cost += await self.calculate_cost_and_update_span(response, verify_span)
+                self.cost += await self.calculate_cost_and_update_span(
+                    response, verify_span
+                )
                 verification_output = response.output
-                ic(verification_output)
-                ic("-" * 50)
+                ic_dev(verification_output)
+                ic_dev("-" * 50)
                 if not verification_output.get_successful():
                     self.logger.warning(
                         f"Verification failed for task '{self.task}'. Reason: {verification_output.reason}"
@@ -943,14 +954,14 @@ Make sure to include citations [1] and a citations section at the end.
         `_fix` method in the calling `_execute_and_verify_single_task` function.
         """
         successful = await self._verify_result_internal(subtask_results_map)
-        ic(successful)
+        ic_dev(successful)
         if successful:
             self.status = "succeeded"
             if self.current_span:
                 self.current_span.add_event("Verification Passed")
         else:
             self.status = "failed_verification"
-            ic("Verification failed")
+            ic_dev("Verification failed")
             if self.current_span:
                 self.current_span.add_event("Verification Failed")
             # This exception is critical to trigger the fix/retry mechanism.
@@ -1029,7 +1040,7 @@ Make sure to include citations [1] and a citations section at the end.
         return self.options.task_limits.limits[self.current_layer]
 
     async def _summarize_subtask_results(
-            self, tasks: List[str], subtask_results: List[str]
+        self, tasks: List[str], subtask_results: List[str]
     ) -> str:
         current_task_type = getattr(self, "task_type", "research")
         if current_task_type in ["basic", "task"]:
@@ -1079,9 +1090,11 @@ Make sure to include citations [1] and a citations section at the end.
                     )
                     merger = self.options.merger(merge_options)
                     # Run the synchronous merge_documents in a separate thread
-                    ic("Running merger in a separate thread...")
+                    ic_dev("Running merger in a separate thread...")
                     if is_async(merger.merge_documents):
-                        merged_content = await merger.merge_documents(documents_to_merge)
+                        merged_content = await merger.merge_documents(
+                            documents_to_merge
+                        )
                     else:
                         merged_content = merger.merge_documents(documents_to_merge)
 
@@ -1090,7 +1103,7 @@ Make sure to include citations [1] and a citations section at the end.
                             merged_content, summary_span
                         )
                         merged_content_str = merged_content.output
-                    ic("Merger completed.")
+                    ic_dev("Merger completed.")
                 except Exception as e_merge:
                     self.logger.warning(
                         f"LLMMerger failed: {e_merge}. Using simple join.",
@@ -1111,6 +1124,8 @@ Make sure to include citations [1] and a citations section at the end.
             async with align_agent.run_mcp_servers():
                 response = await align_agent.run(user_prompt=alignment_prompt)
 
-            self.cost += await self.calculate_cost_and_update_span(response, summary_span)
+            self.cost += await self.calculate_cost_and_update_span(
+                response, summary_span
+            )
             final_summary = response.output
         return final_summary
