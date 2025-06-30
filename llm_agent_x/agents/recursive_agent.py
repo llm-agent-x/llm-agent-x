@@ -1,7 +1,7 @@
 import uuid
 from difflib import SequenceMatcher
 from os import getenv
-from typing import Any, Callable, Literal, Optional, List, Dict, Union
+from typing import Any, Callable, Literal, Optional, List, Dict, Union, Tuple
 
 from langsmith.run_helpers import is_async
 
@@ -101,9 +101,16 @@ class TaskObject(LLMTaskObject):
 class task(TaskObject):
     pass
 
+
 class task_result(BaseModel):
     result: str
-    extra_requested_tasks: List[str]
+
+class task_result_with_extra_tasks(task_result):
+    extra_requested_tasks: List[str] = Field(
+        default=[],
+        description="A list of NEW sibling tasks to be executed after the current set of siblings is complete. Up to 5 extra tasks can be requested.",
+        max_length=5,
+    )
 
 
 class verification(BaseModel):
@@ -251,10 +258,8 @@ class RecursiveAgent:
             else 2
         )
         self.cost = 0
-
-    # --- FIX: REMOVED THE ENTIRE _execute_agent_run METHOD ---
-    # This method was the source of the event loop conflicts.
-    # It will be replaced with direct `await` calls.
+        # --- FIX: ADDED STATE TO HOLD TASKS REQUESTED BY LLM ---
+        self.newly_requested_tasks: List[TaskObject] = []
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -625,18 +630,15 @@ class RecursiveAgent:
                     for dep_uuid in agent.task_obj.depends_on
                     if dep_uuid in completed_tasks
                 }
-                ic_dev("Agent Running")
+
                 result = await agent.run()
-                ic_dev("Agent Finished")
 
                 self.cost += agent.cost
-
                 completed_tasks[agent.uuid] = (
                     result if result is not None else "No result."
                 )
                 del pending_agents[agent.uuid]
                 if span:
-                    ic_dev("Adding event")
                     span.add_event(
                         f"Task Completed",
                         {
@@ -645,7 +647,58 @@ class RecursiveAgent:
                             "result_preview": str(result)[:100],
                         },
                     )
-                    ic_dev("Added event")
+
+                # --- FIX: HANDLE NEWLY REQUESTED TASKS ---
+                if agent.newly_requested_tasks:
+                    self.logger.info(
+                        f"Agent {agent.uuid} requested {len(agent.newly_requested_tasks)} new sibling tasks."
+                    )
+                    if span:
+                        span.add_event(
+                            "Dynamically Adding Sibling Tasks",
+                            {
+                                "count": len(agent.newly_requested_tasks),
+                                "tasks": [t.task for t in agent.newly_requested_tasks],
+                                "requesting_agent_uuid": agent.uuid,
+                            },
+                        )
+
+                    newly_created_agents = []
+                    for new_task_obj in agent.newly_requested_tasks:
+                        new_child_context = TaskContext(
+                            task=new_task_obj.task, parent_context=self.context
+                        )
+                        # New tasks are siblings, so they have the same parent (self) and are at the same layer as the agent that created them.
+                        new_agent = RecursiveAgent(
+                            task=new_task_obj,
+                            u_inst=self.u_inst,
+                            tracer=self.tracer,
+                            tracer_span=span,
+                            agent_options=self.options,
+                            allow_subtasks=(
+                                agent.current_layer
+                                < len(self.options.task_limits.limits)
+                            ),
+                            current_layer=agent.current_layer,  # Sibling => same layer
+                            parent=self,  # Sibling => same parent
+                            context=new_child_context,
+                        )
+                        child_agents[new_agent.uuid] = new_agent
+                        pending_agents[new_agent.uuid] = new_agent
+                        child_contexts.append(new_child_context)
+                        newly_created_agents.append(new_agent)
+
+                    # Reset the list on the child agent to avoid reprocessing
+                    agent.newly_requested_tasks = []
+
+                    # Update sibling contexts for ALL children (old and new)
+                    for ag in child_agents.values():
+                        ag.context.siblings = [
+                            c_ctx for c_ctx in child_contexts if c_ctx.task != ag.task
+                        ]
+
+                    # Increase loop guard to allow new tasks to run
+                    max_loops += len(newly_created_agents)
 
         if pending_agents:
             self.logger.warning(
@@ -767,7 +820,7 @@ Make sure to include citations [1] and a citations section at the end.
                 human_message_content += (
                     f"\n\nFollow these specific instructions: {self.u_inst}"
                 )
-            human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics). Also, can you include any extra tasks that you want to add as a sibling (appended to the end), to be executed after the remaining siblings are completed?"
+            human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics). Also, you can specify any extra tasks you want to add as a sibling (using the `extra_requested_tasks` field), to be executed after the current set of siblings is completed."
             tool_agent = Agent(
                 model=self.llm,
                 system_prompt=system_prompt_content,
@@ -776,11 +829,7 @@ Make sure to include citations [1] and a citations section at the end.
                 mcp_servers=self.options.mcp_servers,
             )
             single_task_span.add_event("Executing Pydantic-AI agent")
-            ic_dev(self.tools)
-            ic_dev(human_message_content)
 
-            # --- FIX: Replaced _execute_agent_run with a direct await call ---
-            # This is the correct, simple way to run an async function.
             response: AgentRunResult
             async with tool_agent.run_mcp_servers():
                 response = await tool_agent.run(user_prompt=human_message_content)
@@ -788,9 +837,28 @@ Make sure to include citations [1] and a citations section at the end.
             self.cost += await self.calculate_cost_and_update_span(
                 response, single_task_span
             )
+
             ic_dev(response.output)
+
             final_result_content = response.output.result or "No result."
-            ic_dev(final_result_content)
+
+            # --- FIX: CAPTURE EXTRA REQUESTED TASKS ---
+            extra_tasks_str = response.output.extra_requested_tasks or []
+            if extra_tasks_str:
+                self.newly_requested_tasks = [
+                    TaskObject(
+                        task=t, type="research", allow_search=True, allow_tools=True
+                    )
+                    for t in extra_tasks_str
+                ]
+                self.logger.info(
+                    f"LLM requested {len(self.newly_requested_tasks)} new sibling tasks to be queued."
+                )
+                single_task_span.add_event(
+                    "LLM Requested New Sibling Tasks",
+                    {"count": len(self.newly_requested_tasks)},
+                )
+
             return str(final_result_content)
 
     async def calculate_cost_and_update_span(self, response: AgentRunResult, span):
@@ -819,7 +887,6 @@ Make sure to include citations [1] and a citations section at the end.
         with self.tracer.start_as_current_span(
             "Split Task Operation", context=parent_context
         ) as split_span:
-            # ... (code to build system message is unchanged) ...
             task_history = self._build_task_split_history()
             max_subtasks = self._get_max_subtasks()
             ancestor_uuids = set()
@@ -868,7 +935,6 @@ Make sure to include citations [1] and a citations section at the end.
                 output_type=SplitTask,
             )
             try:
-                # --- FIX: Replaced _execute_agent_run with a direct await call ---
                 response: AgentRunResult
                 async with split_agent.run_mcp_servers():
                     response = await split_agent.run(user_prompt=self.task)
@@ -907,7 +973,6 @@ Make sure to include citations [1] and a citations section at the end.
                 verify_span.add_event("Verification Failed: No result provided.")
                 return False
 
-            # ... (code to build system and human messages is unchanged) ...
             task_history = self._build_task_verify_history(subtask_results_map)
             system_msg = (
                 "You are a strict quality assurance verifier. Your job is to check if the provided 'Result' accurately and completely answers the 'Task', considering the history and user instructions. "
@@ -933,7 +998,6 @@ Make sure to include citations [1] and a citations section at the end.
                 output_type=verification,
             )
             try:
-                # --- FIX: Replaced _execute_agent_run with a direct await call ---
                 response: AgentRunResult
                 async with verify_agent.run_mcp_servers():
                     response = await verify_agent.run(user_prompt=human_msg)
@@ -958,12 +1022,6 @@ Make sure to include citations [1] and a citations section at the end.
                 return False
 
     async def verify_result(self, subtask_results_map: Optional[Dict[str, str]] = None):
-        """
-        FIXED: The logic for handling a failed verification was corrected.
-        It now correctly sets the agent status to 'failed_verification' and, crucially,
-        raises a `TaskFailedException`. This exception is essential for triggering the
-        `_fix` method in the calling `_execute_and_verify_single_task` function.
-        """
         successful = await self._verify_result_internal(subtask_results_map)
         ic_dev(successful)
         if successful:
@@ -975,7 +1033,6 @@ Make sure to include citations [1] and a citations section at the end.
             ic_dev("Verification failed")
             if self.current_span:
                 self.current_span.add_event("Verification Failed")
-            # This exception is critical to trigger the fix/retry mechanism.
             raise TaskFailedException(f"Task '{self.task}' failed verification.")
 
     async def _fix(self, failed_subtask_results_map: Optional[Dict[str, str]]):
@@ -1016,11 +1073,10 @@ Make sure to include citations [1] and a citations section at the end.
             fix_span.add_event("Retrying task execution with fix instructions.")
 
             try:
-                # Re-run the single task execution and verification within the same agent instance
-                # This call will attempt execution and then verification. If the new verification
-                # also fails, it will raise an exception that is caught below.
+                # We re-run the main execution and verification logic.
+                # Since this logic now handles populating `newly_requested_tasks`,
+                # a fix attempt can also request new tasks, though this is less likely.
                 self.result = await self._execute_and_verify_single_task()
-                # If it gets here without raising an exception, it succeeded.
                 self.status = "succeeded"
                 fix_span.add_event(
                     "Fix Attempt Succeeded and Verified", {"final_status": self.status}
@@ -1042,7 +1098,6 @@ Make sure to include citations [1] and a citations section at the end.
                     f"Fixer agent for '{self.task}' run failed."
                 ) from e_fix_run
             finally:
-                # Restore original instructions to prevent contamination on subsequent calls
                 self.u_inst = original_u_inst
 
     def _get_max_subtasks(self) -> int:
@@ -1065,7 +1120,7 @@ Make sure to include citations [1] and a citations section at the end.
                 for i, (task_item, result_item) in enumerate(
                     zip(tasks, subtask_results)
                 ):
-                    status_update_parts.append(f"Sub-action {i+1}: {task_item}")
+                    status_update_parts.append(f"Sub-action {i + 1}: {task_item}")
                     status_update_parts.append(f"  Result: {str(result_item)}")
             return "\n".join(status_update_parts)
 
@@ -1100,8 +1155,7 @@ Make sure to include citations [1] and a citations section at the end.
                         llm=llm_for_merge, context_window=15000
                     )
                     merger = self.options.merger(merge_options)
-                    # Run the synchronous merge_documents in a separate thread
-                    ic_dev("Running merger in a separate thread...")
+                    ic_dev("Running merger...")
                     if is_async(merger.merge_documents):
                         merged_content = await merger.merge_documents(
                             documents_to_merge
@@ -1130,7 +1184,6 @@ Make sure to include citations [1] and a citations section at the end.
                 system_prompt="You are a report-writing assistant.",
                 output_type=str,
             )
-            # --- FIX: Replaced _execute_agent_run with a direct await call ---
             response: AgentRunResult
             async with align_agent.run_mcp_servers():
                 response = await align_agent.run(user_prompt=alignment_prompt)

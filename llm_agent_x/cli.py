@@ -41,6 +41,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from llm_agent_x.tools.brave_web_search import brave_web_search
 from llm_agent_x.tools.exec_python import exec_python
 from llm_agent_x.backend.utils import ic_dev, TaskType
+
 # Keep all initialization code at the global level
 provider = TracerProvider()
 trace.set_tracer_provider(provider)
