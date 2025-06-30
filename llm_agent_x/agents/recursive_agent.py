@@ -101,6 +101,10 @@ class TaskObject(LLMTaskObject):
 class task(TaskObject):
     pass
 
+class task_result(BaseModel):
+    result: str
+    extra_requested_tasks: List[str]
+
 
 class verification(BaseModel):
     reason: str
@@ -347,6 +351,13 @@ class RecursiveAgent:
         )
         for i, task_str in enumerate(path):
             hierarchy_str += f"{'  ' * i}L- {task_str}\n"
+
+        # Get current task's siblings
+        siblings = self.context.siblings
+        if siblings:
+            hierarchy_str += "Current Task Siblings:\n"
+            for i, sibling in enumerate(siblings):
+                hierarchy_str += f"- {sibling}\n"
 
         # Add the current task at the end for full context
         hierarchy_str += f"{'  ' * len(path)}--> (Your Current Task) {self.task}"
@@ -756,11 +767,11 @@ Make sure to include citations [1] and a citations section at the end.
                 human_message_content += (
                     f"\n\nFollow these specific instructions: {self.u_inst}"
                 )
-            human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics)."
+            human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics). Also, can you include any extra tasks that you want to add as a sibling (appended to the end), to be executed after the remaining siblings are completed?"
             tool_agent = Agent(
                 model=self.llm,
                 system_prompt=system_prompt_content,
-                output_type=str,
+                output_type=task_result,
                 tools=self.tools,
                 mcp_servers=self.options.mcp_servers,
             )
@@ -778,7 +789,7 @@ Make sure to include citations [1] and a citations section at the end.
                 response, single_task_span
             )
             ic_dev(response.output)
-            final_result_content = response.output or "No result."
+            final_result_content = response.output.result or "No result."
             ic_dev(final_result_content)
             return str(final_result_content)
 
