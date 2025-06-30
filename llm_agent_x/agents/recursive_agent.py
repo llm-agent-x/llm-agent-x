@@ -104,11 +104,10 @@ class task(TaskObject):
 
 class task_result(BaseModel):
     result: str
-
-class task_result_with_extra_tasks(task_result):
     extra_requested_tasks: List[str] = Field(
         default=[],
         description="A list of NEW sibling tasks to be executed after the current set of siblings is complete. Up to 5 extra tasks can be requested.",
+        # --- CHANGE: Added max_length for Pydantic-level validation as a safeguard ---
         max_length=5,
     )
 
@@ -214,10 +213,10 @@ class RecursiveAgent:
         siblings: Optional[List["RecursiveAgent"]] = None,
         task_type_override: Optional[str] = None,
         max_fix_attempts: int = 2,
+        # --- CHANGE: Added a flag to identify dynamically created agents ---
+        is_dynamically_added: bool = False,
     ):
         if agent_options is None:
-            # Note: self.logger is not available before it's defined.
-            # Use the global logger for this initial message.
             logger.info("No agent_options provided, using default configuration.")
             agent_options = RecursiveAgentOptions(
                 task_limits=TaskLimit.from_constant(max_tasks=3, max_depth=2)
@@ -233,8 +232,14 @@ class RecursiveAgent:
         self.uuid = self.task_obj.uuid
         self.task_type = task_type_override or self.task_obj.type
         self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{self.uuid}")
+
+        # --- CHANGE: Store the dynamic flag and log it ---
+        self.is_dynamically_added = is_dynamically_added
+        dynamic_status = (
+            "Dynamically Added" if self.is_dynamically_added else "Pre-defined"
+        )
         self.logger.info(
-            f"Initializing RecursiveAgent for task: '{self.task}' (Type: {self.task_type}) at layer {current_layer} with UUID: {self.uuid}"
+            f"Initializing RecursiveAgent for task: '{self.task}' (Type: {self.task_type}, Status: {dynamic_status}) at layer {current_layer} with UUID: {self.uuid}"
         )
         if self.options.task_registry is not None:
             self.options.task_registry[self.uuid] = self
@@ -258,7 +263,6 @@ class RecursiveAgent:
             else 2
         )
         self.cost = 0
-        # --- FIX: ADDED STATE TO HOLD TASKS REQUESTED BY LLM ---
         self.newly_requested_tasks: List[TaskObject] = []
 
     def _get_token_count(self, text: str) -> int:
@@ -335,12 +339,7 @@ class RecursiveAgent:
         }
 
     def _build_task_hierarchy_str(self) -> str:
-        """
-        Builds a string representing the task's position in the hierarchy,
-        showing parent and grandparent tasks.
-        """
         path = []
-        # Traverse up from the parent of the current task
         current_ctx = self.context.parent_context
         while current_ctx:
             path.append(current_ctx.task)
@@ -349,7 +348,6 @@ class RecursiveAgent:
         if not path:
             return f"Current Task: {self.task}\n(This is a root task with no parents)"
 
-        # Reverse the list to display from the top-level parent down
         path.reverse()
         hierarchy_str = (
             "You are executing a sub-task. Here is the hierarchy of parent tasks:\n"
@@ -357,14 +355,12 @@ class RecursiveAgent:
         for i, task_str in enumerate(path):
             hierarchy_str += f"{'  ' * i}L- {task_str}\n"
 
-        # Get current task's siblings
         siblings = self.context.siblings
         if siblings:
             hierarchy_str += "Current Task Siblings:\n"
             for i, sibling in enumerate(siblings):
-                hierarchy_str += f"- {sibling}\n"
+                hierarchy_str += f"- {sibling.task}\n"
 
-        # Add the current task at the end for full context
         hierarchy_str += f"{'  ' * len(path)}--> (Your Current Task) {self.task}"
         return hierarchy_str
 
@@ -436,6 +432,7 @@ class RecursiveAgent:
                 "agent.layer": self.current_layer,
                 "agent.initial_status": self.status,
                 "agent.allow_subtasks_flag": self.allow_subtasks,
+                "agent.is_dynamically_added": self.is_dynamically_added,
             },
         ) as span:
             self.current_span = span
@@ -648,7 +645,6 @@ class RecursiveAgent:
                         },
                     )
 
-                # --- FIX: HANDLE NEWLY REQUESTED TASKS ---
                 if agent.newly_requested_tasks:
                     self.logger.info(
                         f"Agent {agent.uuid} requested {len(agent.newly_requested_tasks)} new sibling tasks."
@@ -663,41 +659,44 @@ class RecursiveAgent:
                             },
                         )
 
+                    # --- CHANGE: Create specialized options for dynamically added agents ---
+                    new_agent_options = self.options.model_copy()
+                    new_agent_options.task_limits = TaskLimit.from_array([2, 0])
+
                     newly_created_agents = []
                     for new_task_obj in agent.newly_requested_tasks:
                         new_child_context = TaskContext(
                             task=new_task_obj.task, parent_context=self.context
                         )
-                        # New tasks are siblings, so they have the same parent (self) and are at the same layer as the agent that created them.
                         new_agent = RecursiveAgent(
                             task=new_task_obj,
                             u_inst=self.u_inst,
                             tracer=self.tracer,
                             tracer_span=span,
-                            agent_options=self.options,
+                            # --- CHANGE: Use the new specialized options ---
+                            agent_options=new_agent_options,
                             allow_subtasks=(
                                 agent.current_layer
-                                < len(self.options.task_limits.limits)
+                                < len(new_agent_options.task_limits.limits)
                             ),
-                            current_layer=agent.current_layer,  # Sibling => same layer
-                            parent=self,  # Sibling => same parent
+                            current_layer=agent.current_layer,
+                            parent=self,
                             context=new_child_context,
+                            # --- CHANGE: Flag the new agent as dynamically added ---
+                            is_dynamically_added=True,
                         )
                         child_agents[new_agent.uuid] = new_agent
                         pending_agents[new_agent.uuid] = new_agent
                         child_contexts.append(new_child_context)
                         newly_created_agents.append(new_agent)
 
-                    # Reset the list on the child agent to avoid reprocessing
                     agent.newly_requested_tasks = []
 
-                    # Update sibling contexts for ALL children (old and new)
                     for ag in child_agents.values():
                         ag.context.siblings = [
                             c_ctx for c_ctx in child_contexts if c_ctx.task != ag.task
                         ]
 
-                    # Increase loop guard to allow new tasks to run
                     max_loops += len(newly_created_agents)
 
         if pending_agents:
@@ -820,7 +819,13 @@ Make sure to include citations [1] and a citations section at the end.
                 human_message_content += (
                     f"\n\nFollow these specific instructions: {self.u_inst}"
                 )
-            human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics). Also, you can specify any extra tasks you want to add as a sibling (using the `extra_requested_tasks` field), to be executed after the current set of siblings is completed."
+
+            # --- CHANGE: Only allow non-dynamic agents to request more tasks ---
+            if not self.is_dynamically_added:
+                human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics). Also, you can specify any extra tasks you want to add as a sibling (using the `extra_requested_tasks` field), to be executed after the current set of siblings is completed."
+            else:
+                human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics)."
+
             tool_agent = Agent(
                 model=self.llm,
                 system_prompt=system_prompt_content,
@@ -842,22 +847,23 @@ Make sure to include citations [1] and a citations section at the end.
 
             final_result_content = response.output.result or "No result."
 
-            # --- FIX: CAPTURE EXTRA REQUESTED TASKS ---
-            extra_tasks_str = response.output.extra_requested_tasks or []
-            if extra_tasks_str:
-                self.newly_requested_tasks = [
-                    TaskObject(
-                        task=t, type="research", allow_search=True, allow_tools=True
+            # --- CHANGE: Only process extra tasks if the agent is not dynamic ---
+            if not self.is_dynamically_added:
+                extra_tasks_str = response.output.extra_requested_tasks or []
+                if extra_tasks_str:
+                    self.newly_requested_tasks = [
+                        TaskObject(
+                            task=t, type="research", allow_search=True, allow_tools=True
+                        )
+                        for t in extra_tasks_str
+                    ]
+                    self.logger.info(
+                        f"LLM requested {len(self.newly_requested_tasks)} new sibling tasks to be queued."
                     )
-                    for t in extra_tasks_str
-                ]
-                self.logger.info(
-                    f"LLM requested {len(self.newly_requested_tasks)} new sibling tasks to be queued."
-                )
-                single_task_span.add_event(
-                    "LLM Requested New Sibling Tasks",
-                    {"count": len(self.newly_requested_tasks)},
-                )
+                    single_task_span.add_event(
+                        "LLM Requested New Sibling Tasks",
+                        {"count": len(self.newly_requested_tasks)},
+                    )
 
             return str(final_result_content)
 
@@ -979,11 +985,7 @@ Make sure to include citations [1] and a citations section at the end.
                 "Score the result based on how well it answers the task, taking into account accuracy, completeness, relevance, adherence to instructions, and clarity. "
                 f"Output JSON matching the '{verification.__name__}' schema."
             )
-            ic_dev("-" * 100)
-            ic_dev(self.task)
-            ic_dev(self.result)
-            ic_dev(self.u_inst)
-            ic_dev("-" * 85)
+
             human_msg = (
                 f"Task:\n'''{self.task}'''\n\n"
                 f"Result:\n'''{self.result}'''\n\n"
@@ -1006,8 +1008,6 @@ Make sure to include citations [1] and a citations section at the end.
                     response, verify_span
                 )
                 verification_output = response.output
-                ic_dev(verification_output)
-                ic_dev("-" * 50)
                 if not verification_output.get_successful():
                     self.logger.warning(
                         f"Verification failed for task '{self.task}'. Reason: {verification_output.reason}"
@@ -1023,14 +1023,12 @@ Make sure to include citations [1] and a citations section at the end.
 
     async def verify_result(self, subtask_results_map: Optional[Dict[str, str]] = None):
         successful = await self._verify_result_internal(subtask_results_map)
-        ic_dev(successful)
         if successful:
             self.status = "succeeded"
             if self.current_span:
                 self.current_span.add_event("Verification Passed")
         else:
             self.status = "failed_verification"
-            ic_dev("Verification failed")
             if self.current_span:
                 self.current_span.add_event("Verification Failed")
             raise TaskFailedException(f"Task '{self.task}' failed verification.")
@@ -1073,9 +1071,6 @@ Make sure to include citations [1] and a citations section at the end.
             fix_span.add_event("Retrying task execution with fix instructions.")
 
             try:
-                # We re-run the main execution and verification logic.
-                # Since this logic now handles populating `newly_requested_tasks`,
-                # a fix attempt can also request new tasks, though this is less likely.
                 self.result = await self._execute_and_verify_single_task()
                 self.status = "succeeded"
                 fix_span.add_event(
@@ -1155,7 +1150,6 @@ Make sure to include citations [1] and a citations section at the end.
                         llm=llm_for_merge, context_window=15000
                     )
                     merger = self.options.merger(merge_options)
-                    ic_dev("Running merger...")
                     if is_async(merger.merge_documents):
                         merged_content = await merger.merge_documents(
                             documents_to_merge
@@ -1168,7 +1162,6 @@ Make sure to include citations [1] and a citations section at the end.
                             merged_content, summary_span
                         )
                         merged_content_str = merged_content.output
-                    ic_dev("Merger completed.")
                 except Exception as e_merge:
                     self.logger.warning(
                         f"LLMMerger failed: {e_merge}. Using simple join.",
