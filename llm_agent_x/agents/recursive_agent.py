@@ -107,7 +107,6 @@ class task_result(BaseModel):
     extra_requested_tasks: List[str] = Field(
         default=[],
         description="A list of NEW sibling tasks to be executed after the current set of siblings is complete. Up to 5 extra tasks can be requested.",
-        # --- CHANGE: Added max_length for Pydantic-level validation as a safeguard ---
         max_length=5,
     )
 
@@ -213,7 +212,6 @@ class RecursiveAgent:
         siblings: Optional[List["RecursiveAgent"]] = None,
         task_type_override: Optional[str] = None,
         max_fix_attempts: int = 2,
-        # --- CHANGE: Added a flag to identify dynamically created agents ---
         is_dynamically_added: bool = False,
     ):
         if agent_options is None:
@@ -233,7 +231,6 @@ class RecursiveAgent:
         self.task_type = task_type_override or self.task_obj.type
         self.logger = logging.getLogger(f"{__name__}.RecursiveAgent.{self.uuid}")
 
-        # --- CHANGE: Store the dynamic flag and log it ---
         self.is_dynamically_added = is_dynamically_added
         dynamic_status = (
             "Dynamically Added" if self.is_dynamically_added else "Pre-defined"
@@ -358,8 +355,8 @@ class RecursiveAgent:
         siblings = self.context.siblings
         if siblings:
             hierarchy_str += "Current Task Siblings:\n"
-            for i, sibling in enumerate(siblings):
-                hierarchy_str += f"- {sibling.task}\n"
+            for i, sibling_ctx in enumerate(siblings):
+                hierarchy_str += f"- {sibling_ctx.task}\n"
 
         hierarchy_str += f"{'  ' * len(path)}--> (Your Current Task) {self.task}"
         return hierarchy_str
@@ -659,9 +656,18 @@ class RecursiveAgent:
                             },
                         )
 
-                    # --- CHANGE: Create specialized options for dynamically added agents ---
+                    # --- FIX: Create specialized, padded options for dynamically added agents ---
                     new_agent_options = self.options.model_copy()
-                    new_agent_options.task_limits = TaskLimit.from_array([2, 0])
+                    # The layer where the new agent will be created
+                    creation_layer = agent.current_layer
+                    # The desired relative limit for the new agent and its children
+                    dynamic_relative_limits = [2, 0]
+                    # Pad the limit array with 0s up to the creation layer
+                    padded_limits = [0] * creation_layer + dynamic_relative_limits
+                    new_agent_options.task_limits = TaskLimit.from_array(padded_limits)
+                    self.logger.info(
+                        f"Creating dynamic agent at layer {creation_layer} with padded task limits: {padded_limits}"
+                    )
 
                     newly_created_agents = []
                     for new_task_obj in agent.newly_requested_tasks:
@@ -673,16 +679,14 @@ class RecursiveAgent:
                             u_inst=self.u_inst,
                             tracer=self.tracer,
                             tracer_span=span,
-                            # --- CHANGE: Use the new specialized options ---
                             agent_options=new_agent_options,
                             allow_subtasks=(
-                                agent.current_layer
+                                creation_layer
                                 < len(new_agent_options.task_limits.limits)
                             ),
-                            current_layer=agent.current_layer,
+                            current_layer=creation_layer,
                             parent=self,
                             context=new_child_context,
-                            # --- CHANGE: Flag the new agent as dynamically added ---
                             is_dynamically_added=True,
                         )
                         child_agents[new_agent.uuid] = new_agent
@@ -820,7 +824,6 @@ Make sure to include citations [1] and a citations section at the end.
                     f"\n\nFollow these specific instructions: {self.u_inst}"
                 )
 
-            # --- CHANGE: Only allow non-dynamic agents to request more tasks ---
             if not self.is_dynamically_added:
                 human_message_content += "\n\nApply the distributive property to any tool calls (e.g., make 3 separate search calls for 3 topics). Also, you can specify any extra tasks you want to add as a sibling (using the `extra_requested_tasks` field), to be executed after the current set of siblings is completed."
             else:
@@ -843,11 +846,8 @@ Make sure to include citations [1] and a citations section at the end.
                 response, single_task_span
             )
 
-            ic_dev(response.output)
-
             final_result_content = response.output.result or "No result."
 
-            # --- CHANGE: Only process extra tasks if the agent is not dynamic ---
             if not self.is_dynamically_added:
                 extra_tasks_str = response.output.extra_requested_tasks or []
                 if extra_tasks_str:
