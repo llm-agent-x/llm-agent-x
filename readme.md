@@ -2,7 +2,7 @@
 
 ## Overview
 
-LLM Agent X is a task execution framework that leverages language models to perform complex tasks by splitting them into subtasks and using tools like web search.
+LLM Agent X is a task execution framework that leverages language models to perform complex tasks by recursively decomposing them into subtasks and using tools like web search.
 
 ## Installation
 

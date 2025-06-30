@@ -11,9 +11,9 @@ import numpy as np
 
 # Download necessary NLTK data (if you haven't already)
 try:
-    nltk.data.find("tokenizers/punkt")
-except nltk.downloader.DownloadError:
-    nltk.download("punkt")
+    nltk.data.find("tokenizers/punkt_tab")
+except:
+    nltk.download("punkt_tab")
 
 
 # --- Configuration ---

@@ -73,3 +73,8 @@ parser.add_argument(
     type=str,
     help="Path to the MCP config file",
 )
+
+parser.add_argument(
+    "--dev-mode",
+    help="Enable development mode",
+)

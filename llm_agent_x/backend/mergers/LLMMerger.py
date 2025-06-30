@@ -1,4 +1,5 @@
 import re
+import sys
 from typing import List, Any
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
 from ..config_classes.MergerConfig import MergeChunk, MergeOptions
@@ -13,12 +14,13 @@ class LLMMerger:
             model=self.llm, system_prompt="Merge these documents:", output_type=str
         )
 
-    def merge_documents(self, documents: List[str]) -> str:
+    async def merge_documents(self, documents: List[str]) -> str:
         assert documents
         if len(documents) == 1:
             return documents[0]
 
-        merged_text = self.merge_agent.run_sync(
+        response = await self.merge_agent.run(
             "Here are the documents to merge:\n\n" + "\n\n---\n\n".join(documents)
-        ).output
-        return merged_text
+        )
+
+        return response

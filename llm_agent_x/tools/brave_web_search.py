@@ -127,6 +127,11 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
         return []
 
 
-# Synchronous wrapper
-def brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
-    return asyncio.run(_brave_web_search(query, num_results))
+from asyncio_throttle import Throttler
+
+throttler = Throttler(rate_limit=1, period=1.1)
+
+
+async def brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
+    async with throttler:
+        return await _brave_web_search(query, num_results)

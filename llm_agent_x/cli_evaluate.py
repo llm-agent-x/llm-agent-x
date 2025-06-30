@@ -7,12 +7,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 import nltk
 from rich.console import Console
-from rich.tree import Tree
-from rich.live import Live
 from rich.text import Text
-from langchain_openai import ChatOpenAI
 from typing import Dict, List, Optional, Any  # Added Any
-from typing import Literal
 import redis
 
 from llm_agent_x import (
@@ -22,16 +18,14 @@ from llm_agent_x import (
     TaskFailedException,
 )
 from llm_agent_x.backend import AppendMerger, LLMMerger, AlgorithmicMerger
-from opentelemetry import trace, context as otel_context
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from pydantic import BaseModel, Field
 
-from llm_agent_x.console import console, task_tree, live
-from llm_agent_x.constants import openai_api_key, openai_base_url
+from llm_agent_x.console import console, task_tree
 from llm_agent_x.tools.brave_web_search import brave_web_search
-from llm_agent_x.llm_manager import model_tree
 
 from pydantic_ai import Agent
 
@@ -190,9 +184,6 @@ async def evaluate_response_with_llm(
 
     response = await judge_agent.run(human_prompt=task_description)
     return response.output
-
-
-TaskType = Literal["research", "search", "basic", "text/reasoning"]
 
 
 def async_wrapper(func):
