@@ -249,6 +249,7 @@ class SequentialCodeAgent:
             "3. Identify any steps the AI assistant has forgotten, any logical errors it has made, or any inefficient plans (e.g., not using parallel execution when possible).\n"
             "4. Check if the assistant's last message is a final answer. If it is, verify if it FULLY addresses the user's original request. Has any part of the request been ignored?\n"
             "5. Return your findings as a list of strings. Include suggestions for how to improve the plan or answer."
+            "6. The agent is in an unsandboxed environment, so it is able to access any normal python globals (like `__file__`, `__name__`, libraries, functions, classes, etc."
         )
 
         self.critic_agent = Agent(
