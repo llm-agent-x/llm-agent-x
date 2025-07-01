@@ -428,7 +428,7 @@ async def main():
             # "They should be in the food and beverage industry. Get their owner's contact info, "
             # "add them to the CRM, and draft a personalized introductory email for each."
             # )
-            prompt = "The owner of 'Austin's Artisan Bakery' has approved the proposal we generated at ./proposals/austins_artisan_bakery_proposal.pdf. Please send this document to austin.artisan@example.com for an e-signature. After sending it, schedule a 15-minute follow-up call with them for a 'Policy Onboarding Walkthrough'."
+            prompt = args.prompt or "The owner of 'Austin's Artisan Bakery' has approved the proposal we generated at ./proposals/austins_artisan_bakery_proposal.pdf. Please send this document to austin.artisan@example.com for an e-signature. After sending it, schedule a 15-minute follow-up call with them for a 'Policy Onboarding Walkthrough'."
             ic(prompt)
             final_result = await agent.run(prompt)
             print("\n--- AGENT'S FINAL RESPONSE ---")
