@@ -1,8 +1,10 @@
 import ast
 import asyncio
+import json
 import traceback
 from functools import wraps
 from typing import Annotated, Any, Callable, Dict, List, Union
+from dotenv import load_dotenv
 
 from icecream import ic
 from pydantic import BaseModel, Field, AfterValidator
@@ -106,24 +108,43 @@ class MCPToolInjector:
             await self._streams.__aexit__(exc_type, exc_val, exc_tb)
         ic("MCP connection closed.")
 
+        # In MCPToolInjector class
+
     def _create_callable_for_tool(self, tool: types.Tool) -> Callable:
         """Dynamically creates an async function to wrap an MCP tool call."""
 
-        async def mcp_tool_wrapper(**kwargs):
+        # FIX #1: The wrapper now accepts *args and **kwargs to be more robust.
+        # This prevents the initial positional argument error.
+        async def mcp_tool_wrapper(*args, **kwargs):
+            # If positional arguments are passed, map them to keyword arguments
+            # based on the tool's schema. This makes the agent more robust.
+            if args:
+                arg_names = list(tool.inputSchema.get("properties", {}).keys())
+                for i, arg_val in enumerate(args):
+                    if i < len(arg_names):
+                        kwargs[arg_names[i]] = arg_val
+
             # ic(f"Calling MCP tool '{tool.name}' with arguments: {kwargs}")
             tool_call_result = await self._session.call_tool(
                 tool.name, arguments=kwargs
             )
 
-            # The actual return value is in tool_call_result.content.
-            # It's a list of blocks; we'll assume the first is what we want.
-            if tool_call_result.content and tool_call_result.content[0].type == "text":
-                # *** MODIFICATION START ***
-                # The tool wrapper should ONLY return the result.
-                # The aexec_python_local function is responsible for printing output.
-                # This prevents the double-printing that was confusing the agent.
-                return tool_call_result.content[0].text
-                # *** MODIFICATION END ***
+            if not tool_call_result.content:
+                return None
+
+            # FIX #2: The return value is now parsed as JSON. This is the critical fix.
+            # This solves the "string indices must be integers" error.
+            if tool_call_result.content[0].type == "text":
+                raw_text = tool_call_result.content[0].text
+                try:
+                    # Attempt to deserialize the text as JSON.
+                    return json.loads(raw_text)
+                except json.JSONDecodeError:
+                    # If it's not valid JSON, return the raw text.
+                    # This handles simple string returns like "success".
+                    return raw_text
+
+            # Fallback for other content types (e.g., binary data)
             return tool_call_result.content
 
         # Create a user-friendly docstring for the LLM from the OpenAPI schema
@@ -184,13 +205,26 @@ class Code(BaseModel):
         description="A string containing valid Python code to be executed."
     )
 
+class Critique(BaseModel):
+    reasoning: str = Field(
+        description="A place for you to think about what you are doing, and to try to catch any mistakes before you make them."
+    )
+    mistakes: List[str] = Field(
+        description="A list of mistakes, logical errors, or forgotten steps found in the assistant's plan or reasoning. If no mistakes are found, return an empty list."
+    )
+    suggestions: List[str] = Field(
+        description="A list of suggested improvements to the assistant's plan or reasoning. If no suggestions are provided, return an empty list. These are meant to be non-critical changes to the plan or reasoning that will help the assistant to complete the task."
+    )
+    is_final_answer_valid: bool = Field(
+        description="Set to true if the last message from the assistant is a valid, complete final answer to the user's original request. Otherwise, set to false."
+    )
 
 # --- Async SequentialCodeAgent (Unchanged) ---
 class SequentialCodeAgent:
     def __init__(
         self,
         llm: str,
-        max_turns: int = 5,
+        max_turns: int = 10,
         mcp_tools_namespace: Dict = None,
         mcp_tools_prompt: str = "",
     ):
@@ -205,6 +239,23 @@ class SequentialCodeAgent:
             system_prompt=self._create_system_prompt(mcp_tools_prompt, pex=False),
             output_type=str,
         )
+
+        critic_system_prompt = (
+            "You are a meticulous and ruthless critic. Your task is to review a conversation between a user and an AI assistant. "
+            "Your sole purpose is to identify flaws in the AI's reasoning and plan. "
+            "1. Carefully read the user's original request (the first message).\n"
+            "2. Read the entire conversation history.\n"
+            "3. Identify any steps the AI assistant has forgotten, any logical errors it has made, or any inefficient plans (e.g., not using parallel execution when possible).\n"
+            "4. Check if the assistant's last message is a final answer. If it is, verify if it FULLY addresses the user's original request. Has any part of the request been ignored?\n"
+            "5. Return your findings as a list of strings. Include suggestions for how to improve the plan or answer."
+        )
+
+        self.critic_agent = Agent(
+            model=llm, # You could use a more powerful model like gpt-4o for the critic if desired
+            system_prompt=critic_system_prompt,
+            output_type=Critique,
+        )
+
         self.namespace_globals = mcp_tools_namespace or {}
         self.namespace_globals["__file__"] = __file__
         self.namespace_locals = {}
@@ -249,34 +300,72 @@ class SequentialCodeAgent:
             code=code,
             globals=self.namespace_globals,
             locals=self.namespace_locals,
-            cg=self.namespace_globals,
         )
 
     async def run(self, prompt: str):
-        current_prompt = f'Here is your task: \n\n"{prompt}"'
+        current_prompt = f"Here is your task:\n\n---\n{prompt}\n---"
+        self.history = []  # Reset history for each run
+
         for i in range(self.max_turns):
-            ic(f"--- Turn {i+1}/{self.max_turns} ---")
+            ic(f"--- Turn {i + 1}/{self.max_turns} ---")
+
+            # --- Main Agent's Turn ---
             response = await self.agent.run(
                 current_prompt, message_history=self.history
             )
             self.history = response.all_messages()
+
+            # --- CRITIC'S TURN ---
+            ic("--- Critic Reviewing Plan ---")
+            critique_response = await self.critic_agent.run(
+                # The prompt for the critic is the full conversation history.
+                # We use all_messages_json() as requested.
+                response.all_messages_json().decode("utf-8"),
+            )
+            critique = critique_response.output
+            ic(critique)
+
+            # Check if the critic found any issues
+            if critique.mistakes:
+                ic("Critic found mistakes! Sending back for correction.")
+                # Formulate a new prompt for the worker agent, including the critique
+                current_prompt = (
+                    "A supervising critic has reviewed your plan and found the following flaws. "
+                    "You MUST address these issues in your next step. DO NOT ignore them.\n\n"
+                    f"**CRITIC'S FEEDBACK:**\n- {'\n- '.join(critique.mistakes)}\n\n"
+                    "Please provide a new, corrected plan and the corresponding code."
+                )
+                # Add the critique to the history so the agent sees it
+                self.history.append({"role": "user", "content": current_prompt})
+                continue  # Skip code execution and go to the next turn for correction
+
+            # --- If critique is clean, proceed with execution ---
+            ic("Critic found no mistakes. Proceeding with execution.")
+
             if isinstance(response.output, Code):
                 ic(response.output.reasoning)
-                # ic(response.output.message)
                 code_to_run = response.output.code
                 ic(f"Executing code:\n---\n{code_to_run}\n---")
-                if not code_to_run.strip():
+
+                if not code_to_run.strip():  # Handles empty code blocks
+                    # ... (rest of this block is the same)
                     ic("No code to execute.")
                     final_answer = await self.final_answer_agent.run(
                         user_prompt="What is the final answer?",
                         message_history=self.history,
                     )
                     return final_answer.output
+
                 python_result = await self._execute_code_in_sandbox(code=code_to_run)
+
+                # ... (rest of the code execution block is the same)
                 if not python_result.get("stderr", "").strip():
                     ic(python_result)
                 else:
-                    print(python_result.get("stderr", "").strip())
+                    # Use ic() for errors too for consistency
+                    ic("Execution resulted in an error:")
+                    ic(python_result.get("stderr", "").strip())
+
                 stdout = python_result.get("stdout", "").strip()
                 stderr = python_result.get("stderr", "").strip()
                 current_prompt = "The code execution produced the following output. Continue with your task."
@@ -285,26 +374,37 @@ class SequentialCodeAgent:
                 if stderr:
                     current_prompt += f"\n\nSTDERR:\n```\n{stderr}\n```"
                 if not stdout and not stderr:
-                    current_prompt += (
-                        "\n\nNOTE: The code ran without error and produced no output."
-                    )
+                    current_prompt += "\n\nNOTE: The code ran without error and produced no output."
+
             elif isinstance(response.output, str):
-                ic(f"Final answer received: {response.output}")
-                return response.output
+                # The critic also validates the final answer
+                if critique.is_final_answer_valid:
+                    ic(f"Final answer received and validated: {response.output}")
+                    return response.output
+                else:
+                    ic("Critic invalidated the final answer. Sending back for more work.")
+                    current_prompt = (
+                        "A supervising critic has reviewed your final answer and determined it is INCOMPLETE. "
+                        "You have not finished all parts of the original request. Please continue working."
+                    )
+                    self.history.append({"role": "user", "content": current_prompt})
+                    continue
+
             else:
+                # ... (rest of the method is the same)
                 error_message = f"Error: Unexpected response type from agent: {type(response.output)}"
                 ic(error_message)
                 return error_message
+
         print("Agent reached maximum turns without providing a final answer.")
         return None
-
 
 # --- REFACTORED: Main usage with 'async with' ---
 async def main():
     mcp_url = "http://localhost:8001/mcp"
 
     try:
-        async with MCPToolInjector(mcp_url=mcp_url) as injector:
+        async with (MCPToolInjector(mcp_url=mcp_url) as injector):
             tool_namespace = injector.get_tool_namespace()
             tool_prompt = injector.get_tools_prompt_string()
 
@@ -315,7 +415,12 @@ async def main():
             )
 
             # Using a more explicit prompt to reduce ambiguity for the agent.
-            prompt = "get the weather in tokyo, san francisco, and los angeles. use `asyncio.gather()` to run multiple tool calls in parallel. "
+            # prompt = (
+            # "Find me 2 new potential clients for commercial liability insurance in Austin, TX."
+            # "They should be in the food and beverage industry. Get their owner's contact info, "
+            # "add them to the CRM, and draft a personalized introductory email for each."
+            # )
+            prompt = "The owner of 'Austin's Artisan Bakery' has approved the proposal we generated at ./proposals/austins_artisan_bakery_proposal.pdf. Please send this document to austin.artisan@example.com for an e-signature. After sending it, schedule a 15-minute follow-up call with them for a 'Policy Onboarding Walkthrough'."
             final_result = await agent.run(prompt)
             print("\n--- AGENT'S FINAL RESPONSE ---")
             print(final_result)
@@ -332,4 +437,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    load_dotenv(".env", override=True)
     asyncio.run(main())

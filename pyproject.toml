@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "llm-agent-x"
-version = "0.3.0"
+version = "1.0.0"
 description = "A task execution framework using language models to perform complex tasks."
 authors = ["Christopher Vaz <christophervaz160@gmail.com>"]
 license = "MIT"
