@@ -1,3 +1,4 @@
+import argparse
 import ast
 import asyncio
 import json
@@ -254,6 +255,7 @@ class SequentialCodeAgent:
             model=llm, # You could use a more powerful model like gpt-4o for the critic if desired
             system_prompt=critic_system_prompt,
             output_type=Critique,
+            result_retries=3,
         )
 
         self.namespace_globals = mcp_tools_namespace or {}
@@ -303,95 +305,99 @@ class SequentialCodeAgent:
         )
 
     async def run(self, prompt: str):
-        current_prompt = f"Here is your task:\n\n---\n{prompt}\n---"
-        self.history = []  # Reset history for each run
+        # The user's initial prompt is the starting point.
+        user_input = f"Here is your task:\n\n---\n{prompt}\n---"
+        self.history = []  # Reset history for each new run
 
         for i in range(self.max_turns):
             ic(f"--- Turn {i + 1}/{self.max_turns} ---")
 
             # --- Main Agent's Turn ---
+            # The agent runs with the latest user_input and the existing history.
             response = await self.agent.run(
-                current_prompt, message_history=self.history
+                user_prompt=user_input, message_history=self.history
             )
+            # We always update the history with the full conversation from the latest run.
             self.history = response.all_messages()
 
             # --- CRITIC'S TURN ---
             ic("--- Critic Reviewing Plan ---")
             critique_response = await self.critic_agent.run(
-                # The prompt for the critic is the full conversation history.
-                # We use all_messages_json() as requested.
-                response.all_messages_json().decode("utf-8"),
+                message_history=response.all_messages()
             )
             critique = critique_response.output
             ic(critique)
 
-            # Check if the critic found any issues
+            # --- DECISION POINT: Correct or Execute? ---
+
+            # Case 1: The critic found mistakes.
             if critique.mistakes:
                 ic("Critic found mistakes! Sending back for correction.")
-                # Formulate a new prompt for the worker agent, including the critique
-                current_prompt = (
+                # Formulate a new, corrective prompt that will be the 'user_input' for the next loop.
+                user_input = (
                     "A supervising critic has reviewed your plan and found the following flaws. "
                     "You MUST address these issues in your next step. DO NOT ignore them.\n\n"
                     f"**CRITIC'S FEEDBACK:**\n- {'\n- '.join(critique.mistakes)}\n\n"
                     "Please provide a new, corrected plan and the corresponding code."
                 )
-                # Add the critique to the history so the agent sees it
-                self.history.append({"role": "user", "content": current_prompt})
-                continue  # Skip code execution and go to the next turn for correction
+                # Continue to the next turn to let the agent process the critique.
+                continue
 
-            # --- If critique is clean, proceed with execution ---
-            ic("Critic found no mistakes. Proceeding with execution.")
+            # Case 2: The critic found no mistakes. Proceed with the agent's proposed action.
+            ic("Critic found no mistakes. Proceeding with proposed action.")
 
             if isinstance(response.output, Code):
                 ic(response.output.reasoning)
                 code_to_run = response.output.code
                 ic(f"Executing code:\n---\n{code_to_run}\n---")
 
-                if not code_to_run.strip():  # Handles empty code blocks
-                    # ... (rest of this block is the same)
-                    ic("No code to execute.")
+                # Handle empty code block
+                if not code_to_run.strip():
+                    ic("Agent proposed no code to run. Asking for final answer.")
                     final_answer = await self.final_answer_agent.run(
                         user_prompt="What is the final answer?",
                         message_history=self.history,
                     )
                     return final_answer.output
 
+                # Execute the code
                 python_result = await self._execute_code_in_sandbox(code=code_to_run)
 
-                # ... (rest of the code execution block is the same)
-                if not python_result.get("stderr", "").strip():
-                    ic(python_result)
-                else:
-                    # Use ic() for errors too for consistency
-                    ic("Execution resulted in an error:")
-                    ic(python_result.get("stderr", "").strip())
-
+                # Format the execution results to be the 'user_input' for the next turn.
                 stdout = python_result.get("stdout", "").strip()
                 stderr = python_result.get("stderr", "").strip()
-                current_prompt = "The code execution produced the following output. Continue with your task."
+
+                if not stderr:
+                    ic(python_result)
+                else:
+                    ic("Execution resulted in an error:")
+                    ic(stderr)
+
+                user_input = "The code execution produced the following output. Continue with your task."
                 if stdout:
-                    current_prompt += f"\n\nSTDOUT:\n```\n{stdout}\n```"
+                    user_input += f"\n\nSTDOUT:\n```\n{stdout}\n```"
                 if stderr:
-                    current_prompt += f"\n\nSTDERR:\n```\n{stderr}\n```"
+                    user_input += f"\n\nSTDERR:\n```\n{stderr}\n```"
                 if not stdout and not stderr:
-                    current_prompt += "\n\nNOTE: The code ran without error and produced no output."
+                    user_input += "\n\nNOTE: The code ran without error and produced no output."
 
             elif isinstance(response.output, str):
-                # The critic also validates the final answer
+                # Case 3: The agent provided a final answer.
+                # The critic has already validated it (since critique.mistakes was empty).
                 if critique.is_final_answer_valid:
                     ic(f"Final answer received and validated: {response.output}")
                     return response.output
                 else:
+                    # This case handles when the agent gives up prematurely.
                     ic("Critic invalidated the final answer. Sending back for more work.")
-                    current_prompt = (
+                    user_input = (
                         "A supervising critic has reviewed your final answer and determined it is INCOMPLETE. "
                         "You have not finished all parts of the original request. Please continue working."
                     )
-                    self.history.append({"role": "user", "content": current_prompt})
                     continue
 
             else:
-                # ... (rest of the method is the same)
+                # Error case
                 error_message = f"Error: Unexpected response type from agent: {type(response.output)}"
                 ic(error_message)
                 return error_message
@@ -400,9 +406,11 @@ class SequentialCodeAgent:
         return None
 
 # --- REFACTORED: Main usage with 'async with' ---
+parser = argparse.ArgumentParser()
+parser.add_argument("prompt", type=str)
 async def main():
     mcp_url = "http://localhost:8001/mcp"
-
+    args = parser.parse_args()
     try:
         async with (MCPToolInjector(mcp_url=mcp_url) as injector):
             tool_namespace = injector.get_tool_namespace()
@@ -421,6 +429,7 @@ async def main():
             # "add them to the CRM, and draft a personalized introductory email for each."
             # )
             prompt = "The owner of 'Austin's Artisan Bakery' has approved the proposal we generated at ./proposals/austins_artisan_bakery_proposal.pdf. Please send this document to austin.artisan@example.com for an e-signature. After sending it, schedule a 15-minute follow-up call with them for a 'Policy Onboarding Walkthrough'."
+            ic(prompt)
             final_result = await agent.run(prompt)
             print("\n--- AGENT'S FINAL RESPONSE ---")
             print(final_result)
