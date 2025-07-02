@@ -97,14 +97,21 @@ class TaskObject(LLMTaskObject):
             return str(v)
         return v
 
+class TaskObjectPlusPriority(TaskObject):
+    priority: float
+
 
 class task(TaskObject):
     pass
 
+class task_request(BaseModel):
+    task: str
+    task_importance_float: float = Field(description="A float between 0 and 1 describing the importance of the task, where 0 is the lowest priority and 1 is the highest priority. Use above .9 only for tasks that will cause errors if not completed.")
+
 
 class task_result(BaseModel):
     result: str
-    extra_requested_tasks: List[str] = Field(
+    extra_requested_tasks: List[task_request] = Field(
         default=[],
         description="A list of NEW sibling tasks to be executed after the current set of siblings is complete. Up to 5 extra tasks can be requested.",
         max_length=5,
@@ -213,6 +220,7 @@ class RecursiveAgent:
         task_type_override: Optional[str] = None,
         max_fix_attempts: int = 2,
         is_dynamically_added: bool = False,
+        common_ancestors: List["RecursiveAgent"] = [],
     ):
         if agent_options is None:
             logger.info("No agent_options provided, using default configuration.")
@@ -261,6 +269,8 @@ class RecursiveAgent:
         )
         self.cost = 0
         self.newly_requested_tasks: List[TaskObject] = []
+        self.common_ancestors = common_ancestors
+        self.common_ancestors
 
     def _get_token_count(self, text: str) -> int:
         if self.options.token_counter:
@@ -545,6 +555,9 @@ class RecursiveAgent:
             child_context = TaskContext(
                 task=subtask_obj.task, parent_context=self.context
             )
+
+            new_common_ancestors = self.common_ancestors.copy()
+
             child_agent = RecursiveAgent(
                 task=subtask_obj,
                 u_inst=self.u_inst,
@@ -557,6 +570,7 @@ class RecursiveAgent:
                 current_layer=self.current_layer + 1,
                 parent=self,
                 context=child_context,
+                common_ancestors=new_common_ancestors
             )
             child_agents_in_order.append(child_agent)
             child_contexts.append(child_context)
@@ -646,6 +660,16 @@ class RecursiveAgent:
                     self.logger.info(
                         f"Agent {agent.uuid} requested {len(agent.newly_requested_tasks)} new sibling tasks."
                     )
+                    # Get the top 5 most important newly requested tasks
+                    self.newly_requested_tasks = sorted(
+                        self.newly_requested_tasks,
+                        key=lambda t: t.priority,
+                        reverse=True,
+                    )
+
+                    if len(self.newly_requested_tasks) > 5:
+                        self.newly_requested_tasks = self.newly_requested_tasks[:5]
+
                     if span:
                         span.add_event(
                             "Dynamically Adding Sibling Tasks",
@@ -832,13 +856,13 @@ Make sure to include citations [1] and a citations section at the end.
             tool_agent = Agent(
                 model=self.llm,
                 system_prompt=system_prompt_content,
-                output_type=task_result,
+                output_type=task_result if not self.is_dynamically_added else str,
                 tools=self.tools,
                 mcp_servers=self.options.mcp_servers,
             )
             single_task_span.add_event("Executing Pydantic-AI agent")
 
-            response: AgentRunResult
+            response: AgentRunResult | str
             async with tool_agent.run_mcp_servers():
                 response = await tool_agent.run(user_prompt=human_message_content)
 
@@ -846,17 +870,19 @@ Make sure to include citations [1] and a citations section at the end.
                 response, single_task_span
             )
 
-            final_result_content = response.output.result or "No result."
+            final_result_content = (response.output.result if not self.is_dynamically_added else response) or "No result."
 
             if not self.is_dynamically_added:
-                extra_tasks_str = response.output.extra_requested_tasks or []
-                if extra_tasks_str:
+                extra_tasks: List[task_request] = response.output.extra_requested_tasks or []
+                ic_dev(extra_tasks)
+                if extra_tasks:
                     self.newly_requested_tasks = [
-                        TaskObject(
-                            task=t, type="research", allow_search=True, allow_tools=True
+                        TaskObjectPlusPriority(
+                            task=t.task, type="research", allow_search=True, allow_tools=True, priority=t.task_importance_float
                         )
-                        for t in extra_tasks_str
+                        for t in extra_tasks
                     ]
+
                     self.logger.info(
                         f"LLM requested {len(self.newly_requested_tasks)} new sibling tasks to be queued."
                     )
@@ -864,6 +890,8 @@ Make sure to include citations [1] and a citations section at the end.
                         "LLM Requested New Sibling Tasks",
                         {"count": len(self.newly_requested_tasks)},
                     )
+            else:
+                self.newly_requested_tasks = []
 
             return str(final_result_content)
 
