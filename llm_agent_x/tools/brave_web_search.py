@@ -24,12 +24,18 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
     print("Running Brave Web Search...")
     print("Query:", query)
     # Setup Redis
+    r = None
     try:
+        if not redis_host or not redis_port or not redis_db:
+            raise Exception("Redis not used")
         r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
         r.ping()
         print("Redis connection successful.")
     except redis.exceptions.ConnectionError as e:
         print(f"Redis connection failed: {e}.  Caching disabled.")
+        r = None
+    except:
+        print("Redis not used")
         r = None
 
     cache_key = hashlib.md5(f"{query}_{num_results}".encode("utf-8")).hexdigest()
