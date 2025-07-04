@@ -64,8 +64,7 @@ def shutdown_telemetry():
 atexit.register(shutdown_telemetry)
 # ---------------------------------------------------------
 
-client = AsyncOpenAI(max_retries=3)
-model = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
+
 
 nltk.download("punkt_tab", force=False)
 
@@ -76,6 +75,8 @@ def main():
     global live
 
     args = parser.parse_args()
+    client = AsyncOpenAI(max_retries=3)
+    model = OpenAIModel(args.model, provider=OpenAIProvider(openai_client=client))
 
     # The main try/finally block is now only for application logic, not global resources
     try:
