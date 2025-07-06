@@ -908,7 +908,6 @@ Make sure to include citations [1] and a citations section at the end.
         total_cost = (input_token_cost * request_tokens) + (
             output_token_cost * response_tokens
         )
-        span.set_attribute(SpanAttributes.LLM_COST_TOTAL, total_cost)
         return total_cost
 
     async def _split_task(self) -> SplitTask:
