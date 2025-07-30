@@ -4,6 +4,9 @@
 
 LLM Agent X is a task execution framework that leverages language models to perform complex tasks by recursively decomposing them into subtasks and using tools like web search.
 
+> ⚠️ This project is highly insecure and should only be used for trusted input. Parts of it allow (optionally) giving an LLM access to arbitrary Python code execution. Please use with caution.
+
+
 ## Installation
 
 1.  Clone the repository (optional, if you want to install from source):
