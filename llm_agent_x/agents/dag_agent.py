@@ -314,27 +314,39 @@ class DAGAgent:
         for t in self.registry.all_tasks():
             logger.info(f" {t.id} :: {t.status} :: cost={t.cost:.4f} :: preview={str(t.result)[:80] if t.result else None}")
 
-def build_demo_registry():
-    reg = TaskRegistry()
-    t1 = Task(id="A", desc="Gather background research on quantum computing.")
-    t2 = Task(id="B", desc="Summarize the five most promising physical qubit implementations.")
-    t3 = Task(
-        id="C", desc="Write a state-of-the-art survey combining results from A and B, split into reasonable sections and aggregate. Be thorough.",
-        deps={"A", "B"}, split_me=True)
-    reg.add_task(t1)
-    reg.add_task(t2)
-    reg.add_task(t3)
-    return reg
-def print_final_results(reg: TaskRegistry):
-    print("\nFinal results:")
-    for t in reg.all_tasks():
-        print(f" {t.id} :: {t.status} :: {str(t.result)[:100] if t.result else None}")
-    print("\nRegistry layout:")
-    reg.print_status_tree()
 if __name__ == "__main__":
-    reg = build_demo_registry()
+    import asyncio
+    import logging
+
+    # Optional: Set log to DEBUG for more insight
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("DAGAgent")
+
+    # Build a DAG with only a single, large, hard task as the root.
+    def build_root_only_registry():
+        reg = TaskRegistry()
+        root_task = Task(
+            id="ROOT",
+            desc=(
+                "Write a comprehensive research review on the recent advances in AI for drug discovery. "
+                "Include background, main achievements, key challenges, and suggest promising future directions. "
+                "Aggregate all findings into a cohesive, structured document."
+            ),
+            split_me=True,  # Strong suggestion to split!
+        )
+        reg.add_task(root_task)
+        return reg
+
+    def print_final_results(reg: TaskRegistry):
+        print("\nFinal results:")
+        for t in reg.all_tasks():
+            print(f"{t.id} :: {t.status} :: {str(t.result)[:150] if t.result else None}")
+        print("\nRegistry layout:")
+        reg.print_status_tree()
+
+    reg = build_root_only_registry()
     runner = DAGAgent(reg)
-    print("\n====== BEGIN EXECUTION ======")
+    print("\n====== BEGIN ADVANCED ROOT-ONLY EXECUTION ======")
     asyncio.run(runner.run())
     print("\n====== ALL DONE =============")
     runner.print_tree_statuses()
