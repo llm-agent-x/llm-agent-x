@@ -1,10 +1,8 @@
 from llm_agent_x.cli_args_parser import parser
 
-args = parser.parse_args()
-
-
 def is_dev(func=None):
     def decorator(f):
+        args = parser.parse_args()
         if args.dev_mode:
             return f
 

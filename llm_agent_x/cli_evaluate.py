@@ -11,7 +11,7 @@ from rich.text import Text
 from typing import Dict, List, Optional, Any  # Added Any
 import redis
 
-from llm_agent_x import (
+from llm_agent_x.agents.recursive_agent import (
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,

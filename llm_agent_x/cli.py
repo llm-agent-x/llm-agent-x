@@ -9,7 +9,7 @@ import nltk
 from typing import Literal
 import atexit  # <-- Import atexit
 
-from llm_agent_x import (
+from llm_agent_x.agents.recursive_agent import (
     RecursiveAgent,
     RecursiveAgentOptions,
     TaskLimit,
