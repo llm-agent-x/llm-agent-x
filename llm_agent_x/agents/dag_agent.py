@@ -60,12 +60,20 @@ class ExecutionPlan(BaseModel):
     subtasks: List[NewSubtask] = Field(default_factory=list, description="A list of new sub-tasks to be executed.")
 
 
-# --- Core Data Models ---
+class RetryDecision(BaseModel):
+    """The decision on whether to attempt another fix for a failing task."""
+    should_retry: bool = Field(description="Set to true if the trend of scores suggests success is likely.")
+    reason: str = Field(description="A brief explanation for the decision, citing the score trend.")
+    next_step_suggestion: str = Field(
+        description="A specific, actionable suggestion for the next attempt to improve the result.")
+
+
+# Update the Task model
 class Task(BaseModel):
     id: str
     desc: str
     deps: Set[str] = Field(default_factory=set)
-    status: str = "pending"  # pending, planning, waiting, running, complete, failed
+    status: str = "pending"
     result: Optional[str] = None
     needs_planning: bool = False
     already_planned: bool = False
@@ -76,6 +84,9 @@ class Task(BaseModel):
     children: List[str] = Field(default_factory=list)
     siblings: List[str] = Field(default_factory=list)
     dep_results: Dict[str, Any] = Field(default_factory=dict)
+    # --- NEW: Fields for Adaptive Retries ---
+    verification_scores: List[float] = Field(default_factory=list)
+    grace_attempts: int = 0
 
     # Tracing Fields
     otel_context: Optional[Any] = None
@@ -138,9 +149,11 @@ class DAGAgent:
             registry: TaskRegistry,
             llm_model: str = "gpt-4o-mini",
             tools: List = [],
-            tracer: Optional[Tracer] = None
+            tracer: Optional[Tracer] = None,
+            max_grace_attempts: int = 2
     ):
         self.registry = registry
+        self.max_grace_attempts = max_grace_attempts
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.tracer = tracer or trace.get_tracer(__name__)
@@ -172,6 +185,18 @@ class DAGAgent:
 
         self.executor = Agent(model=llm_model, output_type=str, tools=tools)
         self.verifier = Agent(model=llm_model, output_type=verification)
+
+        self.retry_analyst = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a meticulous quality assurance analyst. Your job is to decide if a failing task is worth retrying. "
+                "You will be given the task's original goal and a history of its verification scores from past attempts. "
+                "Analyze the trend of these scores. If the scores are generally increasing and approaching the success threshold of 6, it is worth retrying. "
+                "If the scores are stagnant, decreasing, or very low, it is not worth retrying. "
+                "Crucially, you must provide a concrete and actionable 'next_step_suggestion' for the next attempt to guide it towards success."
+            ),
+            output_type=RetryDecision,
+        )
 
     def _add_llm_data_to_span(self, span: Span, agent_res: AgentRunResult, task: Task):
         if not span or not agent_res: return
@@ -318,6 +343,7 @@ class DAGAgent:
                 span.set_attribute("dag.task.status", t.status)
                 span.set_attribute("dag.task.result_preview", (t.result or "")[:200])
 
+    # In the DAGAgent class
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
@@ -331,32 +357,65 @@ class DAGAgent:
         else:
             prompt += "Please execute this task directly and provide a complete answer."
 
-        worked = False;
-        fix_attempt = 0;
+        worked = False
         result = None
-        while not worked and fix_attempt <= t.max_fix_attempts:
-            t.span.add_event(f"Execution Attempt", {"attempt": fix_attempt + 1})
-            with self.tracer.start_as_current_span(f"Agent: Executor (Attempt {fix_attempt + 1})") as exec_span:
+
+        while True:  # Use a while-true loop for more complex exit conditions
+            current_attempt = t.fix_attempts + t.grace_attempts
+            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
+            with self.tracer.start_as_current_span(f"Agent: Executor (Attempt {current_attempt + 1})") as exec_span:
                 agent_res = await self.executor.run(user_prompt=prompt)
                 self._add_llm_data_to_span(exec_span, agent_res, t)
             result = agent_res.output
+
             if await self._verify_task(t, result):
-                worked = True;
+                worked = True
                 t.span.add_event("Execution Succeeded and Verified")
-            else:
-                prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Re-evaluate and try again."
-                t.span.add_event("Execution Attempt Failed Verification");
-                result = None;
-                fix_attempt += 1
+                break  # Exit the loop on success
 
-        if not worked:
-            t.status = "failed";
-            t.result = "Failed to produce a satisfactory result."
-            t.span.set_status(trace.Status(StatusCode.ERROR, "Exceeded max fix attempts"))
-            raise Exception(f"Exceeded max fix attempts for {t.desc}")
+            # --- Verification Failed: Adaptive Retry Logic ---
+            t.fix_attempts += 1
 
-        t.result = result;
-        t.status = "complete";
+            # Check if we've exhausted standard attempts and have grace attempts left
+            if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
+                with self.tracer.start_as_current_span("Agent: Retry Analyst") as analyst_span:
+                    analyst_span.set_attribute("task.scores_history", str(t.verification_scores))
+
+                    analyst_prompt = (
+                        f"Task: '{t.desc}'\n"
+                        f"Failed Attempts have yielded verification scores: {t.verification_scores}\n"
+                        f"A score > 5 is a success. Based on this trend, is another attempt likely to succeed? "
+                        f"Provide a specific suggestion for the next attempt."
+                    )
+                    decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt)
+                    self._add_llm_data_to_span(analyst_span, decision_res, t)
+                    decision = decision_res.output
+
+                    analyst_span.set_attribute("decision.should_retry", decision.should_retry)
+                    analyst_span.set_attribute("decision.reason", decision.reason)
+
+                    if decision.should_retry:
+                        t.span.add_event("Grace attempt granted", {"reason": decision.reason})
+                        t.grace_attempts += 1
+                        prompt += (f"\n\n--- GRACE ATTEMPT GRANTED ---\n"
+                                   f"Analyst Suggestion: {decision.next_step_suggestion}\n"
+                                   f"Please re-evaluate and try again, incorporating this suggestion.")
+                        continue  # Continue to the next iteration of the loop
+
+            # If we reach here, it means we're either out of all attempts or the analyst denied a retry
+            if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
+                t.status = "failed"
+                t.result = "Failed to produce a satisfactory result after multiple standard and grace attempts."
+                error_msg = f"Exceeded max attempts ({t.max_fix_attempts} standard, {t.grace_attempts} grace) for {t.desc}"
+                t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
+                raise Exception(error_msg)
+
+            # Standard retry: update prompt and continue
+            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Re-evaluate and try again."
+
+        # This part only runs if the loop was broken by success
+        t.result = result
+        t.status = "complete"
         logger.info(f"COMPLETED [{t.id}]")
 
     async def _verify_task(self, t: Task, candidate_result: str) -> bool:
@@ -365,6 +424,10 @@ class DAGAgent:
             vres = await self.verifier.run(user_prompt=ver_prompt)
             self._add_llm_data_to_span(verifier_span, vres, t)
             vout = vres.output
+
+            # --- NEW: Store the score for the analyst ---
+            t.verification_scores.append(vout.score)
+
             verifier_span.set_attribute("verification.score", vout.score)
             verifier_span.set_attribute("verification.reason", vout.reason)
             logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
@@ -405,7 +468,7 @@ if __name__ == "__main__":
         root_task = Task(
             id="ROOT_PLANNER",
             desc=(
-                "Plan and book a 3-day research trip to San Francisco for a conference on AI. "
+                "Plan and book a 3-day research trip to San Francisco for a conference on AI. I am located in NYC. The conference is on August 1-3, 2025."
                 "The output should be a complete itinerary including flights, hotel, and a daily schedule."
             ),
             needs_planning=True,
@@ -426,7 +489,7 @@ if __name__ == "__main__":
     async def main():
         with main_tracer.start_as_current_span("main_execution"):
             reg = build_dynamic_planning_dag()
-            runner = DAGAgent(reg, tools=tools, tracer=main_tracer)
+            runner = DAGAgent(reg, tools=tools, tracer=main_tracer, max_grace_attempts=2)
             print("\n====== BEGIN DYNAMIC PLANNING EXECUTION ======")
             reg.print_status_tree()
             await runner.run()
