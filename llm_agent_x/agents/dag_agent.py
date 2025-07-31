@@ -85,6 +85,36 @@ class TaskRegistry:
     def print_status_tree(self):
         for t in self.tasks.values():
             print(f" {t.id}: {t.to_dict_status()}")
+    def dependency_columns(self) -> List[Set[str]]:
+        """
+        Returns a list of sets of task ids representing columns (levels) for parallel execution:
+        - All tasks in a column have dependencies only in columns to the left.
+        - All dependencies are satisfied for all tasks in a column.
+        """
+        # Compute in-degree for each task
+        in_degree = {tid: 0 for tid in self.tasks}
+        for task in self.tasks.values():
+            for dep in task.deps:
+                if dep in in_degree:
+                    in_degree[task.id] += 1
+
+        # Nodes to process for current level ("frontier")
+        unassigned = set(self.tasks)
+        result: List[Set[str]] = []
+
+        while unassigned:
+            # Find tasks with in-degree 0 (no unmet dependencies)
+            ready = {tid for tid in unassigned if in_degree[tid] == 0}
+            if not ready:
+                raise RuntimeError("Cycle detected (should not happen if graph is a DAG)")
+            result.append(ready)
+            # Remove these from the unassigned set and decrement in-degree of their dependents
+            for tid in ready:
+                unassigned.remove(tid)
+                for t in self.tasks.values():
+                    if tid in t.deps and t.id in in_degree:
+                        in_degree[t.id] -= 1
+        return result
 
 class TaskContext:
     def __init__(self, task_id: str, registry: TaskRegistry, runner: "DAGAgent"):
