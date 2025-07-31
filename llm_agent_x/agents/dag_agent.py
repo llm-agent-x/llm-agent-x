@@ -7,26 +7,20 @@ from pydantic import BaseModel, Field, ValidationError, validator
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
 from dotenv import load_dotenv
-
 load_dotenv(".env", override=True)
 
-############################
-# Logger & Dummy Components
-############################
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DAGAgent")
-# Dummy cost calculation; replace with billing API as needed
 def get_cost(usage) -> float:
-    # usage: AgentRunResult.usage()
     if not usage: return 0.0
     return 0.00001 * (getattr(usage, "request_tokens", 0) + getattr(usage, "response_tokens", 0))
+
 def ic_dev(*args, **kwargs): pass
+
 def evaluate_prompt(p):    # Replace with your real complexity model
     class Eval: prompt_complexity_score=[0.5]; domain_knowledge=[0.5]
     return Eval()
-############################
-# Models for LLM split/verification
-############################
+
 class verification(BaseModel):
     reason: str
     message_for_user: str
@@ -38,9 +32,6 @@ class SplitTask(BaseModel):
     evaluation: Optional[Any] = None
     def __bool__(self): return self.needs_subtasks
 
-############################
-# Core Task & Registry
-############################
 class Task(BaseModel):
     id: str
     desc: str
@@ -55,15 +46,14 @@ class Task(BaseModel):
     parent: Optional[str] = None
     children: List[str] = Field(default_factory=list)
     siblings: List[str] = Field(default_factory=list)
-    # For context at execution time (chain of ancestors, etc.)
     dep_results: Dict[str, Any] = Field(default_factory=dict)
-    # Optional: for tracing subtask structure
     def to_dict_status(self):
         return dict(id=self.id, desc=self.desc, status=self.status, deps=list(self.deps),
                     parent=self.parent, children=list(self.children), siblings=list(self.siblings),
                     result_preview=(self.result[:70] if self.result else None))
     class Config:
         arbitrary_types_allowed = True
+
 class TaskRegistry:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
@@ -75,13 +65,9 @@ class TaskRegistry:
         if dep_id not in self.tasks: raise ValueError("Dependency does not exist")
         orig_deps = set(self.tasks[task_id].deps)
         self.tasks[task_id].deps.add(dep_id)
-        try:
-            if self.detect_cycle():
-                self.tasks[task_id].deps = orig_deps
-                raise ValueError("Adding dependency would create cycle")
-        except Exception as e:
+        if self.detect_cycle():
             self.tasks[task_id].deps = orig_deps
-            raise
+            raise ValueError("Adding dependency would create cycle")
     def all_tasks(self):
         return list(self.tasks.values())
     def detect_cycle(self) -> bool:
@@ -100,9 +86,6 @@ class TaskRegistry:
         for t in self.tasks.values():
             print(f" {t.id}: {t.to_dict_status()}")
 
-############################
-# Execution Context (for Tasks)
-############################
 class TaskContext:
     def __init__(self, task_id: str, registry: TaskRegistry, runner: "DAGAgent"):
         self.task_id = task_id
@@ -129,9 +112,6 @@ class TaskContext:
     def mark_result(self, result: str):
         self.task.result = result
 
-############################
-# The Upgraded DAGAgent
-############################
 class DAGAgent:
     def __init__(
         self,
@@ -139,12 +119,12 @@ class DAGAgent:
         llm_model: str = "gpt-4o-mini",
         max_fix_attempts: int = 2,
         allow_tools: bool = False,
-        mcp_servers: Optional[List[Any]] = None,
+        mcp_servers: Optional[List[Any]] = [],
         tools: Optional[List[Any]] = []
     ):
         self.registry = registry
         self.max_fix_attempts = max_fix_attempts
-        self.inflight = set()  # task ids scheduled but not yet complete
+        self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.splitter = Agent(
             model=llm_model,
@@ -202,38 +182,34 @@ class DAGAgent:
     async def _run_taskflow(self, tid: str, ctx: TaskContext):
         t = ctx.task
         logger.info(f"RUN [{tid}] {t.desc}")
-        try:
-            # PHASE 1: SPLITTING (if not yet split and flagged to split)
-            if (t.split_me or not t.already_split) and not t.already_split:
-                eval = evaluate_prompt(t.desc)
-                if eval.prompt_complexity_score[0] > 0.6:
-                    logger.info(f" [{tid}] Asking LLM to split (complexity={eval.prompt_complexity_score[0]})")
-                    async with self.splitter.run_mcp_servers():
-                        split_task: AgentRunResult = await self.splitter.run(user_prompt=t.desc)
+        # PHASE 1: SPLITTING (if not yet split and flagged to split)
+        if (t.split_me or not t.already_split) and not t.already_split:
+            eval = evaluate_prompt(t.desc)
+            if eval.prompt_complexity_score[0] > 0.6:
+                logger.info(f" [{tid}] Asking LLM to split (complexity={eval.prompt_complexity_score[0]})")
+                # async with self.splitter.run_mcp_servers():
+                split_task = await self.splitter.run(user_prompt=t.desc)
+                if split_task is None:
+                    raise Exception(f"Splitter LLM agent returned None for {tid}")
+                if split_task.usage() is not None:
                     t.cost += get_cost(split_task.usage())
-                    split_result = split_task.output
-                    if split_result and split_result.needs_subtasks and split_result.subtasks:
-                        logger.info(f" [{tid}] Split into {len(split_result.subtasks)} subtasks")
-                        for subdesc in split_result.subtasks:
-                            sub_id = ctx.inject_task(subdesc, parent=tid)
-                            ctx.add_dependency(sub_id)
-                        ctx.set_already_split()
-                        t.status = "waiting"
-                        self.inflight.discard(tid)
-                        return
+                split_result = split_task.output
+                if split_result and getattr(split_result, 'needs_subtasks', False) and getattr(split_result, 'subtasks', []):
+                    logger.info(f" [{tid}] Split into {len(split_result.subtasks)} subtasks")
+                    for subdesc in split_result.subtasks:
+                        sub_id = ctx.inject_task(subdesc, parent=tid)
+                        ctx.add_dependency(sub_id)
                     ctx.set_already_split()
-            # PHASE 2: EXECUTION
-            await self._run_task_execution(ctx)
-            t.status = "complete"
-        except Exception as ex:
-            t.status = "failed"
-            t.result = None
-            logger.error(f"FAILED {tid}: {ex}")
-        finally:
-            self.inflight.discard(tid)
+                    t.status = "waiting"
+                    self.inflight.discard(tid)
+                    return
+                ctx.set_already_split()
+        # PHASE 2: EXECUTION
+        await self._run_task_execution(ctx)
+        t.status = "complete"
+        self.inflight.discard(tid)
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
-        # Gather context for LLM
         history = self._build_context(t)
         prompt = f"Task: {t.desc}\n"
         if t.dep_results:
@@ -242,29 +218,29 @@ class DAGAgent:
             )
         prompt += f"\n\nContext chain:\n{history}\n"
         prompt += "If this task is to compile or synthesize from subtasks/children, do so; otherwise, answer directly."
-        # EXECUTE TASK BY LLM
         worked = False
         fix_attempt = 0
         result = None
         while not worked and fix_attempt <= t.max_fix_attempts:
-            try:
-                logger.info(f"   > Executing LLM for {t.desc} (attempt={fix_attempt})")
-                async with self.executor.run_mcp_servers():
-                    agent_res: AgentRunResult = await self.executor.run(user_prompt=prompt)
+            logger.info(f"   > Executing LLM for {t.desc} (attempt={fix_attempt})")
+            print(">>> about to call self.executor.run()")
+            async with self.executor.run_mcp_servers():
+                agent_res = await self.executor.run(user_prompt=prompt)
+            print(">>> finished calling self.executor.run()")
+            if agent_res is None:
+                raise Exception("LLM agent executor returned None")
+            if agent_res.usage() is not None:
                 t.cost += get_cost(agent_res.usage())
-                result = agent_res.output
-                # VERIFY
-                if await self._verify_task(t, result, ctx):
-                    worked = True
-                else:
-                    logger.warning(f"   > Verification failed for task {t.id}; Fixing.")
-                    fix_prompt = f"{prompt}\n\nPrevious answer failed: {str(result)}\nPlease retry and fix. ({fix_attempt+1}/{t.max_fix_attempts})"
-                    result = None
-                    fix_attempt += 1
-                    prompt = fix_prompt
-            except Exception as ex:
-                logger.error(f"   > Execution/fix failed: {ex}")
+            result = agent_res.output
+            if result is None:
+                raise Exception("Agent output is None")
+            if await self._verify_task(t, result, ctx):
+                worked = True
+            else:
+                fix_prompt = f"{prompt}\n\nPrevious answer failed: {str(result)}\nPlease retry and fix. ({fix_attempt+1}/{t.max_fix_attempts})"
+                result = None
                 fix_attempt += 1
+                prompt = fix_prompt
         if not worked:
             t.status = "failed"
             t.result = None
@@ -277,18 +253,18 @@ class DAGAgent:
             f"Context: {self._build_context(t)}\n\n"
             "Only approve if it truly fully satisfies the task."
         )
-        try:
-            async with self.verifier.run_mcp_servers():
-                vres: AgentRunResult = await self.verifier.run(user_prompt=ver_prompt)
+        # async with self.verifier.run_mcp_servers():
+        vres = await self.verifier.run(user_prompt=ver_prompt)
+        if vres is None:
+            raise Exception("Verifier LLM agent returned None")
+        if vres.usage() is not None:
             t.cost += get_cost(vres.usage())
-            vout = vres.output
-            logger.info(f"   > Verification: score={vout.score}, reason={vout.reason[:30]}")
-            return vout.get_successful()
-        except Exception as ex:
-            logger.warning(f"   > Verification error: {ex}")
-            return False
+        vout = vres.output
+        if vout is None:
+            raise Exception("Verifier output is None")
+        logger.info(f"   > Verification: score={vout.score}, reason={vout.reason[:30]}")
+        return vout.get_successful()
     def _build_context(self, t: Task) -> str:
-        # Get ancestors/parent/deps in readable string for LLM context.
         lines = []
         anc = []
         curr = t
@@ -308,14 +284,10 @@ class DAGAgent:
         for t in self.registry.all_tasks():
             logger.info(f" {t.id} :: {t.status} :: cost={t.cost:.4f} :: preview={str(t.result)[:80] if t.result else None}")
 
-############################
-# Demo DAG Construction
-############################
 def build_demo_registry():
     reg = TaskRegistry()
     t1 = Task(id="A", desc="Gather background research on quantum computing.")
     t2 = Task(id="B", desc="Summarize the five most promising physical qubit implementations.")
-    # C: depends on A and B, and will split itself into subtasks at runtime (requires split)
     t3 = Task(
         id="C", desc="Write a state-of-the-art survey combining results from A and B, split into reasonable sections and aggregate. Be thorough.",
         deps={"A", "B"}, split_me=True)
@@ -323,17 +295,12 @@ def build_demo_registry():
     reg.add_task(t2)
     reg.add_task(t3)
     return reg
-
 def print_final_results(reg: TaskRegistry):
     print("\nFinal results:")
     for t in reg.all_tasks():
         print(f" {t.id} :: {t.status} :: {str(t.result)[:100] if t.result else None}")
     print("\nRegistry layout:")
     reg.print_status_tree()
-
-###########################
-# MAIN
-###########################
 if __name__ == "__main__":
     reg = build_demo_registry()
     runner = DAGAgent(reg)
