@@ -208,23 +208,29 @@ class DAGAgent:
                 task_future = asyncio.create_task(self._run_taskflow(tid, ctx))
                 self.task_futures[tid] = task_future
 
-            if self.inflight:
-                done, _ = await asyncio.wait(
-                    [self.task_futures[tid] for tid in list(self.inflight)],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                # Handle exceptions for better debugging
-                for fut in done:
-                    tid_of_future = next((tid for tid, task_fut in self.task_futures.items() if task_fut == fut), None)
-                    if tid_of_future:
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            logger.error(f"Task [{tid_of_future}] failed with exception: {e}")
-                            self.registry.tasks[tid_of_future].status = "failed"
-                        del self.task_futures[tid_of_future]
+                if self.inflight:
+                    done, _ = await asyncio.wait(
+                        [self.task_futures[tid] for tid in list(self.inflight)],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # Handle exceptions and cleanup for better debugging
+                    for fut in done:
+                        tid_of_future = next((tid for tid, task_fut in self.task_futures.items() if task_fut == fut),
+                                             None)
+                        if tid_of_future:
+                            try:
+                                fut.result()  # Check for exceptions
+                            except Exception as e:
+                                logger.error(f"Task [{tid_of_future}] failed with exception: {e}")
+                                if tid_of_future in self.registry.tasks:
+                                    self.registry.tasks[tid_of_future].status = "failed"
+                            finally:
+                                # This block runs whether the task succeeded or failed.
+                                # It is the perfect place for centralized cleanup.
+                                self.inflight.discard(tid_of_future)
+                                del self.task_futures[tid_of_future]
 
-            await asyncio.sleep(0.01)
+                await asyncio.sleep(0.01)
 
     async def _run_taskflow(self, tid: str, ctx: TaskContext):
         t = ctx.task
