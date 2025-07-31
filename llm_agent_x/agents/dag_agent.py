@@ -30,15 +30,21 @@ class verification(BaseModel):
     def get_successful(self): return self.score > 5
 
 
-# --- NEW Pydantic Models for Dynamic Planning ---
+# --- NEW/MODIFIED Pydantic Models for Explained Dependencies and Cycle Breaking ---
+
+class Dependency(BaseModel):
+    """Represents a dependency link between two new sub-tasks."""
+    local_id: str = Field(description="The local_id of the task that must be completed first.")
+    reason: str = Field(description="A clear, concise explanation for why this dependency exists.")
+
 
 class NewSubtask(BaseModel):
     """Defines a new sub-task to be added to the execution graph."""
     local_id: str = Field(
         description="A temporary, unique ID for this new task (e.g., 'task1', 'research_flights'). Used to define dependencies among other new tasks.")
     desc: str = Field(description="The detailed description of this specific sub-task.")
-    deps: List[str] = Field(default_factory=list,
-                            description="A list of local_ids of other *new* sub-tasks that this one depends on.")
+    deps: List[Dependency] = Field(default_factory=list,
+                                   description="A list of dependencies, each with a reason, for this sub-task.")
 
 
 class ExecutionPlan(BaseModel):
@@ -47,7 +53,7 @@ class ExecutionPlan(BaseModel):
     subtasks: List[NewSubtask] = Field(default_factory=list, description="A list of new sub-tasks to be executed.")
 
 
-# --- Models for Core DAG Structure (with modifications) ---
+# --- Models for Core DAG Structure (Unchanged) ---
 
 class Task(BaseModel):
     id: str
@@ -55,12 +61,8 @@ class Task(BaseModel):
     deps: Set[str] = Field(default_factory=set)
     status: str = "pending"  # pending, planning, waiting, running, complete, failed
     result: Optional[str] = None
-
-    # --- MODIFIED/NEW Fields for Two-Phase Execution ---
     needs_planning: bool = False
     already_planned: bool = False
-
-    # --- Unchanged Fields ---
     fix_attempts: int = 0
     max_fix_attempts: int = 2
     cost: float = 0.0
@@ -78,7 +80,6 @@ class Task(BaseModel):
         arbitrary_types_allowed = True
 
 
-# TaskRegistry and TaskContext are largely unchanged, but we'll include them for completeness.
 class TaskRegistry:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
@@ -98,7 +99,6 @@ class TaskRegistry:
 
     def print_status_tree(self):
         logger.info("--- CURRENT TASK REGISTRY STATUS ---")
-        # Find root nodes (tasks with no parents)
         root_nodes = [t for t in self.tasks.values() if not t.parent]
         for root in root_nodes:
             self._print_node(root, 0)
@@ -130,7 +130,7 @@ class TaskContext:
         return sub_id
 
 
-# --- THE REWRITTEN DAGAgent ---
+# --- THE REWRITTEN DAGAgent WITH CYCLE BREAKER ---
 
 class DAGAgent:
     def __init__(
@@ -143,27 +143,52 @@ class DAGAgent:
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
 
-        # --- NEW "Planner" Agent ---
         self.planner = Agent(
             model=llm_model,
             system_prompt=(
                 "You are an expert project planner. Your job is to break down a complex task into a series of smaller, actionable sub-tasks. "
-                "Define a clear plan with dependencies. Use local_ids to define dependencies between the new tasks you create. "
-                "If the task is simple and requires no further breakdown, set 'needs_subtasks' to false."
+                "Define a clear plan with dependencies. For each dependency, you MUST provide a 'reason' explaining why it is necessary. "
+                "For example, a 'Book Hotel' task should depend on a 'Research Hotels' task, with the reason being 'The hotel to book is determined by the research results.' "
+                "Do not worry about creating perfect, cycle-free graphs; focus on capturing all logical connections."
             ),
             output_type=ExecutionPlan
         )
-        # --- Other Agents (Unchanged) ---
+
+        # --- NEW "Cycle Breaker" Agent ---
+        self.cycle_breaker = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a logical validation expert. Your task is to analyze an execution plan and resolve any circular dependencies (cycles). "
+                "A cycle is when Task A depends on B, and Task B depends on A (directly or indirectly). "
+                "You will be given a plan as a JSON object. Analyze the 'deps' for each task. "
+                "If you find a cycle, you must remove the *least critical* dependency to break the cycle. Use the 'reason' field for each dependency to decide which one is less important. "
+                "Your final output MUST be the complete, corrected ExecutionPlan, with the cycle-causing dependency removed. Do not add or remove any tasks. "
+                "If there are no cycles, return the original plan unchanged."
+            ),
+            output_type=ExecutionPlan
+        )
+
         self.executor = Agent(model=llm_model, output_type=str, tools=tools)
         self.verifier = Agent(model=llm_model, output_type=verification)
 
     async def run(self):
         pending = set(self.registry.tasks.keys())
         while pending or self.inflight:
-            # Re-evaluate ready tasks in every loop, as the graph can change
             all_task_ids = set(self.registry.tasks.keys())
-            pending = all_task_ids - {t.id for t in self.registry.tasks.values() if t.status in ('complete', 'failed')}
 
+            # --- Failure Propagation ---
+            current_pending = all_task_ids - {t.id for t in self.registry.tasks.values() if
+                                              t.status in ('complete', 'failed')}
+            for tid in list(current_pending):
+                task = self.registry.tasks[tid]
+                failed_deps = [d for d in task.deps if self.registry.tasks.get(d, {}).status == "failed"]
+                if failed_deps:
+                    logger.warning(f"Task [{tid}] is failing because its dependencies {failed_deps} failed.")
+                    task.status = "failed"
+                    task.result = f"Upstream dependency failure: {failed_deps}"
+
+            # Re-evaluate ready tasks in every loop
+            pending = all_task_ids - {t.id for t in self.registry.tasks.values() if t.status in ('complete', 'failed')}
             ready = [
                 tid for tid in pending
                 if all(self.registry.tasks.get(d, {}).status == "complete" for d in self.registry.tasks[tid].deps)
@@ -173,7 +198,9 @@ class DAGAgent:
             if not ready and not self.inflight and pending:
                 logger.error("Stalled DAG (cycle/unsatisfiable dependency):")
                 self.registry.print_status_tree()
-                raise Exception("DAG is not runnable (cycle?)")
+                # Instead of raising an exception, we can just break the loop
+                # This is useful if we want to inspect the final state without a crash
+                break
 
             for tid in ready:
                 self.inflight.add(tid)
@@ -186,60 +213,82 @@ class DAGAgent:
                     [self.task_futures[tid] for tid in list(self.inflight)],
                     return_when=asyncio.FIRST_COMPLETED
                 )
-            await asyncio.sleep(0.01)  # Small sleep to prevent busy-waiting
+                # Handle exceptions for better debugging
+                for fut in done:
+                    tid_of_future = next((tid for tid, task_fut in self.task_futures.items() if task_fut == fut), None)
+                    if tid_of_future:
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            logger.error(f"Task [{tid_of_future}] failed with exception: {e}")
+                            self.registry.tasks[tid_of_future].status = "failed"
+                        del self.task_futures[tid_of_future]
+
+            await asyncio.sleep(0.01)
 
     async def _run_taskflow(self, tid: str, ctx: TaskContext):
         t = ctx.task
 
-        # --- PHASE 1: DYNAMIC PLANNING ---
-        # If the task hasn't been planned yet and is flagged for planning.
+        # --- PHASE 1: DYNAMIC PLANNING (NOW WITH A FIXER STEP) ---
         if not t.already_planned and t.needs_planning:
             t.status = "planning"
             logger.info(f"PLANNING for [{t.id}]: {t.desc}")
 
+            # Step 1: Generate the initial, potentially flawed plan
             plan_res = await self.planner.run(user_prompt=t.desc)
             t.cost += get_cost(plan_res.usage())
-            plan = plan_res.output
+            initial_plan = plan_res.output
+            t.already_planned = True
 
-            t.already_planned = True  # Mark as planned even if no subtasks are created
+            if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
+                logger.info(
+                    f"Initial plan for [{t.id}] creates {len(initial_plan.subtasks)} sub-tasks. Validating for cycles...")
 
-            if plan and plan.needs_subtasks and plan.subtasks:
-                logger.info(f"Plan for [{t.id}] creates {len(plan.subtasks)} new sub-tasks.")
+                # Step 2: Send the plan to the cycle breaker for validation and fixing
+                fixer_prompt = (
+                    "Please analyze the following execution plan for cycles and correct it:\n\n"
+                    f"{initial_plan.model_dump_json(indent=2)}"
+                )
+                fixed_plan_res = await self.cycle_breaker.run(user_prompt=fixer_prompt)
+                t.cost += get_cost(fixed_plan_res.usage())
+                final_plan = fixed_plan_res.output
 
+                logger.info(f"Cycle breaker has validated the plan. Proceeding with {len(final_plan.subtasks)} tasks.")
+
+                # You can set a breakpoint here to inspect the initial vs. final plan!
+                # print("--- INITIAL PLAN ---\n", initial_plan.model_dump_json(indent=2))
+                # print("--- FINAL PLAN ---\n", final_plan.model_dump_json(indent=2))
+                # import pdb; pdb.set_trace()
+
+                # Step 3: Inject the validated tasks into the DAG
                 local_to_global_id_map: Dict[str, str] = {}
-
-                # First pass: Create all tasks to get their global IDs
-                for sub in plan.subtasks:
+                for sub in final_plan.subtasks:
                     new_task_id = ctx.inject_task(sub.desc, parent=t.id)
                     local_to_global_id_map[sub.local_id] = new_task_id
-                    # The parent (current task) now depends on this new child
                     ctx.add_dependency(new_task_id)
 
-                # Second pass: Add dependencies between the new tasks
-                for sub in plan.subtasks:
+                for sub in final_plan.subtasks:
                     new_task_global_id = local_to_global_id_map[sub.local_id]
-                    for local_dep_id in sub.deps:
+                    for dep in sub.deps:  # Iterate through Dependency objects
+                        local_dep_id = dep.local_id
                         if local_dep_id in local_to_global_id_map:
                             global_dep_id = local_to_global_id_map[local_dep_id]
                             self.registry.add_dependency(new_task_global_id, global_dep_id)
 
-                t.status = "waiting"  # The parent now waits for its new children
+                t.status = "waiting"
                 self.inflight.discard(tid)
                 logger.info(f"Finished PLANNING for [{t.id}]. Now waiting for {len(t.deps)} children.")
-                self.registry.print_status_tree()  # Show the new graph
-                return  # Yield control back to the main run loop
+                self.registry.print_status_tree()
+                return
 
-        # --- PHASE 2: EXECUTION / SYNTHESIS ---
+        # --- PHASE 2: EXECUTION / SYNTHESIS (Unchanged) ---
         t.status = "running"
         logger.info(f"EXECUTING [{t.id}]: {t.desc}")
-        await self._run_task_execution(ctx)  # This contains the verify/fix loop
-        t.status = "complete"
-        self.inflight.discard(tid)
-        logger.info(f"COMPLETED [{t.id}]")
+        await self._run_task_execution(ctx)
+        self.inflight.discard(tid)  # Remove from inflight after execution attempt
 
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
-        # Refresh dependency results right before execution
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
 
         prompt = f"Task: {t.desc}\n"
@@ -254,13 +303,11 @@ class DAGAgent:
         else:
             prompt += "Please execute this task directly and provide a complete answer."
 
-        # Verify/Fix loop (mostly unchanged)
         worked = False
         fix_attempt = 0
         result = None
         while not worked and fix_attempt <= t.max_fix_attempts:
             logger.info(f"   > LLM execution for [{t.id}] (attempt={fix_attempt})")
-
             agent_res = await self.executor.run(user_prompt=prompt)
             t.cost += get_cost(agent_res.usage())
             result = agent_res.output
@@ -268,16 +315,19 @@ class DAGAgent:
             if await self._verify_task(t, result):
                 worked = True
             else:
-                prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was deemed insufficient. Please re-evaluate the task and the provided data to generate a better, more complete response. (Attempt {fix_attempt + 1}/{t.max_fix_attempts})"
+                prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was deemed insufficient. Please re-evaluate and try again."
                 result = None
                 fix_attempt += 1
 
         if not worked:
             t.status = "failed"
             t.result = "Failed to produce a satisfactory result after multiple attempts."
+            logger.error(f"Task [{t.id}] failed after {t.max_fix_attempts + 1} attempts.")
             raise Exception(f"Exceeded max fix attempts for {t.desc}")
 
         t.result = result
+        t.status = "complete"  # Set status to complete only on success
+        logger.info(f"COMPLETED [{t.id}]")
 
     async def _verify_task(self, t: Task, candidate_result: str) -> bool:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
@@ -295,6 +345,7 @@ if __name__ == "__main__":
 
     apply()
 
+
     def build_dynamic_planning_dag():
         reg = TaskRegistry()
         root_task = Task(
@@ -303,116 +354,50 @@ if __name__ == "__main__":
                 "Plan and book a 3-day research trip to San Francisco for a conference on AI. "
                 "The output should be a complete itinerary including flights, hotel, and a daily schedule."
             ),
-            # This flag is the entry point to the new dynamic behavior
             needs_planning=True,
         )
         reg.add_task(root_task)
         return reg
 
 
+    # --- Dummy Tool Functions (Unchanged) ---
     def book_one_way_flight(origin: str, destination: str, datetime: str):
-        """
-        Books a one-way flight ticket from an origin to a destination.
-
-        Args:
-            origin (str): The starting city or airport code (e.g., 'SFO' for San Francisco).
-            destination (str): The destination city or airport code (e.g., 'JFK' for New York).
-            datetime (str): The desired departure date and time in a clear, standard format (e.g., '2024-09-15 14:30').
-
-        Returns:
-            str: A confirmation message including the flight booking details.
-        """
+        """Books a one-way flight ticket."""
         print(f"Booking a one-way flight from {origin} to {destination} on {datetime}")
-        return f"Successfully booked a one-way flight from {origin} to {destination} on {datetime}. Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
+        return f"Successfully booked a one-way flight... Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
 
 
     def book_round_trip_flight(origin: str, destination: str, departure_datetime: str, return_datetime: str):
-        """
-        Books a round-trip flight ticket, including a departure and a return flight.
-
-        Args:
-            origin (str): The starting city or airport code (e.g., 'SFO').
-            destination (str): The destination city or airport code (e.g., 'LAX').
-            departure_datetime (str): The desired departure date and time (e.g., '2024-10-20 09:00').
-            return_datetime (str): The desired return date and time (e.g., '2024-10-25 18:00').
-
-        Returns:
-            str: A confirmation message with the round-trip booking details.
-        """
+        """Books a round-trip flight ticket."""
         print(
             f"Booking a round-trip flight from {origin} to {destination} on {departure_datetime} and {return_datetime}")
-        return f"Successfully booked a round-trip flight from {origin} to {destination}, departing on {departure_datetime} and returning on {return_datetime}. Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
+        return f"Successfully booked a round-trip flight... Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
 
 
     def book_hotel(location: str, check_in_date: str, check_out_date: str, room_type: str = "Standard King"):
-        """
-        Books a hotel stay for a given location and date range. Use the brave_web_search tool first to find suitable hotel names.
-
-        Args:
-            location (str): The name of the hotel to book (e.g., 'Marriott Marquis San Francisco').
-            check_in_date (str): The date for checking into the hotel (e.g., '2024-09-15').
-            check_out_date (str): The date for checking out of the hotel (e.g., '2024-09-18').
-            room_type (str): The desired type of room (e.g., 'Standard King', 'Queen with View'). Defaults to 'Standard King'.
-
-        Returns:
-            str: A confirmation of the hotel booking.
-        """
+        """Books a hotel stay for a given location and date range."""
         print(f"Booking a hotel stay at {location} from {check_in_date} to {check_out_date}")
-        return f"Successfully booked a {room_type} room at {location} from {check_in_date} to {check_out_date}. Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
+        return f"Successfully booked a {room_type} room at {location}... Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
 
 
     def book_meal(restaurant_name: str, party_size: int, datetime: str):
-        """
-        Makes a meal reservation at a specific restaurant.
-
-        Args:
-            restaurant_name (str): The name of the restaurant for the reservation.
-            party_size (int): The number of people in the party.
-            datetime (str): The date and time for the reservation (e.g., '2024-09-16 19:30').
-
-        Returns:
-            str: A confirmation of the meal reservation.
-        """
+        """Makes a meal reservation."""
         print(f"Booking a meal at {restaurant_name} for {party_size} people on {datetime}")
-        return f"Successfully booked a table for {party_size} at {restaurant_name} on {datetime}. Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
+        return f"Successfully booked a table... Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
 
 
     def book_transportation(service: str, origin: str, destination: str, datetime: str):
-        """
-        Books ground transportation, such as a taxi or rideshare.
-
-        Args:
-            service (str): The type of transportation service (e.g., 'Taxi', 'Uber', 'Lyft').
-            origin (str): The pickup location (e.g., 'San Francisco International Airport').
-            destination (str): The drop-off location (e.g., 'Marriott Marquis San Francisco').
-            datetime (str): The date and time for the pickup (e.g., '2024-09-15 16:00').
-
-        Returns:
-            str: A confirmation of the transportation booking.
-        """
+        """Books ground transportation."""
         print(f"Booking {service} to {destination} from {origin} on {datetime}")
-        return f"Successfully booked {service} from {origin} to {destination} for {datetime}. Driver will be dispatched."
+        return f"Successfully booked {service}... Driver will be dispatched."
 
 
     def book_event(event_name: str, location: str, datetime: str, quantity: int = 1):
-        """
-        Books a ticket for a specific event, such as a conference, show, or museum.
-
-        Args:
-            event_name (str): The name of the event (e.g., 'AI Global Summit 2024').
-            location (str): The venue of the event (e.g., 'Moscone Center, San Francisco').
-            datetime (str): The date and time of the event.
-            quantity (int): The number of tickets to book. Defaults to 1.
-
-        Returns:
-            str: A confirmation of the event ticket booking.
-        """
+        """Books a ticket for a specific event."""
         print(f"Booking {quantity} ticket(s) for {event_name} at {location} on {datetime}")
-        return f"Successfully booked {quantity} ticket(s) for {event_name} at {location} on {datetime}. Tickets sent to registered email."
+        return f"Successfully booked {quantity} ticket(s)... Tickets sent to registered email."
 
 
-    # The list of tools provided to the agent. It includes a general-purpose search
-    # tool and the specific booking tools defined above.
     tools = [
         brave_web_search,
         book_one_way_flight,
@@ -423,8 +408,8 @@ if __name__ == "__main__":
         book_event,
     ]
 
-    async def main():
 
+    async def main():
         reg = build_dynamic_planning_dag()
         runner = DAGAgent(reg, tools=tools)
 
@@ -439,8 +424,9 @@ if __name__ == "__main__":
         reg.print_status_tree()
 
         print("\n--- FINAL RESULTS ---")
-        root_result = runner.registry.tasks["ROOT_PLANNER"].result
-        print(f"** Final Itinerary for ROOT_PLANNER **\n{root_result}")
+        root_result_task = runner.registry.tasks.get("ROOT_PLANNER")
+        if root_result_task:
+            print(f"** Final Itinerary for ROOT_PLANNER ({root_result_task.status}) **\n{root_result_task.result}")
 
         total_cost = sum(t.cost for t in reg.all_tasks())
         print(f"\nTotal estimated cost: ${total_cost:.4f}")
