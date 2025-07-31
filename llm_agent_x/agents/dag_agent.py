@@ -1,33 +1,36 @@
 import asyncio
 import uuid
 import logging
+from os import getenv
 from typing import Set, Dict, Any, Optional, List
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
 from dotenv import load_dotenv
 
-# --- NEW: OpenTelemetry Imports ---
+# --- OpenTelemetry Imports ---
 from opentelemetry import trace, context as otel_context
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
-from opentelemetry.trace import Tracer, Span
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
 
+# --- Basic Setup ---
 load_dotenv(".env", override=True)
-
-# --- Basic Setup (Unchanged) ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("DAGAgent")
 
 
 def get_cost(usage) -> float:
     if not usage: return 0.0
+    # Using GPT-4o-mini pricing for example
     input_cost = 0.15 / 1_000_000
     output_cost = 0.60 / 1_000_000
     return (input_cost * getattr(usage, "request_tokens", 0)) + (output_cost * getattr(usage, "response_tokens", 0))
 
 
+# --- Pydantic Models ---
 class verification(BaseModel):
     reason: str
     message_for_user: str
@@ -37,27 +40,32 @@ class verification(BaseModel):
 
 
 class Dependency(BaseModel):
+    """Represents a dependency link between two new sub-tasks."""
     local_id: str = Field(description="The local_id of the task that must be completed first.")
     reason: str = Field(description="A clear, concise explanation for why this dependency exists.")
 
 
 class NewSubtask(BaseModel):
-    local_id: str = Field(description="A temporary, unique ID for this new task (e.g., 'task1', 'research_flights').")
+    """Defines a new sub-task to be added to the execution graph."""
+    local_id: str = Field(
+        description="A temporary, unique ID for this new task (e.g., 'task1', 'research_flights'). Used to define dependencies among other new tasks.")
     desc: str = Field(description="The detailed description of this specific sub-task.")
     deps: List[Dependency] = Field(default_factory=list,
                                    description="A list of dependencies, with reasons, for this sub-task.")
 
 
 class ExecutionPlan(BaseModel):
+    """The execution plan for a complex task. It can either be a simple task or be broken down into sub-tasks."""
     needs_subtasks: bool = Field(description="Set to true if the task is complex and should be broken down.")
     subtasks: List[NewSubtask] = Field(default_factory=list, description="A list of new sub-tasks to be executed.")
 
 
+# --- Core Data Models ---
 class Task(BaseModel):
     id: str
     desc: str
     deps: Set[str] = Field(default_factory=set)
-    status: str = "pending"
+    status: str = "pending"  # pending, planning, waiting, running, complete, failed
     result: Optional[str] = None
     needs_planning: bool = False
     already_planned: bool = False
@@ -69,9 +77,9 @@ class Task(BaseModel):
     siblings: List[str] = Field(default_factory=list)
     dep_results: Dict[str, Any] = Field(default_factory=dict)
 
-    # --- NEW: Tracing Fields ---
-    otel_context: Optional[Any] = None  # Stores the parent's OTel context for linking
-    span: Optional[Span] = None  # Holds the active span for this task during its run
+    # Tracing Fields
+    otel_context: Optional[Any] = None
+    span: Optional[Span] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -115,7 +123,6 @@ class TaskContext:
     def add_dependency(self, dep_id: str):
         self.registry.add_dependency(self.task_id, dep_id)
 
-    # --- MODIFIED: To accept and store the parent's tracing context ---
     def inject_task(self, desc: str, parent: Optional[str] = None, parent_context: Optional[Any] = None) -> str:
         sub_id = str(uuid.uuid4())[:8]
         task = Task(id=sub_id, desc=desc, parent=parent, otel_context=parent_context)
@@ -124,6 +131,7 @@ class TaskContext:
         return sub_id
 
 
+# --- The Corrected and Instrumented DAGAgent ---
 class DAGAgent:
     def __init__(
             self,
@@ -135,17 +143,37 @@ class DAGAgent:
         self.registry = registry
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
-        # --- MODIFIED: Use injected tracer or get a default one ---
         self.tracer = tracer or trace.get_tracer(__name__)
 
-        # Agents remain the same
-        self.planner = Agent(model=llm_model, system_prompt=..., output_type=ExecutionPlan)
-        self.cycle_breaker = Agent(model=llm_model, system_prompt=..., output_type=ExecutionPlan)
+        # --- BUG FIX: Restored the full system prompts ---
+        self.planner = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are an expert project planner. Your job is to break down a complex task into a series of smaller, actionable sub-tasks. "
+                "Define a clear plan with dependencies. For each dependency, you MUST provide a 'reason' explaining why it is necessary. "
+                "For example, a 'Book Hotel' task should depend on a 'Research Hotels' task, with the reason being 'The hotel to book is determined by the research results.' "
+                "Do not worry about creating perfect, cycle-free graphs; focus on capturing all logical connections."
+            ),
+            output_type=ExecutionPlan
+        )
+
+        self.cycle_breaker = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a logical validation expert. Your task is to analyze an execution plan and resolve any circular dependencies (cycles). "
+                "A cycle is when Task A depends on B, and Task B depends on A (directly or indirectly). "
+                "You will be given a plan as a JSON object. Analyze the 'deps' for each task. "
+                "If you find a cycle, you must remove the *least critical* dependency to break the cycle. Use the 'reason' field for each dependency to decide which one is less important. "
+                "Your final output MUST be the complete, corrected ExecutionPlan, with the cycle-causing dependency removed. Do not add or remove any tasks. "
+                "If there are no cycles, return the original plan unchanged."
+            ),
+            output_type=ExecutionPlan
+        )
+
         self.executor = Agent(model=llm_model, output_type=str, tools=tools)
         self.verifier = Agent(model=llm_model, output_type=verification)
 
-    # --- NEW: Helper for consistently adding LLM data to spans ---
-    def _add_llm_data_to_span(self, span: Span, agent_res: AgentRunResult):
+    def _add_llm_data_to_span(self, span: Span, agent_res: AgentRunResult, task: Task):
         if not span or not agent_res: return
         usage = agent_res.usage()
         cost = get_cost(usage)
@@ -155,15 +183,10 @@ class DAGAgent:
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, getattr(usage, "total_tokens", 0))
         span.set_attribute("llm.cost", cost)
 
-        # Find the task associated with this span's context and add the cost
-        span_ctx = trace.get_current_span().get_span_context()
-        for task in self.registry.all_tasks():
-            if task.span and task.span.get_span_context() == span_ctx:
-                task.cost += cost
-                break
+        # This logic is a bit tricky with async contexts. We find the task that owns this span.
+        task.cost += cost
 
     async def run(self):
-        # --- MODIFIED: Wrap the entire run in a root span ---
         with self.tracer.start_as_current_span("DAGAgent.run") as root_span:
             root_span.set_attribute("dag.task_count.initial", len(self.registry.tasks))
 
@@ -171,7 +194,6 @@ class DAGAgent:
             while pending or self.inflight:
                 all_task_ids = set(self.registry.tasks.keys())
 
-                # Failure Propagation
                 current_pending = all_task_ids - {t.id for t in self.registry.tasks.values() if
                                                   t.status in ('complete', 'failed')}
                 for tid in list(current_pending):
@@ -191,7 +213,7 @@ class DAGAgent:
                     logger.error("Stalled DAG (cycle/unsatisfiable dependency):")
                     self.registry.print_status_tree()
                     root_span.add_event("DAG Stalled", {"pending_tasks": list(pending)})
-                    root_span.set_status(trace.Status(trace.StatusCode.ERROR, "DAG Stalled"))
+                    root_span.set_status(trace.Status(StatusCode.ERROR, "DAG Stalled"))
                     break
 
                 for tid in ready:
@@ -208,97 +230,90 @@ class DAGAgent:
                                              None)
                         if tid_of_future:
                             try:
-                                fut.result()  # Check for exceptions
+                                fut.result()
                             except Exception as e:
-                                logger.error(f"Task [{tid_of_future}] failed with exception: {e}")
+                                # --- THIS IS THE FIX ---
+                                # The exception was already recorded on the span in _run_taskflow.
+                                # The main loop's only job is to log it and update the task's state in the registry.
+                                logger.error(f"Task [{tid_of_future}]'s future completed with exception: {e}")
                                 task = self.registry.tasks.get(tid_of_future)
                                 if task:
+                                    # The status is already set to 'failed' where the exception was raised,
+                                    # but we can ensure it here as a safeguard.
                                     task.status = "failed"
-                                    # --- MODIFIED: Record exception on the correct span ---
-                                    if task.span:
-                                        task.span.record_exception(e)
-                                        task.span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                                # --- REMOVED THE FOLLOWING LINES ---
+                                # if task.span:
+                                #     task.span.record_exception(e)
+                                #     task.span.set_status(trace.Status(StatusCode.ERROR, str(e)))
                             finally:
                                 self.inflight.discard(tid_of_future)
                                 del self.task_futures[tid_of_future]
-
-                await asyncio.sleep(0.01)
 
             root_span.set_attribute("dag.task_count.final", len(self.registry.tasks))
 
     async def _run_taskflow(self, tid: str, ctx: TaskContext):
         t = ctx.task
-        # --- MODIFIED: Create a span for the entire task lifecycle, using stored context ---
         with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}...", context=t.otel_context) as span:
-            t.span = span  # Store the active span on the task object
+            t.span = span
             span.set_attribute("dag.task.id", t.id)
             span.set_attribute("dag.task.description", t.desc)
             span.set_attribute("dag.task.parent_id", t.parent or "None")
             span.set_attribute("dag.task.status", t.status)
 
             try:
-                # --- PHASE 1: DYNAMIC PLANNING ---
                 if not t.already_planned and t.needs_planning:
                     with self.tracer.start_as_current_span("Phase: Planning") as planning_span:
-                        t.status = "planning"
+                        t.status = "planning";
                         span.set_attribute("dag.task.status", t.status)
                         logger.info(f"PLANNING for [{t.id}]: {t.desc}")
 
                         with self.tracer.start_as_current_span("Agent: Planner") as planner_span:
                             plan_res = await self.planner.run(user_prompt=t.desc)
-                            self._add_llm_data_to_span(planner_span, plan_res)
-                        initial_plan = plan_res.output
+                            self._add_llm_data_to_span(planner_span, plan_res, t)
+                        initial_plan = plan_res.output;
                         t.already_planned = True
 
                         if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
                             planning_span.add_event("Initial plan generated",
                                                     {"subtask_count": len(initial_plan.subtasks)})
-
                             with self.tracer.start_as_current_span("Agent: Cycle Breaker") as cb_span:
-                                fixer_prompt = f"Please analyze...{initial_plan.model_dump_json(indent=2)}"
+                                fixer_prompt = (
+                                    f"Please analyze the following execution plan for cycles and correct it:\n\n{initial_plan.model_dump_json(indent=2)}")
                                 fixed_plan_res = await self.cycle_breaker.run(user_prompt=fixer_prompt)
-                                self._add_llm_data_to_span(cb_span, fixed_plan_res)
+                                self._add_llm_data_to_span(cb_span, fixed_plan_res, t)
                             final_plan = fixed_plan_res.output
+                            planning_span.add_event("Plan validated", {"final_subtask_count": len(final_plan.subtasks)})
 
-                            planning_span.add_event("Plan validated by Cycle Breaker",
-                                                    {"final_subtask_count": len(final_plan.subtasks)})
-
-                            # --- CRITICAL: Capture parent context before creating children ---
                             parent_context = otel_context.get_current()
-
                             local_to_global_id_map: Dict[str, str] = {}
                             for sub in final_plan.subtasks:
                                 new_task_id = ctx.inject_task(sub.desc, parent=t.id, parent_context=parent_context)
                                 local_to_global_id_map[sub.local_id] = new_task_id
                                 ctx.add_dependency(new_task_id)
-
                             for sub in final_plan.subtasks:
                                 new_task_global_id = local_to_global_id_map[sub.local_id]
                                 for dep in sub.deps:
                                     if dep.local_id in local_to_global_id_map:
-                                        global_dep_id = local_to_global_id_map[dep.local_id]
-                                        self.registry.add_dependency(new_task_global_id, global_dep_id)
+                                        self.registry.add_dependency(new_task_global_id,
+                                                                     local_to_global_id_map[dep.local_id])
 
-                            t.status = "waiting"
+                            t.status = "waiting";
                             self.inflight.discard(tid)
                             logger.info(f"Finished PLANNING for [{t.id}]. Now waiting for {len(t.deps)} children.")
-                            return  # Exit early, this task is now a manager
+                            return
 
-                # --- PHASE 2: EXECUTION / SYNTHESIS ---
                 with self.tracer.start_as_current_span("Phase: Execution") as exec_phase_span:
-                    t.status = "running"
+                    t.status = "running";
                     span.set_attribute("dag.task.status", t.status)
                     logger.info(f"EXECUTING [{t.id}]: {t.desc}")
                     await self._run_task_execution(ctx)
 
                 self.inflight.discard(tid)
-
             except Exception as e:
-                # Catch-all for any unhandled exception within the taskflow
                 span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR, f"Task failed in execution: {e}"))
-                t.status = "failed"
-                raise  # Re-raise to be handled by the main loop's exception handler
+                span.set_status(trace.Status(StatusCode.ERROR, f"Task failed: {e}"))
+                t.status = "failed";
+                raise
             finally:
                 span.set_attribute("dag.task.status", t.status)
                 span.set_attribute("dag.task.result_preview", (t.result or "")[:200])
@@ -306,99 +321,122 @@ class DAGAgent:
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
-        prompt = f"Task: {t.desc}\n..."  # Prompt building logic is the same
+        prompt = f"Task: {t.desc}\n"
+        if t.dep_results:
+            prompt += "\nUse the following data from completed dependencies to inform your answer:\n"
+            for dep_id, res in t.dep_results.items():
+                prompt += f"- Result from sub-task '{self.registry.tasks[dep_id].desc}':\n{str(res)}\n\n"
+        if t.children:
+            prompt += "Your main goal is to synthesize the results from your sub-tasks into a final, cohesive answer."
+        else:
+            prompt += "Please execute this task directly and provide a complete answer."
 
-        worked = False
-        fix_attempt = 0
+        worked = False;
+        fix_attempt = 0;
         result = None
         while not worked and fix_attempt <= t.max_fix_attempts:
             t.span.add_event(f"Execution Attempt", {"attempt": fix_attempt + 1})
             with self.tracer.start_as_current_span(f"Agent: Executor (Attempt {fix_attempt + 1})") as exec_span:
                 agent_res = await self.executor.run(user_prompt=prompt)
-                self._add_llm_data_to_span(exec_span, agent_res)
+                self._add_llm_data_to_span(exec_span, agent_res, t)
             result = agent_res.output
-
             if await self._verify_task(t, result):
-                worked = True
+                worked = True;
                 t.span.add_event("Execution Succeeded and Verified")
             else:
-                prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---"
-                t.span.add_event("Execution Attempt Failed Verification")
-                result = None
+                prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Re-evaluate and try again."
+                t.span.add_event("Execution Attempt Failed Verification");
+                result = None;
                 fix_attempt += 1
 
         if not worked:
-            t.status = "failed"
-            t.result = "Failed to produce a satisfactory result after multiple attempts."
-            logger.error(f"Task [{t.id}] failed after {t.max_fix_attempts + 1} attempts.")
-            t.span.set_status(trace.Status(trace.StatusCode.ERROR, "Exceeded max fix attempts"))
+            t.status = "failed";
+            t.result = "Failed to produce a satisfactory result."
+            t.span.set_status(trace.Status(StatusCode.ERROR, "Exceeded max fix attempts"))
             raise Exception(f"Exceeded max fix attempts for {t.desc}")
 
-        t.result = result
-        t.status = "complete"
+        t.result = result;
+        t.status = "complete";
         logger.info(f"COMPLETED [{t.id}]")
 
     async def _verify_task(self, t: Task, candidate_result: str) -> bool:
         with self.tracer.start_as_current_span("Agent: Verifier") as verifier_span:
-            ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\n..."
+            ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
             vres = await self.verifier.run(user_prompt=ver_prompt)
-            self._add_llm_data_to_span(verifier_span, vres)
+            self._add_llm_data_to_span(verifier_span, vres, t)
             vout = vres.output
-
             verifier_span.set_attribute("verification.score", vout.score)
             verifier_span.set_attribute("verification.reason", vout.reason)
-
             logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
             return vout.get_successful()
 
 
 if __name__ == "__main__":
-    from llm_agent_x.tools.brave_web_search import brave_web_search
     from nest_asyncio import apply
 
     apply()
 
-    # --- NEW: OpenTelemetry SDK Boilerplate Setup ---
+    # --- This assumes you have brave_web_search in a specific project structure ---
+    # --- If not, comment this out or replace with a dummy function. ---
+    try:
+        from llm_agent_x.tools.brave_web_search import brave_web_search
+    except ImportError:
+        logger.warning("Could not import brave_web_search. Using a dummy function.")
+
+
+        def brave_web_search(query: str):
+            """Performs a web search."""
+            logger.info(f"DUMMY SEARCH: {query}")
+            return f"Dummy search results for '{query}'"
+
+    # --- OTel and Phoenix Setup (for connecting to an existing server) ---
     provider = TracerProvider()
-    processor = SimpleSpanProcessor(ConsoleSpanExporter())
+    otlp_exporter = OTLPSpanExporter(
+        endpoint=getenv("ARIZE_PHOENIX_ENDPOINT", "http://localhost:6006/v1/traces")
+    )
+    processor = BatchSpanProcessor(otlp_exporter)
     provider.add_span_processor(processor)
     trace.set_tracer_provider(provider)
-    # Get a tracer for the main execution context
     main_tracer = trace.get_tracer("dag_agent_main")
 
 
     def build_dynamic_planning_dag():
-        # ... (function is unchanged)
         reg = TaskRegistry()
-        root_task = Task(id="ROOT_PLANNER", desc=..., needs_planning=True)
+        root_task = Task(
+            id="ROOT_PLANNER",
+            desc=(
+                "Plan and book a 3-day research trip to San Francisco for a conference on AI. "
+                "The output should be a complete itinerary including flights, hotel, and a daily schedule."
+            ),
+            needs_planning=True,
+        )
         reg.add_task(root_task)
         return reg
 
 
-    # ... (dummy tool functions are unchanged) ...
-    tools = [brave_web_search, ...]
+    def book_one_way_flight(origin: str, destination: str, datetime: str):
+        """Books a one-way flight ticket."""
+        logger.info(f"Booking a one-way flight from {origin} to {destination} on {datetime}")
+        return f"Successfully booked a one-way flight... Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
+
+
+    tools = [brave_web_search, book_one_way_flight]
 
 
     async def main():
-        # --- MODIFIED: Use the tracer ---
         with main_tracer.start_as_current_span("main_execution"):
             reg = build_dynamic_planning_dag()
             runner = DAGAgent(reg, tools=tools, tracer=main_tracer)
-
             print("\n====== BEGIN DYNAMIC PLANNING EXECUTION ======")
             reg.print_status_tree()
-
             await runner.run()
-
             print("\n====== ALL DONE =============")
             print("Final state:")
             reg.print_status_tree()
-
             print("\n--- FINAL RESULTS ---")
             root_result_task = runner.registry.tasks.get("ROOT_PLANNER")
             if root_result_task:
                 print(f"** Final Itinerary for ROOT_PLANNER ({root_result_task.status}) **\n{root_result_task.result}")
-
             total_cost = sum(t.cost for t in reg.all_tasks())
             print(f"\nTotal estimated cost: ${total_cost:.4f}")
 
