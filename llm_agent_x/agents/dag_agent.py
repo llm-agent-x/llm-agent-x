@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import logging
+from hashlib import md5
 from os import getenv
 from typing import Set, Dict, Any, Optional, List
 from pydantic import BaseModel, Field
@@ -96,14 +97,28 @@ class Task(BaseModel):
         arbitrary_types_allowed = True
 
 
+from hashlib import md5
+
 class TaskRegistry:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
-
     def add_task(self, task: Task):
-        if task.id in self.tasks: raise ValueError(f"Task {task.id} already exists")
+        if task.id in self.tasks:
+            raise ValueError(f"Task {task.id} already exists")
         self.tasks[task.id] = task
-
+    def add_document(self, document_name: str, content: str) -> str:
+        if content is None:
+            raise ValueError("Document content cannot be None")
+        # Always hash bytes
+        id = md5(f"{document_name}{content}".encode()).hexdigest()
+        self.tasks[id] = Task(
+            id=id,
+            deps=set(),
+            desc=f"Document: {document_name}",
+            status="complete",
+            result=content
+        )
+        return id
     def add_dependency(self, task_id: str, dep_id: str):
         if task_id not in self.tasks: raise ValueError(f"Task {task_id} does not exist")
         if dep_id not in self.tasks: raise ValueError(f"Dependency {dep_id} does not exist")
