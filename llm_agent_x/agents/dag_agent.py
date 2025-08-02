@@ -399,9 +399,12 @@ class DAGAgent:
                                 new_task_id = ctx.inject_task(sub.desc, parent=t.id, parent_context=parent_context)
                                 local_to_global_id_map[sub.local_id] = new_task_id
                                 ctx.add_dependency(new_task_id)
+
+                            # --- FIX 2: Update the dependency linking logic ---
                             for sub in final_plan.subtasks:
                                 new_task_global_id = local_to_global_id_map[sub.local_id]
                                 for dep in sub.deps:
+                                    # Check if dependency is another NEW subtask
                                     if dep.local_id in local_to_global_id_map:
                                         self.registry.add_dependency(new_task_global_id,
                                                                      local_to_global_id_map[dep.local_id])
@@ -555,92 +558,86 @@ if __name__ == "__main__":
     from nest_asyncio import apply
 
     apply()
-    logger.info("==== BEGIN DEMO FOR DOCUMENT-DAG INTEGRATION ====")
+    logger.info("==== BEGIN DEMO: COMPLEX COMPILATION TASK ====")
 
-    # --- Build registry and add documents
+    # --- This setup tests the agent's ability to handle a more complex scenario ---
+    # Instead of two clean documents, we provide multiple, fragmented data sources
+    # and one irrelevant "distractor" document. The agent must plan to identify,
+    # gather, and synthesize only the relevant pieces.
+
     reg = TaskRegistry()
-    doc1_content = (
-        "Apple Inc. (AAPL) Q2 2024 Financial Report\n\n"
-        "1. **Revenue**: \n"
-        "- Total Revenue: $94.5 billion (up 5% year-over-year)\n"
-        "- Product Segments:\n"
-        "  - iPhones: $50.5 billion (up 8% due to strong demand for the iPhone 14)\n"
-        "  - Mac: $10.5 billion (down 2% due to supply chain issues)\n"
-        "  - iPads: $8.0 billion (up 10% driven by education sales)\n"
-        "  - Services: $22.0 billion (up 15%, a new record for this segment)\n"
-        "\n2. **Net Income**:\n"
-        "- Net Income: $25.1 billion\n"
-        "- Earnings Per Share (EPS): $1.55\n"
-        "\n3. **Operating Expenses**:\n"
-        "- Total Operating Expenses: $65.3 billion\n"
-        "- R&D Expenses: $19.0 billion\n"
-        "- SG&A Expenses: $46.3 billion\n"
-        "\n4. **Cash Flow**:\n"
-        "- Free Cash Flow: $27.5 billion\n"
-        "- Cash on Hand: $104.6 billion\n"
-        "\n5. **Forward Guidance**:\n"
-        "- Expect Q3 revenue to decline slightly due to macroeconomic headwinds, but services revenue is expected to continue growing.\n"
-        "\n6. **Market Position**:\n"
-        "- Apple remains the market leader in premium smartphones with a share of 50% in the high-end segment.\n"
-        "- Strong brand loyalty and robust ecosystem continue to drive engagement.\n"
-        "\n7. **Risks**:\n"
-        "- Potential supply chain disruptions due to geopolitical tensions.\n"
-        "- Inflation concerns affecting consumer discretionary spending."
-    )
 
-    doc2_content = (
-        "Current Market Sentiment for Apple Inc. (AAPL)\n\n"
-        "1. **Analyst Sentiment**:\n"
-        "- Overall Analyst Rating: **Buy**\n"
-        "- Analysts remain bullish on Apple's potential, citing strong demand for the iPhone and robust growth in services.\n"
-        "\n2. **Recent Events**:\n"
-        "- Recent reports highlight Apple's strong performance in China, outpacing competitors.\n"
-        "- Positive reception of the new iPhone model launching in early Q3 2024.\n"
-        "\n3. **Competitor Insights**:\n"
-        "- Competitors are struggling with inventory issues, whereas Apple has maintained positive supply chain management.\n"
-        "- Samsung's Galaxy S series saw decreased sales, leaving a gap that Apple is poised to fill.\n"
-        "\n4. **Consumer Insights**:\n"
-        "- Surveys show that 68% of current iPhone users plan to upgrade to the latest model.\n"
-        "- Increasing interest in Apple's services (such as Apple TV+ and Apple Music) contributes to overall consumer satisfaction.\n"
-        "\n5. **Economic Factors**:\n"
-        "- Analysts caution that inflation rates are high and suggest a possible economic slowdown could dampen sales in Q4 2024.\n"
-        "- The Federal Reserve's stance on interest rates could impact tech stock valuations."
-    )
+    # --- Create fragmented data sources ---
+    document_fragments = [
+        ("Financials: Q2 2024 Revenue Breakdown",
+         "Apple Inc. (AAPL) Q2 2024 Revenue Report Snippet:\n"
+         "- Total Revenue: $94.5 billion (up 5% year-over-year)\n"
+         "- Product Segments:\n"
+         "  - iPhones: $50.5 billion (up 8%)\n"
+         "  - Mac: $10.5 billion (down 2%)\n"
+         "  - iPads: $8.0 billion (up 10%)\n"
+         "  - Services: $22.0 billion (up 15%)"),
 
-    # Adding documents to registry
-    doc1_id = reg.add_document("Apple Q2 2024 Financial Report", doc1_content)
-    doc2_id = reg.add_document("Current Market Sentiment Analysis", doc2_content)
+        ("Financials: Q2 2024 Profit & EPS",
+         "Apple Inc. (AAPL) Q2 2024 Profitability Snippet:\n"
+         "- Net Income: $25.1 billion\n"
+         "- Earnings Per Share (EPS): $1.55"),
 
-    # --- Root task that should plan to use these documents
+        ("Management Outlook: Q2 2024 Guidance and Risks",
+         "Apple Inc. (AAPL) Q2 2024 Management Commentary:\n"
+         "- Forward Guidance: Expect Q3 revenue to decline slightly due to macroeconomic headwinds.\n"
+         "- Identified Risks: Potential supply chain disruptions and inflation concerns."),
+
+        ("Market Intel: Q2 Analyst Ratings",
+         "Market View on Apple (AAPL) for Q2 2024:\n"
+         "- Overall Analyst Rating: Strong Buy\n"
+         "- Rationale: Bullish on strong iPhone demand and services growth."),
+
+        ("Market Intel: Q2 Competitor and Consumer Data",
+         "Competitive Landscape and Consumer Trends for Q2 2024:\n"
+         "- Competitors (e.g., Samsung) are facing inventory challenges.\n"
+         "- Consumer surveys show 68% of current iPhone users plan to upgrade."),
+
+        # --- This is a distractor document. The agent should ignore it. ---
+        ("Internal Memo: Q2 Social Events",
+         "A reminder that the annual Q2 company picnic will be held next Friday. All employees "
+         "are encouraged to attend for a day of fun and team-building.")
+    ]
+
+    # Add all fragments to the registry
+    for name, content in document_fragments:
+        reg.add_document(name, content)
+
+    # --- New, more complex root task ---
     root_task = Task(
-        id="ROOT_PROJECT_ANALYSIS",
-        desc="Perform project analysis using any relevant document data in the system. " +
-             "Summarize sections of the Q2 2024 Financial Report and any useful numerical info from the Market Sentiment Analysis. " +
-             "Where possible, reuse completed tasks/documents as dependencies.",
+        id="ROOT_INVESTOR_BRIEFING",
+        desc=(
+            "You are a financial analyst. Your task is to create a comprehensive investor briefing for Apple Inc.'s Q2 2024 performance. "
+            "The system contains multiple fragmented documents with specific data points (revenue, profit, market sentiment, etc.). "
+            "You must first plan to identify and consolidate all relevant fragments. Then, synthesize this compiled information "
+            "into a single, cohesive, well-structured report for investors. "
+            "Ignore any irrelevant documents like internal social memos."
+        ),
         needs_planning=True,
     )
     reg.add_task(root_task)
 
-    # --- Optionally: Show topo layers before execution
+    # --- Optionally: Show topo layers before execution ---
     print("\n--- TOPOLOGICAL TABLE BEFORE DAG EXECUTION ---")
     layers = reg.topological_layers()
     print_topo_table(layers, show_status=True)
 
-    # ---- Create mock or real agent; use a mock agent for testing/demo --------
-    # If running for real, you can use your DAGAgent as-is (below).
+    # ---- Create the agent ---
     from opentelemetry import trace as ot_trace
-
-    # Simple agent with minimal retry to show document re-use.
     agent = DAGAgent(
         registry=reg,
-        llm_model="gpt-4o-mini",  # (or None if using a local test/mocked agent)
-        tools=[],  # Add any relevant tools you want to use
+        llm_model="gpt-4o-mini",
+        tools=[],
         tracer=ot_trace.get_tracer("doc_dag_demo"),
         max_grace_attempts=1
     )
 
-
-    # ---- Run the DAG agent
+    # ---- Run the DAG agent ---
     async def main():
         print("\n===== EXECUTING DAG AGENT =====\n")
         reg.print_status_tree()
@@ -651,7 +648,7 @@ if __name__ == "__main__":
         layers = reg.topological_layers()
         print_topo_table(layers, show_status=True)
         print("\n--- Final Output for Root Task ---\n")
-        root_result_task = reg.tasks.get("ROOT_PROJECT_ANALYSIS")
+        root_result_task = reg.tasks.get("ROOT_INVESTOR_BRIEFING")
         if root_result_task:
             print(f"Result ({root_result_task.status}):\n{root_result_task.result}")
         print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.all_tasks()):.4f}")
