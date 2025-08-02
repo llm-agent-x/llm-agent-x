@@ -356,13 +356,16 @@ class DAGAgent:
                         ]
                         if completed_tasks:
                             completed_tasks_info = "\n".join(
-                                f"- [{task.id[:8]}] {task.desc[:70]} (Result: {(task.result[:60] + '...') if task.result and len(task.result) > 60 else (task.result or 'n/a')})"
+                                f"- ID: {task.id}\n  Description: {task.desc}"
                                 for task in completed_tasks
                             )
+                            # --- FIX 1: Make the instructions for the LLM more explicit ---
                             completed_tasks_text = (
-                                "You may use these already-completed tasks as dependencies to avoid repeating work:\n"
+                                "You may use these already-completed tasks as dependencies to avoid repeating work. To do so, "
+                                "when defining a 'deps' entry for a new subtask, use the FULL ID of the existing task "
+                                "(e.g., 'db5a29eac...') in the 'local_id' field.\n\n"
+                                "Available pre-completed tasks:\n"
                                 f"{completed_tasks_info}\n"
-                                "If needed, explicitly state the task id when using as a dependency."
                             )
                         else:
                             completed_tasks_text = "No pre-existing completed tasks are available to use as dependencies."
@@ -402,6 +405,13 @@ class DAGAgent:
                                     if dep.local_id in local_to_global_id_map:
                                         self.registry.add_dependency(new_task_global_id,
                                                                      local_to_global_id_map[dep.local_id])
+                                    # Check if dependency is a PRE-EXISTING task
+                                    elif dep.local_id in self.registry.tasks:
+                                        self.registry.add_dependency(new_task_global_id, dep.local_id)
+                                    else:
+                                        logger.warning(
+                                            f"Could not find dependency '{dep.local_id}' for task '{new_task_global_id}'. Skipping.")
+
                             t.status = "waiting"
                             self.inflight.discard(tid)
                             logger.info(f"Finished PLANNING for [{t.id}]. Now waiting for {len(t.deps)} children.")
