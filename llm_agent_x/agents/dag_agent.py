@@ -1,7 +1,9 @@
 import asyncio
 import uuid
 import logging
+from collections import defaultdict, deque
 from hashlib import md5
+from rich.table import Table
 from os import getenv
 from typing import Set, Dict, Any, Optional, List
 from pydantic import BaseModel, Field
@@ -16,6 +18,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
+from rich.console import Console
 
 # --- Basic Setup ---
 load_dotenv(".env", override=True)
@@ -42,8 +45,8 @@ class verification(BaseModel):
 
 class Dependency(BaseModel):
     """Represents a dependency link between two new sub-tasks."""
-    local_id: str = Field(description="The local_id of the task that must be completed first.")
     reason: str = Field(description="A clear, concise explanation for why this dependency exists.")
+    local_id: str = Field(description="The local_id of the task that must be completed first.")
 
 
 class NewSubtask(BaseModel):
@@ -130,14 +133,54 @@ class TaskRegistry:
     def print_status_tree(self):
         logger.info("--- CURRENT TASK REGISTRY STATUS ---")
         root_nodes = [t for t in self.tasks.values() if not t.parent]
-        for root in root_nodes: self._print_node(root, 0)
+        for root in root_nodes:
+            self._print_node(root, 0)
         logger.info("------------------------------------")
 
     def _print_node(self, task: Task, level: int):
         prefix = "  " * level
         logger.info(f"{prefix}- {task.id}: {task.status} | {task.desc[:60]}... | deps: {list(task.deps)}")
         for child_id in task.children:
-            if child_id in self.tasks: self._print_node(self.tasks[child_id], level + 1)
+            if child_id in self.tasks:
+                self._print_node(self.tasks[child_id], level + 1)\
+
+
+    def topological_layers(self) -> List[List[Task]]:
+        """
+        Returns a list of lists (layers/waves) of Task, where each sublist contains tasks
+        that can be executed in parallel after previous waves have finished.
+        """
+        in_degree = defaultdict(int)
+        children = defaultdict(list)
+        for t in self.tasks.values():
+            for dep in t.deps:
+                in_degree[t.id] += 1
+                children[dep].append(t.id)
+            # Ensure all tasks are in in_degree
+            if t.id not in in_degree:
+                in_degree[t.id] = 0
+
+        ready = deque([tid for tid, deg in in_degree.items() if deg == 0])
+        seen = set()
+        levels = []  # Each layer is a list of tasks
+
+        while ready:
+            layer = []
+            for _ in range(len(ready)):
+                tid = ready.popleft()
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                task = self.tasks[tid]
+                layer.append(task)
+                for child_id in children[tid]:
+                    in_degree[child_id] -= 1
+                    if in_degree[child_id] == 0:
+                        ready.append(child_id)
+            if layer:
+                levels.append(layer)
+
+        return levels
 
 
 class TaskContext:
@@ -299,7 +342,6 @@ class DAGAgent:
             span.set_attribute("dag.task.description", t.desc)
             span.set_attribute("dag.task.parent_id", t.parent or "None")
             span.set_attribute("dag.task.status", t.status)
-
             try:
                 if not t.already_planned and t.needs_planning:
                     with self.tracer.start_as_current_span("Phase: Planning") as planning_span:
@@ -307,10 +349,34 @@ class DAGAgent:
                         span.set_attribute("dag.task.status", t.status)
                         logger.info(f"PLANNING for [{t.id}]: {t.desc}")
 
+                        # --- BEGIN: Gather completed tasks context ---
+                        completed_tasks = [
+                            task for task in self.registry.tasks.values()
+                            if task.status == "complete" and task.id != t.id
+                        ]
+                        if completed_tasks:
+                            completed_tasks_info = "\n".join(
+                                f"- [{task.id[:8]}] {task.desc[:70]} (Result: {(task.result[:60] + '...') if task.result and len(task.result) > 60 else (task.result or 'n/a')})"
+                                for task in completed_tasks
+                            )
+                            completed_tasks_text = (
+                                "You may use these already-completed tasks as dependencies to avoid repeating work:\n"
+                                f"{completed_tasks_info}\n"
+                                "If needed, explicitly state the task id when using as a dependency."
+                            )
+                        else:
+                            completed_tasks_text = "No pre-existing completed tasks are available to use as dependencies."
+
+                        planning_prompt = (
+                            f"{t.desc.strip()}\n\n"
+                            f"{completed_tasks_text}\n"
+                        )
+                        # --- END: Gather completed tasks context ---
+
                         with self.tracer.start_as_current_span("Agent: Planner") as planner_span:
-                            plan_res = await self.planner.run(user_prompt=t.desc)
+                            plan_res = await self.planner.run(user_prompt=planning_prompt)
                             self._add_llm_data_to_span(planner_span, plan_res, t)
-                        initial_plan = plan_res.output;
+                        initial_plan = plan_res.output
                         t.already_planned = True
 
                         if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
@@ -318,12 +384,12 @@ class DAGAgent:
                                                     {"subtask_count": len(initial_plan.subtasks)})
                             with self.tracer.start_as_current_span("Agent: Cycle Breaker") as cb_span:
                                 fixer_prompt = (
-                                    f"Please analyze the following execution plan for cycles and correct it:\n\n{initial_plan.model_dump_json(indent=2)}")
+                                    f"Please analyze the following execution plan for cycles and correct it:\n\n{initial_plan.model_dump_json(indent=2)}"
+                                )
                                 fixed_plan_res = await self.cycle_breaker.run(user_prompt=fixer_prompt)
                                 self._add_llm_data_to_span(cb_span, fixed_plan_res, t)
                             final_plan = fixed_plan_res.output
                             planning_span.add_event("Plan validated", {"final_subtask_count": len(final_plan.subtasks)})
-
                             parent_context = otel_context.get_current()
                             local_to_global_id_map: Dict[str, str] = {}
                             for sub in final_plan.subtasks:
@@ -336,23 +402,20 @@ class DAGAgent:
                                     if dep.local_id in local_to_global_id_map:
                                         self.registry.add_dependency(new_task_global_id,
                                                                      local_to_global_id_map[dep.local_id])
-
-                            t.status = "waiting";
+                            t.status = "waiting"
                             self.inflight.discard(tid)
                             logger.info(f"Finished PLANNING for [{t.id}]. Now waiting for {len(t.deps)} children.")
                             return
-
                 with self.tracer.start_as_current_span("Phase: Execution") as exec_phase_span:
-                    t.status = "running";
+                    t.status = "running"
                     span.set_attribute("dag.task.status", t.status)
                     logger.info(f"EXECUTING [{t.id}]: {t.desc}")
                     await self._run_task_execution(ctx)
-
                 self.inflight.discard(tid)
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(trace.Status(StatusCode.ERROR, f"Task failed: {e}"))
-                t.status = "failed";
+                t.status = "failed"
                 raise
             finally:
                 span.set_attribute("dag.task.status", t.status)
@@ -448,75 +511,140 @@ class DAGAgent:
             logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
             return vout.get_successful()
 
+def print_topo_table(layers, show_status=False):
+
+    console = Console()
+    table = Table(title="Topological Task Waves")
+    for i in range(len(layers)):
+        table.add_column(f"Wave {i}")
+
+    if not layers:
+        print("No tasks found.")
+        return
+    max_len = max(len(layer) for layer in layers)
+    for row in range(max_len):
+        row_cells = []
+        for wave in layers:
+            if row < len(wave):
+                t = wave[row]
+                s = f"{t.id[:6]}: {t.desc[:20]}"
+                if show_status:
+                    s += f" [{t.status}]"
+                row_cells.append(s)
+            else:
+                row_cells.append("")
+        table.add_row(*row_cells)
+    console.print(table)
+
 
 if __name__ == "__main__":
+    import sys
+    import random
+    from rich.table import Table
+    from rich.console import Console
     from nest_asyncio import apply
 
     apply()
+    logger.info("==== BEGIN DEMO FOR DOCUMENT-DAG INTEGRATION ====")
 
-    # --- This assumes you have brave_web_search in a specific project structure ---
-    # --- If not, comment this out or replace with a dummy function. ---
-    try:
-        from llm_agent_x.tools.brave_web_search import brave_web_search
-    except ImportError:
-        logger.warning("Could not import brave_web_search. Using a dummy function.")
-
-
-        def brave_web_search(query: str):
-            """Performs a web search."""
-            logger.info(f"DUMMY SEARCH: {query}")
-            return f"Dummy search results for '{query}'"
-
-    # --- OTel and Phoenix Setup (for connecting to an existing server) ---
-    provider = TracerProvider()
-    otlp_exporter = OTLPSpanExporter(
-        endpoint=getenv("ARIZE_PHOENIX_ENDPOINT", "http://localhost:6006/v1/traces")
+    # --- Build registry and add documents
+    reg = TaskRegistry()
+    doc1_content = (
+        "Apple Inc. (AAPL) Q2 2024 Financial Report\n\n"
+        "1. **Revenue**: \n"
+        "- Total Revenue: $94.5 billion (up 5% year-over-year)\n"
+        "- Product Segments:\n"
+        "  - iPhones: $50.5 billion (up 8% due to strong demand for the iPhone 14)\n"
+        "  - Mac: $10.5 billion (down 2% due to supply chain issues)\n"
+        "  - iPads: $8.0 billion (up 10% driven by education sales)\n"
+        "  - Services: $22.0 billion (up 15%, a new record for this segment)\n"
+        "\n2. **Net Income**:\n"
+        "- Net Income: $25.1 billion\n"
+        "- Earnings Per Share (EPS): $1.55\n"
+        "\n3. **Operating Expenses**:\n"
+        "- Total Operating Expenses: $65.3 billion\n"
+        "- R&D Expenses: $19.0 billion\n"
+        "- SG&A Expenses: $46.3 billion\n"
+        "\n4. **Cash Flow**:\n"
+        "- Free Cash Flow: $27.5 billion\n"
+        "- Cash on Hand: $104.6 billion\n"
+        "\n5. **Forward Guidance**:\n"
+        "- Expect Q3 revenue to decline slightly due to macroeconomic headwinds, but services revenue is expected to continue growing.\n"
+        "\n6. **Market Position**:\n"
+        "- Apple remains the market leader in premium smartphones with a share of 50% in the high-end segment.\n"
+        "- Strong brand loyalty and robust ecosystem continue to drive engagement.\n"
+        "\n7. **Risks**:\n"
+        "- Potential supply chain disruptions due to geopolitical tensions.\n"
+        "- Inflation concerns affecting consumer discretionary spending."
     )
-    processor = BatchSpanProcessor(otlp_exporter)
-    provider.add_span_processor(processor)
-    trace.set_tracer_provider(provider)
-    main_tracer = trace.get_tracer("dag_agent_main")
+
+    doc2_content = (
+        "Current Market Sentiment for Apple Inc. (AAPL)\n\n"
+        "1. **Analyst Sentiment**:\n"
+        "- Overall Analyst Rating: **Buy**\n"
+        "- Analysts remain bullish on Apple's potential, citing strong demand for the iPhone and robust growth in services.\n"
+        "\n2. **Recent Events**:\n"
+        "- Recent reports highlight Apple's strong performance in China, outpacing competitors.\n"
+        "- Positive reception of the new iPhone model launching in early Q3 2024.\n"
+        "\n3. **Competitor Insights**:\n"
+        "- Competitors are struggling with inventory issues, whereas Apple has maintained positive supply chain management.\n"
+        "- Samsung's Galaxy S series saw decreased sales, leaving a gap that Apple is poised to fill.\n"
+        "\n4. **Consumer Insights**:\n"
+        "- Surveys show that 68% of current iPhone users plan to upgrade to the latest model.\n"
+        "- Increasing interest in Apple's services (such as Apple TV+ and Apple Music) contributes to overall consumer satisfaction.\n"
+        "\n5. **Economic Factors**:\n"
+        "- Analysts caution that inflation rates are high and suggest a possible economic slowdown could dampen sales in Q4 2024.\n"
+        "- The Federal Reserve's stance on interest rates could impact tech stock valuations."
+    )
+
+    # Adding documents to registry
+    doc1_id = reg.add_document("Apple Q2 2024 Financial Report", doc1_content)
+    doc2_id = reg.add_document("Current Market Sentiment Analysis", doc2_content)
+
+    # --- Root task that should plan to use these documents
+    root_task = Task(
+        id="ROOT_PROJECT_ANALYSIS",
+        desc="Perform project analysis using any relevant document data in the system. " +
+             "Summarize sections of the Q2 2024 Financial Report and any useful numerical info from the Market Sentiment Analysis. " +
+             "Where possible, reuse completed tasks/documents as dependencies.",
+        needs_planning=True,
+    )
+    reg.add_task(root_task)
+
+    # --- Optionally: Show topo layers before execution
+    print("\n--- TOPOLOGICAL TABLE BEFORE DAG EXECUTION ---")
+    layers = reg.topological_layers()
+    print_topo_table(layers, show_status=True)
+
+    # ---- Create mock or real agent; use a mock agent for testing/demo --------
+    # If running for real, you can use your DAGAgent as-is (below).
+    from opentelemetry import trace as ot_trace
+
+    # Simple agent with minimal retry to show document re-use.
+    agent = DAGAgent(
+        registry=reg,
+        llm_model="gpt-4o-mini",  # (or None if using a local test/mocked agent)
+        tools=[],  # Add any relevant tools you want to use
+        tracer=ot_trace.get_tracer("doc_dag_demo"),
+        max_grace_attempts=1
+    )
 
 
-    def build_dynamic_planning_dag():
-        reg = TaskRegistry()
-        root_task = Task(
-            id="ROOT_PLANNER",
-            desc=(
-                "Plan and book a 3-day research trip to San Francisco for a conference on AI. I am located in NYC. The conference is on August 1-3, 2025."
-                "The output should be a complete itinerary including flights, hotel, and a daily schedule."
-            ),
-            needs_planning=True,
-        )
-        reg.add_task(root_task)
-        return reg
-
-
-    def book_one_way_flight(origin: str, destination: str, datetime: str):
-        """Books a one-way flight ticket."""
-        logger.info(f"Booking a one-way flight from {origin} to {destination} on {datetime}")
-        return f"Successfully booked a one-way flight... Confirmation ID: {str(uuid.uuid4())[:8].upper()}"
-
-
-    tools = [brave_web_search, book_one_way_flight]
-
-
+    # ---- Run the DAG agent
     async def main():
-        with main_tracer.start_as_current_span("main_execution"):
-            reg = build_dynamic_planning_dag()
-            runner = DAGAgent(reg, tools=tools, tracer=main_tracer, max_grace_attempts=2)
-            print("\n====== BEGIN DYNAMIC PLANNING EXECUTION ======")
-            reg.print_status_tree()
-            await runner.run()
-            print("\n====== ALL DONE =============")
-            print("Final state:")
-            reg.print_status_tree()
-            print("\n--- FINAL RESULTS ---")
-            root_result_task = runner.registry.tasks.get("ROOT_PLANNER")
-            if root_result_task:
-                print(f"** Final Itinerary for ROOT_PLANNER ({root_result_task.status}) **\n{root_result_task.result}")
-            total_cost = sum(t.cost for t in reg.all_tasks())
-            print(f"\nTotal estimated cost: ${total_cost:.4f}")
+        print("\n===== EXECUTING DAG AGENT =====\n")
+        reg.print_status_tree()
+        await agent.run()
+        print("\n===== DAG EXECUTION COMPLETE =====\n")
+        reg.print_status_tree()
+        print("\n--- TOPOLOGICAL TABLE AFTER DAG EXECUTION ---")
+        layers = reg.topological_layers()
+        print_topo_table(layers, show_status=True)
+        print("\n--- Final Output for Root Task ---\n")
+        root_result_task = reg.tasks.get("ROOT_PROJECT_ANALYSIS")
+        if root_result_task:
+            print(f"Result ({root_result_task.status}):\n{root_result_task.result}")
+        print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.all_tasks()):.4f}")
 
 
     asyncio.run(main())
