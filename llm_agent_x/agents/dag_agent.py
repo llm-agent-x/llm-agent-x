@@ -100,15 +100,15 @@ class Task(BaseModel):
         arbitrary_types_allowed = True
 
 
-from hashlib import md5
-
 class TaskRegistry:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
+
     def add_task(self, task: Task):
         if task.id in self.tasks:
             raise ValueError(f"Task {task.id} already exists")
         self.tasks[task.id] = task
+
     def add_document(self, document_name: str, content: str) -> str:
         if content is None:
             raise ValueError("Document content cannot be None")
@@ -122,6 +122,7 @@ class TaskRegistry:
             result=content
         )
         return id
+
     def add_dependency(self, task_id: str, dep_id: str):
         if task_id not in self.tasks: raise ValueError(f"Task {task_id} does not exist")
         if dep_id not in self.tasks: raise ValueError(f"Dependency {dep_id} does not exist")
@@ -142,8 +143,7 @@ class TaskRegistry:
         logger.info(f"{prefix}- {task.id}: {task.status} | {task.desc[:60]}... | deps: {list(task.deps)}")
         for child_id in task.children:
             if child_id in self.tasks:
-                self._print_node(self.tasks[child_id], level + 1)\
-
+                self._print_node(self.tasks[child_id], level + 1)
 
     def topological_layers(self) -> List[List[Task]]:
         """
@@ -265,8 +265,6 @@ class DAGAgent:
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, getattr(usage, "total_tokens", 0))
         span.set_attribute("llm.cost", cost)
-
-        # This logic is a bit tricky with async contexts. We find the task that owns this span.
         task.cost += cost
 
     async def run(self):
@@ -313,6 +311,7 @@ class DAGAgent:
                                              None)
                         if tid_of_future:
                             try:
+                                # This re-raises any exception that occurred in the task
                                 fut.result()
                             except Exception as e:
                                 # --- THIS IS THE FIX ---
@@ -322,13 +321,10 @@ class DAGAgent:
                                 task = self.registry.tasks.get(tid_of_future)
                                 if task:
                                     # The status is already set to 'failed' where the exception was raised,
-                                    # but we can ensure it here as a safeguard.
+                                    # but we ensure it here as a safeguard.
                                     task.status = "failed"
-                                # --- REMOVED THE FOLLOWING LINES ---
-                                # if task.span:
-                                #     task.span.record_exception(e)
-                                #     task.span.set_status(trace.Status(StatusCode.ERROR, str(e)))
                             finally:
+                                # Clean up the completed task from inflight tracking
                                 self.inflight.discard(tid_of_future)
                                 del self.task_futures[tid_of_future]
 
@@ -349,7 +345,6 @@ class DAGAgent:
                         span.set_attribute("dag.task.status", t.status)
                         logger.info(f"PLANNING for [{t.id}]: {t.desc}")
 
-                        # --- BEGIN: Gather completed tasks context ---
                         completed_tasks = [
                             task for task in self.registry.tasks.values()
                             if task.status == "complete" and task.id != t.id
@@ -359,7 +354,7 @@ class DAGAgent:
                                 f"- ID: {task.id}\n  Description: {task.desc}"
                                 for task in completed_tasks
                             )
-                            # --- FIX 1: Make the instructions for the LLM more explicit ---
+                            # --- FIX 1: Make instructions for the LLM more explicit ---
                             completed_tasks_text = (
                                 "You may use these already-completed tasks as dependencies to avoid repeating work. To do so, "
                                 "when defining a 'deps' entry for a new subtask, use the FULL ID of the existing task "
@@ -374,7 +369,6 @@ class DAGAgent:
                             f"{t.desc.strip()}\n\n"
                             f"{completed_tasks_text}\n"
                         )
-                        # --- END: Gather completed tasks context ---
 
                         with self.tracer.start_as_current_span("Agent: Planner") as planner_span:
                             plan_res = await self.planner.run(user_prompt=planning_prompt)
@@ -419,6 +413,7 @@ class DAGAgent:
                             self.inflight.discard(tid)
                             logger.info(f"Finished PLANNING for [{t.id}]. Now waiting for {len(t.deps)} children.")
                             return
+
                 with self.tracer.start_as_current_span("Phase: Execution") as exec_phase_span:
                     t.status = "running"
                     span.set_attribute("dag.task.status", t.status)
@@ -426,6 +421,7 @@ class DAGAgent:
                     await self._run_task_execution(ctx)
                 self.inflight.discard(tid)
             except Exception as e:
+                # Record the exception on the span and set status before re-raising
                 span.record_exception(e)
                 span.set_status(trace.Status(StatusCode.ERROR, f"Task failed: {e}"))
                 t.status = "failed"
@@ -434,7 +430,6 @@ class DAGAgent:
                 span.set_attribute("dag.task.status", t.status)
                 span.set_attribute("dag.task.result_preview", (t.result or "")[:200])
 
-    # In the DAGAgent class
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
@@ -471,7 +466,6 @@ class DAGAgent:
             if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
                 with self.tracer.start_as_current_span("Agent: Retry Analyst") as analyst_span:
                     analyst_span.set_attribute("task.scores_history", str(t.verification_scores))
-
                     analyst_prompt = (
                         f"Task: '{t.desc}'\n"
                         f"Failed Attempts have yielded verification scores: {t.verification_scores}\n"
@@ -516,16 +510,13 @@ class DAGAgent:
             self._add_llm_data_to_span(verifier_span, vres, t)
             vout = vres.output
 
-            # --- NEW: Store the score for the analyst ---
             t.verification_scores.append(vout.score)
-
             verifier_span.set_attribute("verification.score", vout.score)
             verifier_span.set_attribute("verification.reason", vout.reason)
             logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
             return vout.get_successful()
 
 def print_topo_table(layers, show_status=False):
-
     console = Console()
     table = Table(title="Topological Task Waves")
     for i in range(len(layers)):
@@ -534,7 +525,7 @@ def print_topo_table(layers, show_status=False):
     if not layers:
         print("No tasks found.")
         return
-    max_len = max(len(layer) for layer in layers)
+    max_len = max(len(layer) for layer in layers) if layers else 0
     for row in range(max_len):
         row_cells = []
         for wave in layers:
@@ -551,19 +542,10 @@ def print_topo_table(layers, show_status=False):
 
 
 if __name__ == "__main__":
-    import sys
-    import random
-    from rich.table import Table
-    from rich.console import Console
     from nest_asyncio import apply
 
     apply()
     logger.info("==== BEGIN DEMO: COMPLEX COMPILATION TASK ====")
-
-    # --- This setup tests the agent's ability to handle a more complex scenario ---
-    # Instead of two clean documents, we provide multiple, fragmented data sources
-    # and one irrelevant "distractor" document. The agent must plan to identify,
-    # gather, and synthesize only the relevant pieces.
 
     reg = TaskRegistry()
 
@@ -598,17 +580,14 @@ if __name__ == "__main__":
          "- Competitors (e.g., Samsung) are facing inventory challenges.\n"
          "- Consumer surveys show 68% of current iPhone users plan to upgrade."),
 
-        # --- This is a distractor document. The agent should ignore it. ---
         ("Internal Memo: Q2 Social Events",
          "A reminder that the annual Q2 company picnic will be held next Friday. All employees "
          "are encouraged to attend for a day of fun and team-building.")
     ]
 
-    # Add all fragments to the registry
     for name, content in document_fragments:
         reg.add_document(name, content)
 
-    # --- New, more complex root task ---
     root_task = Task(
         id="ROOT_INVESTOR_BRIEFING",
         desc=(
@@ -622,22 +601,18 @@ if __name__ == "__main__":
     )
     reg.add_task(root_task)
 
-    # --- Optionally: Show topo layers before execution ---
     print("\n--- TOPOLOGICAL TABLE BEFORE DAG EXECUTION ---")
     layers = reg.topological_layers()
     print_topo_table(layers, show_status=True)
 
-    # ---- Create the agent ---
-    from opentelemetry import trace as ot_trace
     agent = DAGAgent(
         registry=reg,
         llm_model="gpt-4o-mini",
         tools=[],
-        tracer=ot_trace.get_tracer("doc_dag_demo"),
+        tracer=trace.get_tracer("doc_dag_demo"),
         max_grace_attempts=1
     )
 
-    # ---- Run the DAG agent ---
     async def main():
         print("\n===== EXECUTING DAG AGENT =====\n")
         reg.print_status_tree()
@@ -652,6 +627,5 @@ if __name__ == "__main__":
         if root_result_task:
             print(f"Result ({root_result_task.status}):\n{root_result_task.result}")
         print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.all_tasks()):.4f}")
-
 
     asyncio.run(main())
