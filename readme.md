@@ -2,179 +2,166 @@
 
 ## Overview
 
-LLM Agent X is a task execution framework that leverages language models to perform complex tasks by recursively decomposing them into subtasks and using tools like web search.
+LLM Agent X is a Python-based framework for creating and running autonomous agents that can perform complex tasks. It provides a flexible architecture that allows language models to decompose high-level objectives into smaller, manageable steps and execute them using a variety of tools.
 
-> ⚠️ This project is highly insecure and should only be used for trusted input. Parts of it allow (optionally) giving an LLM access to arbitrary Python code execution. Please use with caution.
+The framework currently features two primary agent architectures:
+-   **Recursive Agent**: A hierarchical agent that recursively breaks down tasks into a tree of sub-tasks. It's ideal for problems that have a clear, structured decomposition.
+-   **DAG Agent**: A more advanced agent that models tasks as a Directed Acyclic Graph (DAG). This allows for more complex, non-linear dependencies between tasks and is suitable for problems requiring sophisticated planning and adaptation.
 
+> ⚠️ **Security Warning**: This project is a research demonstration and is not secure. It allows language models to execute arbitrary code, which can be dangerous. Use with trusted inputs only and preferably in a sandboxed environment.
+
+## Features
+
+-   **Multiple Agent Architectures**: Choose between a simple `recursive` agent or a more powerful `dag` agent.
+-   **Tool Use**: Equip agents with tools like web search (`brave_web_search`) and code execution (`exec_python`).
+-   **Task Decomposition**: Agents can autonomously break down complex goals into smaller sub-tasks.
+-   **Extensible**: Designed to be integrated into other applications via a Python API.
+-   **Observability**: Integrates with OpenTelemetry for tracing agent execution.
+-   **Optional Sandbox**: Includes a Dockerized sandbox for safe execution of Python code.
 
 ## Installation
 
-1.  Clone the repository (optional, if you want to install from source):
+1.  **Clone the repository (optional):**
     ```sh
     git clone https://github.com/cvaz1306/llm_agent_x.git
     cd llm_agent_x
     ```
 
-2.  Install the package:
-    *   From PyPI:
-        ```sh
-        pip install llm-agent-x
-        ```
-    *   Or, for local development (from the project root directory):
-        ```sh
-        pip install .
-        ```
-    *   To install with editable mode (useful for development):
-        ```sh
-        pip install -e .
-        ```
+2.  **Install the package:**
+    ```sh
+    pip install .
+    ```
+    For development, use editable mode: `pip install -e .`
 
-3.  Set up environment variables:
-    Create a `.env` file in the root directory (or ensure your environment is configured) and add the following variables:
+3.  **Set up environment variables:**
+    Create a `.env` file in the root directory and add your API keys.
     ```env
-    SEARX_HOST=http://localhost:8080
+    OPENAI_API_KEY="your_openai_api_key"
+    BRAVE_API_KEY="your_brave_search_api_key" # If using brave_web_search
+
+    # Optional
     OUTPUT_DIR=./output/
-    OPENAI_BASE_URL=https://api.openai.com/v1
-    OPENAI_API_KEY=your_openai_api_key
-    # Optional: Define a default LLM model
-    # DEFAULT_LLM=gpt-4o-mini
+    DEFAULT_LLM=gpt-4o-mini
     ```
 
-## Usage
+## Usage (CLI)
 
-To run the LLM agent, use the following command:
-```sh
-llm-agent-x "Your task description here" --max_layers 2 --output output.md --model gpt-4o-mini
-```
+The command-line interface allows you to quickly run agents on a given task.
 
-> `cli.py` is not intended to be the primary interface for this project. It is merely a script demonstrating the project's capabilities. For your use, we recommend that you modify or copy `cli.py` or integrating `llm_agent_x`'s API into your own project. In the future, we may implement a HTTP server,.
-### Arguments
-
-- `task`: The task to execute.
-- `--u_inst`: User instructions for the task.
-- `--max_layers`: The maximum number of layers for task splitting (default: 3).
-- `--output`: The output file path (default: output.md, saved in `OUTPUT_DIR`).
-- `--model`: The name of the LLM to use (default: value from `DEFAULT_LLM` environment variable, or the hardcoded default in `cli.py` if `DEFAULT_LLM` is not set).
-- `--task_limit`: Array defining task limits per layer (default: "[3,2,2,0]").
-- `--merger`: Strategy for merging results, 'ai' or 'append' (default: 'ai').
-- `--align_summaries`: Whether to align summaries with user instructions.
-- `--no-tree`: If specified, disables tree rendering in console
-- `--default_subtask_type`: The default task type to apply to all subtasks.
-- `--enable-python-execution`: Enable the `exec_python` tool for the agent. If enabled, the agent can choose to execute Python code, potentially in a Docker sandbox if configured (see Python Execution Sandbox section). Defaults to False.
-
-## Example
+### Basic Syntax
 
 ```sh
-llm-agent-x "Research the impact of climate change on polar bears" --max_layers 3 --output climate_change_report.md --model gpt-4o-mini
+llm-agent-x <agent_type> "Your task description" [options]
 ```
 
-See the [samples](./samples) folder for more examples, including their outputs.
+### Examples
 
-## Example flowchart output
-
-```mermaid
-flowchart TD
-    A[Research the evolution of the internet. use 5 subtasks, and make sure you follow all your previous instructions nd don't include a summarization task at the end. make your final report very detailed.]
-    A -->|Subtask| B[Identify key milestones in the development of the internet.]
-    B -->|Tool call| C[web_search]
-    C --> B
-    B -->|Completed| A
-    A -->|Subtask| D[Research the history of major internet protocols and technologies.]
-    D -->|Tool call| E[web_search]
-    E --> D
-    D -->|Completed| A
-    A -->|Subtask| F[Analyze the impact of government policies on the growth of the internet.]
-    F -->|Tool call| G[web_search]
-    G --> F
-    F -->|Completed| A
-    A -->|Subtask| H[Examine the role of private companies in shaping the internet's evolution.]
-    H -->|Tool call| I[web_search]
-    I --> H
-    H -->|Completed| A
-    A -->|Subtask| J[Evaluate the global spread and adoption of the internet over time.]
-    J -->|Tool call| K[web_search]
-    K --> J
-    J -->|Completed| A
+**1. Run the `recursive` agent for a research task:**
+```sh
+llm-agent-x recursive "Research the pros and cons of using nuclear energy for power generation." --output nuclear_report.md
 ```
+
+**2. Run the `dag` agent to analyze pre-existing data:**
+
+First, create a `documents.json` file:
+```json
+[
+  {"name": "Q3_Financials", "content": "Our Q3 revenue was $75M, beating estimates."},
+  {"name": "Q3_Press_Release", "content": "The successful launch of Product Z drove significant growth in the third quarter."}
+]
+```
+
+Then, run the agent:
+```sh
+llm-agent-x dag "Create a summary of the Q3 performance for an internal memo." --dag-documents documents.json
+```
+
+**3. Run the `dag` agent with web search enabled:**
+If the `dag` agent needs to find its own information, you can start it with an empty set of documents.
+```sh
+llm-agent-x dag "Investigate and report on the current state of quantum computing hardware." --dag-documents '[]'
+```
+
+For a full list of CLI arguments and advanced options, see the [CLI Documentation](./docs/cli.md).
+
+## Usage (Python API)
+
+For more control and integration, use the Python API.
+
+### RecursiveAgent API Example
+```python
+import asyncio
+from llm_agent_x.agents.recursive_agent import RecursiveAgent, RecursiveAgentOptions, TaskLimit
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from openai import AsyncOpenAI
+from llm_agent_x.tools.brave_web_search import brave_web_search
+
+async def main():
+    client = AsyncOpenAI()
+    llm = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
+
+    agent_options = RecursiveAgentOptions(
+        llm=llm,
+        tools=[brave_web_search],
+        task_limits=TaskLimit.from_array([2, 1, 0])
+    )
+
+    agent = RecursiveAgent(
+        task="Explore the future of remote work.",
+        agent_options=agent_options
+    )
+
+    result = await agent.run()
+    print(result)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### DAGAgent API Example
+```python
+import asyncio
+from llm_agent_x.agents.dag_agent import DAGAgent, TaskRegistry, Task
+
+async def main():
+    registry = TaskRegistry()
+    registry.add_document("Initial_Data", "The company's goal is to expand into the European market in 2025.")
+
+    root_task = Task(
+        id="ROOT_TASK",
+        desc="Create a market entry strategy for Europe.",
+        needs_planning=True,
+    )
+    registry.add_task(root_task)
+
+    agent = DAGAgent(registry=registry, llm_model="gpt-4o-mini")
+
+    await agent.run()
+
+    final_result = registry.tasks.get("ROOT_TASK")
+    print(final_result.result)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+See the [Examples Documentation](./docs/examples.md) for more detailed examples.
+
+## Documentation
+
+-   [**Installation**](./docs/installation.md): How to set up the project.
+-   [**CLI Reference**](./docs/cli.md): Detailed command-line usage.
+-   [**API Reference**](./docs/api.md): Guide to using the Python API.
+-   [**Examples**](./docs/examples.md): Practical examples for both CLI and API.
+-   [**Sandbox**](./docs/sandbox.md): Information on the optional code execution sandbox.
 
 ## Dependencies
 
-Project dependencies are managed with Poetry and are listed in the `pyproject.toml` file.
+Project dependencies are managed with Poetry and are listed in `pyproject.toml`.
 
-> ⚠️ `torch` is optional in Poetry but **required** at runtime. You must install the correct version for your hardware manually using the appropriate `--index-url`.
+> Note: `torch` is an optional dependency for certain models but may be required at runtime.
 
 ## License
 
 This project is licensed under the MIT License.
-
-## Python Execution Sandbox (Optional)
-
-LLM Agent X includes an optional Dockerized sandbox environment for executing Python code. This provides isolation and allows for pre-loading files and cloudpickle objects into the execution namespace.
-
-### Features
--   **Isolated Execution**: Code runs inside a Docker container.
--   **File Uploads**: Upload scripts or data files directly to the sandbox's workspace.
--   **Cloudpickle Support**: Load `.pkl` files (created with `cloudpickle`) into the Python execution scope.
--   **REST API**: The sandbox is controlled via a simple REST API.
-
-### Building the Sandbox Image
-From the root of the repository:
-```sh
-docker build -t python-sandbox ./sandbox
-```
-
-### Running the Sandbox Container
-To run the sandbox container and make it accessible on port 5000:
-```sh
-docker run -d -p 5000:5000 --rm python-sandbox
-```
-The `--rm` flag automatically removes the container when it exits.
-The `-d` flag runs it in detached mode.
-
-### Configuration
-The `exec_python` tool will interact with this sandbox if `use_docker_sandbox=True` is passed to it.
-By default, it expects the sandbox API to be at `http://localhost:5000`.
-You can configure this URL by setting the `PYTHON_SANDBOX_API_URL` environment variable for the environment running `llm-agent-x` (not for the Docker container itself). For example, in your `.env` file:
-```env
-PYTHON_SANDBOX_API_URL=http://127.0.0.1:5000
-```
-
-### Using with the Agent
-To allow the agent to use the `exec_python` tool (and potentially the sandbox):
-1.  Ensure the `exec_python` tool is enabled in `llm_agent_x/cli.py` by the logic controlled by the `--enable-python-execution` flag. (This was done as part of the feature implementation).
-2.  Make sure the Docker sandbox container is running if you intend to use `use_docker_sandbox=True`.
-3.  To make the `exec_python` tool available to the agent, use the `--enable-python-execution` command-line flag when running `llm-agent-x`.
-4.  If enabled, the agent's underlying LLM must be prompted in a way that it understands when and how to use the `exec_python` tool (including its parameters like `use_docker_sandbox`, `files_to_upload`, and `cloud_pickle_files_to_load`). This typically involves providing clear instructions and examples in the prompt or task description given to the agent.
-
-**Example `exec_python` call (if used directly):**
-```python
-from llm_agent_x.tools.exec_python import exec_python
-
-# Assuming sandbox is running and test_script.py exists locally
-# and data.pkl was generated using cloudpickle.
-
-# 1. Create dummy files for demonstration
-with open("test_script.py", "w") as f:
-    f.write("my_obj = LOADED_PICKLES.get('data.pkl')\nprint(f'Loaded data: {my_obj}')\nprint('Hello from sandbox script!')")
-
-import cloudpickle
-with open("data.pkl", "wb") as f:
-    cloudpickle.dump({"key": "value"}, f)
-
-# 2. Execute using the sandbox
-result = exec_python(
-    code="with open('/workspace/test_script.py', 'r') as f: exec(f.read())", # Execute the uploaded script
-    use_docker_sandbox=True,
-    files_to_upload=["test_script.py", "data.pkl"],
-    cloud_pickle_files_to_load=["data.pkl"] # Path relative to sandbox workspace
-)
-print(result)
-
-# Expected output (or similar):
-# {'stdout': "Loaded data: {'key': 'value'}\nHello from sandbox script!\n", 'stderr': '', 'error': None}
-
-# Don't forget to clean up dummy files
-import os
-os.remove("test_script.py")
-os.remove("data.pkl")
-```
