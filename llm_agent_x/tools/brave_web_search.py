@@ -139,5 +139,6 @@ throttler = Throttler(rate_limit=1, period=1.1)
 
 
 async def brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
+    print("Awaiting throttle to run Brave Web Search...")
     async with throttler:
         return await _brave_web_search(query, num_results)
