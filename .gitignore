@@ -9,3 +9,4 @@ dist/
 llm_agent_x.log
 mcpconf.json
 tasks.json
+input/*
