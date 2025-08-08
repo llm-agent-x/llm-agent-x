@@ -22,7 +22,6 @@ from llm_agent_x.agents.dag_agent import (
     DAGAgent,
     TaskRegistry,
     Task,
-    print_topo_table
 )
 
 # --- Backend and Tool Imports ---
@@ -195,7 +194,7 @@ def main():
                 console.print("\n--- DAG Execution Complete ---")
                 registry.print_status_tree()
                 response = registry.tasks.get("ROOT_TASK").result
-                total_cost = sum(t.cost for t in registry.all_tasks())
+                total_cost = sum(t.cost for t in registry.tasks.values())
 
 
             # ===============================================================

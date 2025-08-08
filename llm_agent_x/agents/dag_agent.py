@@ -163,6 +163,7 @@ class DAGAgent:
             registry: TaskRegistry,
             llm_model: str = "gpt-4o-mini",
             tracer: Optional[Tracer] = None,
+            tools: Optional[List[Any]] = None,
             global_proposal_limit: int = 5,
             max_grace_attempts: int = 1,
     ):
@@ -171,6 +172,7 @@ class DAGAgent:
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.tracer = tracer or trace.get_tracer(__name__)
         self.max_grace_attempts = max_grace_attempts
+        self.tools = tools or []
 
         self.global_proposal_limit = global_proposal_limit
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
@@ -179,7 +181,8 @@ class DAGAgent:
         self.initial_planner = Agent(
             model=llm_model,
             system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
-            output_type=ExecutionPlan
+            output_type=ExecutionPlan,
+            tools=self.tools,
         )
         self.cycle_breaker = Agent(
             model=llm_model,
@@ -194,14 +197,15 @@ class DAGAgent:
         self.adaptive_decomposer = Agent(
             model=llm_model,
             system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
-            output_type=List[ProposedSubtask]
+            output_type=List[ProposedSubtask],
+            tools=self.tools,
         )
         self.conflict_resolver = Agent(
             model=llm_model,
             system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
             output_type=ProposalResolutionPlan
         )
-        self.executor = Agent(model=llm_model, output_type=str)
+        self.executor = Agent(model=llm_model, output_type=str, tools=self.tools)
         self.verifier = Agent(model=llm_model, output_type=verification)
         self.retry_analyst = Agent(
             model=llm_model,
