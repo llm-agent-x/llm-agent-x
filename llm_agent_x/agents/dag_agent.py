@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 from hashlib import md5
 from rich.table import Table
 from os import getenv
-from typing import Set, Dict, Any, Optional, List
+from typing import Set, Dict, Any, Optional, List, Tuple
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
@@ -43,56 +43,68 @@ class verification(BaseModel):
     def get_successful(self): return self.score > 5
 
 
+class RetryDecision(BaseModel):
+    should_retry: bool
+    reason: str
+    next_step_suggestion: str
+
+
+# Models for Initial, Top-Down Planning (The "Architect")
 class Dependency(BaseModel):
-    """Represents a dependency link between two new sub-tasks."""
-    reason: str = Field(description="A clear, concise explanation for why this dependency exists.")
-    local_id: str = Field(description="The local_id of the task that must be completed first.")
+    reason: str
+    local_id: str
 
 
 class NewSubtask(BaseModel):
-    """Defines a new sub-task to be added to the execution graph."""
-    local_id: str = Field(
-        description="A temporary, unique ID for this new task (e.g., 'task1', 'research_flights'). Used to define dependencies among other new tasks.")
-    desc: str = Field(description="The detailed description of this specific sub-task.")
-    deps: List[Dependency] = Field(default_factory=list,
-                                   description="A list of dependencies, with reasons, for this sub-task.")
+    local_id: str
+    desc: str
+    deps: List[Dependency] = Field(default_factory=list)
+    can_request_new_subtasks: bool = Field(False,
+                                           description="Set to true ONLY for complex, integrative, or uncertain tasks that might need further dynamic decomposition later.")
 
 
 class ExecutionPlan(BaseModel):
-    """The execution plan for a complex task. It can either be a simple task or be broken down into sub-tasks."""
-    needs_subtasks: bool = Field(description="Set to true if the task is complex and should be broken down.")
-    subtasks: List[NewSubtask] = Field(default_factory=list, description="A list of new sub-tasks to be executed.")
+    needs_subtasks: bool
+    subtasks: List[NewSubtask] = Field(default_factory=list)
 
 
-class RetryDecision(BaseModel):
-    """The decision on whether to attempt another fix for a failing task."""
-    should_retry: bool = Field(description="Set to true if the trend of scores suggests success is likely.")
-    reason: str = Field(description="A brief explanation for the decision, citing the score trend.")
-    next_step_suggestion: str = Field(
-        description="A specific, actionable suggestion for the next attempt to improve the result.")
+# Models for Adaptive, Bottom-Up Decomposition (The "Explorer")
+class ProposedSubtask(BaseModel):
+    local_id: str
+    desc: str
+    importance: int = Field(
+        description="An integer score from 1 (least critical) to 100 (most critical) representing this task's necessity.",
+        ge=1, le=100)
+    deps: List[str] = Field(default_factory=list,
+                            description="A list of local_ids of other PROPOSED tasks that this one depends on.")
 
 
-# Update the Task model
+class ProposalResolutionPlan(BaseModel):
+    """The final, pruned list of approved sub-tasks."""
+    approved_tasks: List[ProposedSubtask]
+
+
+# The main Task model, enhanced for the new architecture
 class Task(BaseModel):
     id: str
     desc: str
     deps: Set[str] = Field(default_factory=set)
-    status: str = "pending"
+    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed
     result: Optional[str] = None
-    needs_planning: bool = False
-    already_planned: bool = False
-    fix_attempts: int = 0
-    max_fix_attempts: int = 2
     cost: float = 0.0
     parent: Optional[str] = None
     children: List[str] = Field(default_factory=list)
-    siblings: List[str] = Field(default_factory=list)
     dep_results: Dict[str, Any] = Field(default_factory=dict)
-    # --- NEW: Fields for Adaptive Retries ---
-    verification_scores: List[float] = Field(default_factory=list)
-    grace_attempts: int = 0
 
-    # Tracing Fields
+    # --- HYBRID PLANNING & ADAPTATION FIELDS ---
+    needs_planning: bool = False
+    already_planned: bool = False
+    can_request_new_subtasks: bool = False
+
+    # --- RETRY & TRACING FIELDS ---
+    fix_attempts: int = 0
+    max_fix_attempts: int = 2
+    verification_scores: List[float] = Field(default_factory=list)
     otel_context: Optional[Any] = None
     span: Optional[Span] = None
 
@@ -100,87 +112,35 @@ class Task(BaseModel):
         arbitrary_types_allowed = True
 
 
+# TaskRegistry and TaskContext remain largely the same
 class TaskRegistry:
     def __init__(self):
         self.tasks: Dict[str, Task] = {}
 
     def add_task(self, task: Task):
-        if task.id in self.tasks:
-            raise ValueError(f"Task {task.id} already exists")
+        if task.id in self.tasks: raise ValueError(f"Task {task.id} already exists")
         self.tasks[task.id] = task
 
     def add_document(self, document_name: str, content: str) -> str:
-        if content is None:
-            raise ValueError("Document content cannot be None")
-        # Always hash bytes
         id = md5(f"{document_name}{content}".encode()).hexdigest()
-        self.tasks[id] = Task(
-            id=id,
-            deps=set(),
-            desc=f"Document: {document_name}",
-            status="complete",
-            result=content
-        )
+        self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete", result=content)
         return id
 
     def add_dependency(self, task_id: str, dep_id: str):
-        if task_id not in self.tasks: raise ValueError(f"Task {task_id} does not exist")
-        if dep_id not in self.tasks: raise ValueError(f"Dependency {dep_id} does not exist")
+        if task_id not in self.tasks or dep_id not in self.tasks: return
         self.tasks[task_id].deps.add(dep_id)
-
-    def all_tasks(self):
-        return list(self.tasks.values())
 
     def print_status_tree(self):
         logger.info("--- CURRENT TASK REGISTRY STATUS ---")
         root_nodes = [t for t in self.tasks.values() if not t.parent]
-        for root in root_nodes:
-            self._print_node(root, 0)
+        for root in root_nodes: self._print_node(root, 0)
         logger.info("------------------------------------")
 
     def _print_node(self, task: Task, level: int):
         prefix = "  " * level
-        logger.info(f"{prefix}- {task.id}: {task.status} | {task.desc[:60]}... | deps: {list(task.deps)}")
+        logger.info(f"{prefix}- {task.id[:8]}: {task.status.upper()} | {task.desc[:60]}...")
         for child_id in task.children:
-            if child_id in self.tasks:
-                self._print_node(self.tasks[child_id], level + 1)
-
-    def topological_layers(self) -> List[List[Task]]:
-        """
-        Returns a list of lists (layers/waves) of Task, where each sublist contains tasks
-        that can be executed in parallel after previous waves have finished.
-        """
-        in_degree = defaultdict(int)
-        children = defaultdict(list)
-        for t in self.tasks.values():
-            for dep in t.deps:
-                in_degree[t.id] += 1
-                children[dep].append(t.id)
-            # Ensure all tasks are in in_degree
-            if t.id not in in_degree:
-                in_degree[t.id] = 0
-
-        ready = deque([tid for tid, deg in in_degree.items() if deg == 0])
-        seen = set()
-        levels = []  # Each layer is a list of tasks
-
-        while ready:
-            layer = []
-            for _ in range(len(ready)):
-                tid = ready.popleft()
-                if tid in seen:
-                    continue
-                seen.add(tid)
-                task = self.tasks[tid]
-                layer.append(task)
-                for child_id in children[tid]:
-                    in_degree[child_id] -= 1
-                    if in_degree[child_id] == 0:
-                        ready.append(child_id)
-            if layer:
-                levels.append(layer)
-
-        return levels
+            if child_id in self.tasks: self._print_node(self.tasks[child_id], level + 1)
 
 
 class TaskContext:
@@ -189,443 +149,335 @@ class TaskContext:
         self.registry = registry
         self.task = self.registry.tasks[task_id]
 
-    def add_dependency(self, dep_id: str):
-        self.registry.add_dependency(self.task_id, dep_id)
 
-    def inject_task(self, desc: str, parent: Optional[str] = None, parent_context: Optional[Any] = None) -> str:
-        sub_id = str(uuid.uuid4())[:8]
-        task = Task(id=sub_id, desc=desc, parent=parent, otel_context=parent_context)
-        self.registry.add_task(task)
-        if parent: self.registry.tasks[parent].children.append(sub_id)
-        return sub_id
-
-
-# --- The Corrected and Instrumented DAGAgent ---
 class DAGAgent:
     def __init__(
             self,
             registry: TaskRegistry,
             llm_model: str = "gpt-4o-mini",
-            tools: List = [],
             tracer: Optional[Tracer] = None,
-            max_grace_attempts: int = 2
+            global_proposal_limit: int = 5,
     ):
         self.registry = registry
-        self.max_grace_attempts = max_grace_attempts
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.tracer = tracer or trace.get_tracer(__name__)
 
-        # --- BUG FIX: Restored the full system prompts ---
-        self.planner = Agent(
+        # --- NEW: Global state for the "Propose, then Prune" model ---
+        self.global_proposal_limit = global_proposal_limit
+        self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
+
+        # --- AGENT ROLES ---
+        self.initial_planner = Agent(
             model=llm_model,
-            system_prompt=(
-                "You are an expert project planner. Your job is to break down a complex task into a series of smaller, actionable sub-tasks. "
-                "Define a clear plan with dependencies. For each dependency, you MUST provide a 'reason' explaining why it is necessary. "
-                "For example, a 'Book Hotel' task should depend on a 'Research Hotels' task, with the reason being 'The hotel to book is determined by the research results.' "
-                "Do not worry about creating perfect, cycle-free graphs; focus on capturing all logical connections."
-            ),
+            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
             output_type=ExecutionPlan
         )
-
-        self.cycle_breaker = Agent(
+        self.adaptive_decomposer = Agent(
             model=llm_model,
-            system_prompt=(
-                "You are a logical validation expert. Your task is to analyze an execution plan and resolve any circular dependencies (cycles). "
-                "A cycle is when Task A depends on B, and Task B depends on A (directly or indirectly). "
-                "You will be given a plan as a JSON object. Analyze the 'deps' for each task. "
-                "If you find a cycle, you must remove the *least critical* dependency to break the cycle. Use the 'reason' field for each dependency to decide which one is less important. "
-                "Your final output MUST be the complete, corrected ExecutionPlan, with the cycle-causing dependency removed. Do not add or remove any tasks. "
-                "If there are no cycles, return the original plan unchanged."
-            ),
-            output_type=ExecutionPlan
+            system_prompt="You are an adaptive expert. Analyze the given task and the results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
+            output_type=List[ProposedSubtask]
         )
-
-        self.executor = Agent(model=llm_model, output_type=str, tools=tools)
+        self.conflict_resolver = Agent(
+            model=llm_model,
+            system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
+            output_type=ProposalResolutionPlan
+        )
+        self.executor = Agent(model=llm_model, output_type=str)
         self.verifier = Agent(model=llm_model, output_type=verification)
-
-        self.retry_analyst = Agent(
-            model=llm_model,
-            system_prompt=(
-                "You are a meticulous quality assurance analyst. Your job is to decide if a failing task is worth retrying. "
-                "You will be given the task's original goal and a history of its verification scores from past attempts. "
-                "Analyze the trend of these scores. If the scores are generally increasing and approaching the success threshold of 6, it is worth retrying. "
-                "If the scores are stagnant, decreasing, or very low, it is not worth retrying. "
-                "Crucially, you must provide a concrete and actionable 'next_step_suggestion' for the next attempt to guide it towards success."
-            ),
-            output_type=RetryDecision,
-        )
 
     def _add_llm_data_to_span(self, span: Span, agent_res: AgentRunResult, task: Task):
         if not span or not agent_res: return
-        usage = agent_res.usage()
-        cost = get_cost(usage)
-
+        usage, cost = agent_res.usage(), get_cost(agent_res.usage())
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, getattr(usage, "request_tokens", 0))
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
-        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_TOTAL, getattr(usage, "total_tokens", 0))
-        span.set_attribute("llm.cost", cost)
         task.cost += cost
 
     async def run(self):
         with self.tracer.start_as_current_span("DAGAgent.run") as root_span:
-            root_span.set_attribute("dag.task_count.initial", len(self.registry.tasks))
-
-            pending = set(self.registry.tasks.keys())
-            while pending or self.inflight:
+            while True:
                 all_task_ids = set(self.registry.tasks.keys())
+                completed_or_failed = {t.id for t in self.registry.tasks.values() if t.status in ('complete', 'failed')}
 
-                current_pending = all_task_ids - {t.id for t in self.registry.tasks.values() if
-                                                  t.status in ('complete', 'failed')}
-                for tid in list(current_pending):
+                # Propagate failures
+                for tid in all_task_ids - completed_or_failed:
                     task = self.registry.tasks[tid]
-                    failed_deps = [d for d in task.deps if self.registry.tasks.get(d, {}).status == "failed"]
-                    if failed_deps:
-                        logger.warning(f"Task [{tid}] is failing because its dependencies {failed_deps} failed.")
+                    if any(self.registry.tasks.get(d, {}).status == "failed" for d in task.deps):
                         task.status = "failed"
-                        task.result = f"Upstream dependency failure: {failed_deps}"
 
-                pending = all_task_ids - {t.id for t in self.registry.tasks.values() if
-                                          t.status in ('complete', 'failed')}
-                ready = [tid for tid in pending if all(self.registry.tasks.get(d, {}).status == "complete" for d in
-                                                       self.registry.tasks[tid].deps) and tid not in self.inflight]
+                # Find ready tasks for the next wave
+                pending_tasks = all_task_ids - completed_or_failed
+                ready_to_run_ids = {
+                    tid for tid in pending_tasks if
+                    self.registry.tasks[tid].status == "pending" and
+                    all(self.registry.tasks.get(d, {}).status == "complete" for d in self.registry.tasks[tid].deps)
+                }
 
-                if not ready and not self.inflight and pending:
-                    logger.error("Stalled DAG (cycle/unsatisfiable dependency):")
+                # Add "woken up" synthesis tasks
+                for tid in pending_tasks:
+                    task = self.registry.tasks[tid]
+                    if task.status == 'waiting_for_children' and all(
+                            self.registry.tasks[c].status == 'complete' for c in task.children):
+                        ready_to_run_ids.add(tid)
+
+                ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
+
+                if not ready and not self.inflight and pending_tasks:
+                    logger.error("Stalled DAG!");
                     self.registry.print_status_tree()
-                    root_span.add_event("DAG Stalled", {"pending_tasks": list(pending)})
-                    root_span.set_status(trace.Status(StatusCode.ERROR, "DAG Stalled"))
+                    root_span.set_status(trace.Status(StatusCode.ERROR, "DAG Stalled"));
+                    break
+                if not pending_tasks and not self.inflight:
+                    logger.info("DAG execution complete.");
                     break
 
+                # --- PHASE 1: LAUNCH ALL READY TASKS FOR THE CURRENT WAVE ---
                 for tid in ready:
                     self.inflight.add(tid)
-                    ctx = TaskContext(tid, self.registry)
-                    task_future = asyncio.create_task(self._run_taskflow(tid, ctx))
-                    self.task_futures[tid] = task_future
+                    self.task_futures[tid] = asyncio.create_task(self._run_taskflow(tid))
 
-                if self.inflight:
-                    done, _ = await asyncio.wait([self.task_futures[tid] for tid in list(self.inflight)],
-                                                 return_when=asyncio.FIRST_COMPLETED)
-                    for fut in done:
-                        tid_of_future = next((tid for tid, task_fut in self.task_futures.items() if task_fut == fut),
-                                             None)
-                        if tid_of_future:
-                            try:
-                                # This re-raises any exception that occurred in the task
-                                fut.result()
-                            except Exception as e:
-                                # --- THIS IS THE FIX ---
-                                # The exception was already recorded on the span in _run_taskflow.
-                                # The main loop's only job is to log it and update the task's state in the registry.
-                                logger.error(f"Task [{tid_of_future}]'s future completed with exception: {e}")
-                                task = self.registry.tasks.get(tid_of_future)
-                                if task:
-                                    # The status is already set to 'failed' where the exception was raised,
-                                    # but we ensure it here as a safeguard.
-                                    task.status = "failed"
-                            finally:
-                                # Clean up the completed task from inflight tracking
-                                self.inflight.discard(tid_of_future)
-                                del self.task_futures[tid_of_future]
+                if not self.task_futures: continue  # Nothing to wait for
 
-            root_span.set_attribute("dag.task_count.final", len(self.registry.tasks))
+                # --- WAIT FOR THE ENTIRE WAVE TO FINISH ---
+                # We use ALL_COMPLETED so we can run the global resolver on all proposals from the wave.
+                done, _ = await asyncio.wait(self.task_futures.values(), return_when=asyncio.ALL_COMPLETED)
 
-    async def _run_taskflow(self, tid: str, ctx: TaskContext):
+                # Process results and cleanup futures
+                for fut in done:
+                    tid_of_future = next((tid for tid, task_fut in self.task_futures.items() if task_fut == fut), None)
+                    if tid_of_future:
+                        self.inflight.discard(tid_of_future)
+                        del self.task_futures[tid_of_future]
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            logger.error(f"Task [{tid_of_future}] failed: {e}")
+
+                # --- PHASE 2: GLOBAL CONFLICT RESOLUTION ---
+                if self.proposed_tasks_buffer:
+                    await self._run_global_resolution()
+
+    async def _run_global_resolution(self):
+        logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
+
+        approved_proposals = [p[0] for p in self.proposed_tasks_buffer]  # Extract ProposedSubtask objects
+
+        if len(approved_proposals) > self.global_proposal_limit:
+            logger.warning(
+                f"Proposal buffer ({len(approved_proposals)}) exceeds global limit ({self.global_proposal_limit}). Engaging resolver.")
+
+            # Use a simple list format for the prompt
+            prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
+                           approved_proposals]
+
+            resolver_res = await self.conflict_resolver.run(
+                user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}")
+            approved_proposals = resolver_res.output.approved_tasks
+
+        logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
+        self._commit_proposals(approved_proposals)
+        self.proposed_tasks_buffer = []
+
+    def _commit_proposals(self, approved_proposals: List[ProposedSubtask]):
+        """Creates and wires up the approved tasks from the global buffer."""
+        local_to_global_id_map: Dict[str, str] = {}
+        proposal_to_parent_map: Dict[str, str] = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
+
+        # First pass: Create tasks and map IDs
+        for proposal in approved_proposals:
+            parent_id = proposal_to_parent_map.get(proposal.local_id)
+            if not parent_id: continue
+
+            new_task = Task(
+                id=str(uuid.uuid4())[:8],
+                desc=proposal.desc,
+                parent=parent_id,
+            )
+            self.registry.add_task(new_task)
+            self.registry.tasks[parent_id].children.append(new_task.id)
+            local_to_global_id_map[proposal.local_id] = new_task.id
+
+        # Second pass: Wire up dependencies between new tasks
+        for proposal in approved_proposals:
+            new_task_global_id = local_to_global_id_map.get(proposal.local_id)
+            if not new_task_global_id: continue
+
+            for dep_local_id in proposal.deps:
+                dep_global_id = local_to_global_id_map.get(dep_local_id)
+                if dep_global_id:
+                    self.registry.add_dependency(new_task_global_id, dep_global_id)
+
+    async def _run_taskflow(self, tid: str):
+        ctx = TaskContext(tid, self.registry)
         t = ctx.task
-        with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}...", context=t.otel_context) as span:
+        with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}") as span:
             t.span = span
             span.set_attribute("dag.task.id", t.id)
-            span.set_attribute("dag.task.description", t.desc)
-            span.set_attribute("dag.task.parent_id", t.parent or "None")
             span.set_attribute("dag.task.status", t.status)
             try:
-                if not t.already_planned and t.needs_planning:
-                    with self.tracer.start_as_current_span("Phase: Planning") as planning_span:
-                        t.status = "planning";
-                        span.set_attribute("dag.task.status", t.status)
-                        logger.info(f"PLANNING for [{t.id}]: {t.desc}")
-
-                        completed_tasks = [
-                            task for task in self.registry.tasks.values()
-                            if task.status == "complete" and task.id != t.id
-                        ]
-                        if completed_tasks:
-                            completed_tasks_info = "\n".join(
-                                f"- ID: {task.id}\n  Description: {task.desc}"
-                                for task in completed_tasks
-                            )
-                            # --- FIX 1: Make instructions for the LLM more explicit ---
-                            completed_tasks_text = (
-                                "You may use these already-completed tasks as dependencies to avoid repeating work. To do so, "
-                                "when defining a 'deps' entry for a new subtask, use the FULL ID of the existing task "
-                                "(e.g., 'db5a29eac...') in the 'local_id' field.\n\n"
-                                "Available pre-completed tasks:\n"
-                                f"{completed_tasks_info}\n"
-                            )
-                        else:
-                            completed_tasks_text = "No pre-existing completed tasks are available to use as dependencies."
-
-                        planning_prompt = (
-                            f"{t.desc.strip()}\n\n"
-                            f"{completed_tasks_text}\n"
-                        )
-
-                        with self.tracer.start_as_current_span("Agent: Planner") as planner_span:
-                            plan_res = await self.planner.run(user_prompt=planning_prompt)
-                            self._add_llm_data_to_span(planner_span, plan_res, t)
-                        initial_plan = plan_res.output
-                        t.already_planned = True
-
-                        if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
-                            planning_span.add_event("Initial plan generated",
-                                                    {"subtask_count": len(initial_plan.subtasks)})
-                            with self.tracer.start_as_current_span("Agent: Cycle Breaker") as cb_span:
-                                fixer_prompt = (
-                                    f"Please analyze the following execution plan for cycles and correct it:\n\n{initial_plan.model_dump_json(indent=2)}"
-                                )
-                                fixed_plan_res = await self.cycle_breaker.run(user_prompt=fixer_prompt)
-                                self._add_llm_data_to_span(cb_span, fixed_plan_res, t)
-                            final_plan = fixed_plan_res.output
-                            planning_span.add_event("Plan validated", {"final_subtask_count": len(final_plan.subtasks)})
-                            parent_context = otel_context.get_current()
-                            local_to_global_id_map: Dict[str, str] = {}
-                            for sub in final_plan.subtasks:
-                                new_task_id = ctx.inject_task(sub.desc, parent=t.id, parent_context=parent_context)
-                                local_to_global_id_map[sub.local_id] = new_task_id
-                                ctx.add_dependency(new_task_id)
-
-                            # --- FIX 2: Update the dependency linking logic ---
-                            for sub in final_plan.subtasks:
-                                new_task_global_id = local_to_global_id_map[sub.local_id]
-                                for dep in sub.deps:
-                                    # Check if dependency is another NEW subtask
-                                    if dep.local_id in local_to_global_id_map:
-                                        self.registry.add_dependency(new_task_global_id,
-                                                                     local_to_global_id_map[dep.local_id])
-                                    # Check if dependency is a PRE-EXISTING task
-                                    elif dep.local_id in self.registry.tasks:
-                                        self.registry.add_dependency(new_task_global_id, dep.local_id)
-                                    else:
-                                        logger.warning(
-                                            f"Could not find dependency '{dep.local_id}' for task '{new_task_global_id}'. Skipping.")
-
-                            t.status = "waiting"
-                            self.inflight.discard(tid)
-                            logger.info(f"Finished PLANNING for [{t.id}]. Now waiting for {len(t.deps)} children.")
-                            return
-
-                with self.tracer.start_as_current_span("Phase: Execution") as exec_phase_span:
-                    t.status = "running"
-                    span.set_attribute("dag.task.status", t.status)
-                    logger.info(f"EXECUTING [{t.id}]: {t.desc}")
+                # --- ROUTER LOGIC ---
+                if t.status == 'waiting_for_children':
+                    t.status = 'running'
+                    logger.info(f"SYNTHESIS PHASE for [{t.id}].")
                     await self._run_task_execution(ctx)
-                self.inflight.discard(tid)
+                elif t.needs_planning and not t.already_planned:
+                    t.status = 'planning'
+                    logger.info(f"ARCHITECT PHASE for [{t.id}].")
+                    await self._run_initial_planning(ctx)
+                    t.already_planned = True
+                    t.status = "waiting_for_children"
+                elif t.can_request_new_subtasks and t.status != 'proposing':
+                    t.status = 'proposing'
+                    logger.info(f"EXPLORER PHASE for [{t.id}].")
+                    await self._run_adaptive_decomposition(ctx)
+                    t.status = "waiting_for_children"
+                else:
+                    t.status = 'running'
+                    logger.info(f"WORKER PHASE for [{t.id}].")
+                    await self._run_task_execution(ctx)
+
+                if t.status not in ["waiting_for_children", "failed"]:
+                    t.status = "complete"
             except Exception as e:
-                # Record the exception on the span and set status before re-raising
                 span.record_exception(e)
-                span.set_status(trace.Status(StatusCode.ERROR, f"Task failed: {e}"))
+                span.set_status(trace.Status(StatusCode.ERROR, str(e)))
                 t.status = "failed"
                 raise
             finally:
                 span.set_attribute("dag.task.status", t.status)
-                span.set_attribute("dag.task.result_preview", (t.result or "")[:200])
+
+    async def _run_initial_planning(self, ctx: TaskContext):
+        t = ctx.task
+        completed_tasks = [tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id]
+        context = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
+        prompt = f"Objective: {t.desc}\n\nAvailable completed data sources to use as dependencies:\n{context}"
+
+        plan_res = await self.initial_planner.run(user_prompt=prompt)
+        plan = plan_res.output
+        self._add_llm_data_to_span(t.span, plan_res, t)
+
+        if not plan.needs_subtasks: return
+
+        local_to_global_id_map = {}
+        for sub in plan.subtasks:
+            new_task = Task(id=str(uuid.uuid4())[:8], desc=sub.desc, parent=t.id,
+                            can_request_new_subtasks=sub.can_request_new_subtasks)
+            self.registry.add_task(new_task)
+            t.children.append(new_task.id)
+            local_to_global_id_map[sub.local_id] = new_task.id
+
+        for sub in plan.subtasks:
+            new_global_id = local_to_global_id_map.get(sub.local_id)
+            if not new_global_id: continue
+            for dep in sub.deps:
+                dep_global_id = local_to_global_id_map.get(dep.local_id) or (
+                    dep.local_id if dep.local_id in self.registry.tasks else None)
+                if dep_global_id: self.registry.add_dependency(new_global_id, dep_global_id)
+
+    async def _run_adaptive_decomposition(self, ctx: TaskContext):
+        t = ctx.task
+        t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
+        prompt = f"Task: {t.desc}\n\nResults from completed dependencies:\n{t.dep_results}"
+
+        proposals_res = await self.adaptive_decomposer.run(user_prompt=prompt)
+        proposals = proposals_res.output
+        self._add_llm_data_to_span(t.span, proposals_res, t)
+
+        if proposals:
+            logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
+            for sub in proposals:
+                self.proposed_tasks_buffer.append((sub, t.id))
 
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
-        t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
+
+        # --- POSITIVE FRAMING LOGIC ---
+        # The prompt is built only from real, approved children, or original deps.
+        child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
+                         self.registry.tasks[cid].status == 'complete'}
+        dep_results = {did: self.registry.tasks[did].result for did in t.deps if
+                       self.registry.tasks[did].status == 'complete' and did not in child_results}
+
         prompt = f"Task: {t.desc}\n"
-        if t.dep_results:
-            prompt += "\nUse the following data from completed dependencies to inform your answer:\n"
-            for dep_id, res in t.dep_results.items():
-                prompt += f"- Result from sub-task '{self.registry.tasks[dep_id].desc}':\n{str(res)}\n\n"
-        if t.children:
-            prompt += "Your main goal is to synthesize the results from your sub-tasks into a final, cohesive answer."
+        if child_results:
+            prompt += "\nYour sub-tasks have completed. Synthesize their results into a final answer:\n"
+            for cid, res in child_results.items():
+                prompt += f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n"
+        elif dep_results:
+            prompt += "\nUse data from dependencies to inform your answer:\n"
+            for did, res in dep_results.items():
+                prompt += f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n"
+
+        # Simplified retry logic for brevity, but can be expanded
+        result_res = await self.executor.run(user_prompt=prompt)
+        self._add_llm_data_to_span(t.span, result_res, t)
+
+        verification_res = await self.verifier.run(user_prompt=f"Task: {t.desc}\nCandidate Result: {result_res.output}")
+        self._add_llm_data_to_span(t.span, verification_res, t)
+
+        if verification_res.output.get_successful():
+            t.result = result_res.output
         else:
-            prompt += "Please execute this task directly and provide a complete answer."
-
-        worked = False
-        result = None
-
-        while True:  # Use a while-true loop for more complex exit conditions
-            current_attempt = t.fix_attempts + t.grace_attempts
-            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
-            with self.tracer.start_as_current_span(f"Agent: Executor (Attempt {current_attempt + 1})") as exec_span:
-                agent_res = await self.executor.run(user_prompt=prompt)
-                self._add_llm_data_to_span(exec_span, agent_res, t)
-            result = agent_res.output
-
-            if await self._verify_task(t, result):
-                worked = True
-                t.span.add_event("Execution Succeeded and Verified")
-                break  # Exit the loop on success
-
-            # --- Verification Failed: Adaptive Retry Logic ---
-            t.fix_attempts += 1
-
-            # Check if we've exhausted standard attempts and have grace attempts left
-            if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
-                with self.tracer.start_as_current_span("Agent: Retry Analyst") as analyst_span:
-                    analyst_span.set_attribute("task.scores_history", str(t.verification_scores))
-                    analyst_prompt = (
-                        f"Task: '{t.desc}'\n"
-                        f"Failed Attempts have yielded verification scores: {t.verification_scores}\n"
-                        f"A score > 5 is a success. Based on this trend, is another attempt likely to succeed? "
-                        f"Provide a specific suggestion for the next attempt."
-                    )
-                    decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt)
-                    self._add_llm_data_to_span(analyst_span, decision_res, t)
-                    decision = decision_res.output
-
-                    analyst_span.set_attribute("decision.should_retry", decision.should_retry)
-                    analyst_span.set_attribute("decision.reason", decision.reason)
-
-                    if decision.should_retry:
-                        t.span.add_event("Grace attempt granted", {"reason": decision.reason})
-                        t.grace_attempts += 1
-                        prompt += (f"\n\n--- GRACE ATTEMPT GRANTED ---\n"
-                                   f"Analyst Suggestion: {decision.next_step_suggestion}\n"
-                                   f"Please re-evaluate and try again, incorporating this suggestion.")
-                        continue  # Continue to the next iteration of the loop
-
-            # If we reach here, it means we're either out of all attempts or the analyst denied a retry
-            if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
-                t.status = "failed"
-                t.result = "Failed to produce a satisfactory result after multiple standard and grace attempts."
-                error_msg = f"Exceeded max attempts ({t.max_fix_attempts} standard, {t.grace_attempts} grace) for {t.desc}"
-                t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
-                raise Exception(error_msg)
-
-            # Standard retry: update prompt and continue
-            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Re-evaluate and try again."
-
-        # This part only runs if the loop was broken by success
-        t.result = result
-        t.status = "complete"
-        logger.info(f"COMPLETED [{t.id}]")
-
-    async def _verify_task(self, t: Task, candidate_result: str) -> bool:
-        with self.tracer.start_as_current_span("Agent: Verifier") as verifier_span:
-            ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
-            vres = await self.verifier.run(user_prompt=ver_prompt)
-            self._add_llm_data_to_span(verifier_span, vres, t)
-            vout = vres.output
-
-            t.verification_scores.append(vout.score)
-            verifier_span.set_attribute("verification.score", vout.score)
-            verifier_span.set_attribute("verification.reason", vout.reason)
-            logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
-            return vout.get_successful()
-
-def print_topo_table(layers, show_status=False):
-    console = Console()
-    table = Table(title="Topological Task Waves")
-    for i in range(len(layers)):
-        table.add_column(f"Wave {i}")
-
-    if not layers:
-        print("No tasks found.")
-        return
-    max_len = max(len(layer) for layer in layers) if layers else 0
-    for row in range(max_len):
-        row_cells = []
-        for wave in layers:
-            if row < len(wave):
-                t = wave[row]
-                s = f"{t.id[:6]}: {t.desc[:20]}"
-                if show_status:
-                    s += f" [{t.status}]"
-                row_cells.append(s)
-            else:
-                row_cells.append("")
-        table.add_row(*row_cells)
-    console.print(table)
+            raise Exception(f"Verification failed: {verification_res.output.reason}")
 
 
 if __name__ == "__main__":
-    from nest_asyncio import apply
+    apply() if 'apply' in globals() else None
+    try:
+        from nest_asyncio import apply
 
-    apply()
-    logger.info("==== BEGIN DEMO: COMPLEX COMPILATION TASK ====")
+        apply()
+    except ImportError:
+        pass
+    logger.info("==== BEGIN DEMO: HYBRID PLANNING AGENT ====")
 
     reg = TaskRegistry()
 
     # --- Create fragmented data sources ---
-    document_fragments = [
-        ("Financials: Q2 2024 Revenue Breakdown",
-         "Apple Inc. (AAPL) Q2 2024 Revenue Report Snippet:\n"
-         "- Total Revenue: $94.5 billion (up 5% year-over-year)\n"
-         "- Product Segments:\n"
-         "  - iPhones: $50.5 billion (up 8%)\n"
-         "  - Mac: $10.5 billion (down 2%)\n"
-         "  - iPads: $8.0 billion (up 10%)\n"
-         "  - Services: $22.0 billion (up 15%)"),
-
-        ("Financials: Q2 2024 Profit & EPS",
-         "Apple Inc. (AAPL) Q2 2024 Profitability Snippet:\n"
-         "- Net Income: $25.1 billion\n"
-         "- Earnings Per Share (EPS): $1.55"),
-
-        ("Management Outlook: Q2 2024 Guidance and Risks",
-         "Apple Inc. (AAPL) Q2 2024 Management Commentary:\n"
-         "- Forward Guidance: Expect Q3 revenue to decline slightly due to macroeconomic headwinds.\n"
-         "- Identified Risks: Potential supply chain disruptions and inflation concerns."),
-
-        ("Market Intel: Q2 Analyst Ratings",
-         "Market View on Apple (AAPL) for Q2 2024:\n"
-         "- Overall Analyst Rating: Strong Buy\n"
-         "- Rationale: Bullish on strong iPhone demand and services growth."),
-
-        ("Market Intel: Q2 Competitor and Consumer Data",
-         "Competitive Landscape and Consumer Trends for Q2 2024:\n"
-         "- Competitors (e.g., Samsung) are facing inventory challenges.\n"
-         "- Consumer surveys show 68% of current iPhone users plan to upgrade."),
-
-        ("Internal Memo: Q2 Social Events",
-         "A reminder that the annual Q2 company picnic will be held next Friday. All employees "
-         "are encouraged to attend for a day of fun and team-building.")
-    ]
-
-    for name, content in document_fragments:
-        reg.add_document(name, content)
+    doc_ids = [reg.add_document(name, content) for name, content in [
+        ("Financials Q2 Revenue", "Apple Inc. (AAPL) Q2 2024 Revenue: $94.5B. iPhones: $50.5B. Services: $22.0B."),
+        ("Financials Q2 Profit", "Apple Inc. (AAPL) Q2 2024 Net Income: $25.1B. EPS: $1.55."),
+        ("Management Outlook Q2",
+         "Guidance: Expect Q3 revenue to decline slightly due to macro headwinds. Risks: Supply chain."),
+        ("Market Intel Q2", "Analyst Rating: Strong Buy. Rationale: Bullish on services growth."),
+        ("Irrelevant Memo", "The company picnic is next Friday.")
+    ]]
 
     root_task = Task(
         id="ROOT_INVESTOR_BRIEFING",
         desc=(
-            "You are a financial analyst. Your task is to create a comprehensive investor briefing for Apple Inc.'s Q2 2024 performance. "
-            "The system contains multiple fragmented documents with specific data points (revenue, profit, market sentiment, etc.). "
-            "You must first plan to identify and consolidate all relevant fragments. Then, synthesize this compiled information "
-            "into a single, cohesive, well-structured report for investors. "
-            "Ignore any irrelevant documents like internal social memos."
+            "You are a financial analyst. Create a comprehensive investor briefing for Apple's Q2 2024 performance. "
+            "First, create a plan to consolidate all relevant financial and market data fragments. Then, synthesize this information "
+            "into a well-structured report. Ignore irrelevant data."
         ),
-        needs_planning=True,
+        needs_planning=True,  # This will trigger the "Architect"
     )
     reg.add_task(root_task)
 
-    print("\n--- TOPOLOGICAL TABLE BEFORE DAG EXECUTION ---")
-    layers = reg.topological_layers()
-    print_topo_table(layers, show_status=True)
-
+    # In this demo, the architect will create a "synthesis" task.
+    # We expect that synthesis task to be given `can_request_new_subtasks=True`.
+    # It will then propose new, more granular tasks. We will set a low global
+    # limit to force the ConflictResolver to act.
     agent = DAGAgent(
         registry=reg,
         llm_model="gpt-4o-mini",
-        tools=[],
-        tracer=trace.get_tracer("doc_dag_demo"),
-        max_grace_attempts=1
+        tracer=trace.get_tracer("hybrid_dag_demo"),
+        global_proposal_limit=2  # Force the resolver to prune proposals
     )
 
+
     async def main():
-        print("\n===== EXECUTING DAG AGENT =====\n")
+        print("\n--- STATUS BEFORE EXECUTION ---")
         reg.print_status_tree()
         await agent.run()
-        print("\n===== DAG EXECUTION COMPLETE =====\n")
+        print("\n--- STATUS AFTER EXECUTION ---")
         reg.print_status_tree()
-        print("\n--- TOPOLOGICAL TABLE AFTER DAG EXECUTION ---")
-        layers = reg.topological_layers()
-        print_topo_table(layers, show_status=True)
+
         print("\n--- Final Output for Root Task ---\n")
-        root_result_task = reg.tasks.get("ROOT_INVESTOR_BRIEFING")
-        if root_result_task:
-            print(f"Result ({root_result_task.status}):\n{root_result_task.result}")
-        print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.all_tasks()):.4f}")
+        root_result = reg.tasks.get("ROOT_INVESTOR_BRIEFING")
+        if root_result:
+            print(f"Final Result (Status: {root_result.status}):\n{root_result.result}")
+        print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.tasks.values()):.4f}")
+
 
     asyncio.run(main())
