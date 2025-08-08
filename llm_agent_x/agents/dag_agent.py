@@ -3,7 +3,6 @@ import uuid
 import logging
 from collections import defaultdict, deque
 from hashlib import md5
-from rich.table import Table
 from os import getenv
 from typing import Set, Dict, Any, Optional, List, Tuple
 from pydantic import BaseModel, Field
@@ -18,7 +17,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
-from rich.console import Console
+
+# --- rich imports removed as they are no longer needed ---
 
 # --- Basic Setup ---
 load_dotenv(".env", override=True)
@@ -43,7 +43,6 @@ class verification(BaseModel):
     def get_successful(self): return self.score > 5
 
 
-# --- FEATURE RE-IMPLEMENTED: RetryDecision from old version ---
 class RetryDecision(BaseModel):
     """The decision on whether to attempt another fix for a failing task."""
     should_retry: bool = Field(description="Set to true if the trend of scores suggests success is likely.")
@@ -104,7 +103,7 @@ class Task(BaseModel):
     already_planned: bool = False
     can_request_new_subtasks: bool = False
 
-    # --- FEATURE RE-IMPLEMENTED: RETRY & TRACING FIELDS from old version ---
+    # --- RETRY & TRACING FIELDS ---
     fix_attempts: int = 0
     max_fix_attempts: int = 2
     verification_scores: List[float] = Field(default_factory=list)
@@ -134,46 +133,21 @@ class TaskRegistry:
         self.tasks[task_id].deps.add(dep_id)
 
     def print_status_tree(self):
-        logger.info("--- CURRENT TASK REGISTRY STATUS ---")
+        logger.info("--- CURRENT TASK STATUS TREE ---")
         root_nodes = [t for t in self.tasks.values() if not t.parent]
         for root in root_nodes: self._print_node(root, 0)
         logger.info("------------------------------------")
 
     def _print_node(self, task: Task, level: int):
         prefix = "  " * level
-        logger.info(f"{prefix}- {task.id[:8]}: {task.status.upper()} | {task.desc[:60]}...")
+        status_color = {"complete": "✅", "failed": "❌", "running": "⏳", "planning": "📝", "proposing": "💡",
+                        "waiting_for_children": "⏸️", "pending": "📋"}
+        status_icon = status_color.get(task.status, "❓")
+        logger.info(f"{prefix}- {status_icon} {task.id[:8]}: {task.status.upper()} | {task.desc[:60]}...")
         for child_id in task.children:
             if child_id in self.tasks: self._print_node(self.tasks[child_id], level + 1)
 
-    # --- FEATURE RE-IMPLEMENTED: topological_layers from old version ---
-    def topological_layers(self) -> List[List[Task]]:
-        in_degree = defaultdict(int)
-        children = defaultdict(list)
-        for t in self.tasks.values():
-            for dep in t.deps:
-                in_degree[t.id] += 1
-                children[dep].append(t.id)
-            if t.id not in in_degree:
-                in_degree[t.id] = 0
-
-        ready = deque([tid for tid, deg in in_degree.items() if deg == 0])
-        seen = set()
-        levels = []
-        while ready:
-            layer = []
-            for _ in range(len(ready)):
-                tid = ready.popleft()
-                if tid in seen: continue
-                seen.add(tid)
-                task = self.tasks[tid]
-                layer.append(task)
-                for child_id in children[tid]:
-                    in_degree[child_id] -= 1
-                    if in_degree[child_id] == 0:
-                        ready.append(child_id)
-            if layer:
-                levels.append(layer)
-        return levels
+    # --- REMOVED: topological_layers method is no longer needed ---
 
 
 class TaskContext:
@@ -190,13 +164,13 @@ class DAGAgent:
             llm_model: str = "gpt-4o-mini",
             tracer: Optional[Tracer] = None,
             global_proposal_limit: int = 5,
-            max_grace_attempts: int = 1,  # Feature from old version
+            max_grace_attempts: int = 1,
     ):
         self.registry = registry
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.tracer = tracer or trace.get_tracer(__name__)
-        self.max_grace_attempts = max_grace_attempts  # Feature from old version
+        self.max_grace_attempts = max_grace_attempts
 
         self.global_proposal_limit = global_proposal_limit
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
@@ -207,7 +181,6 @@ class DAGAgent:
             system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
             output_type=ExecutionPlan
         )
-        # --- FEATURE RE-IMPLEMENTED: Cycle Breaker Agent from old version ---
         self.cycle_breaker = Agent(
             model=llm_model,
             system_prompt=(
@@ -230,7 +203,6 @@ class DAGAgent:
         )
         self.executor = Agent(model=llm_model, output_type=str)
         self.verifier = Agent(model=llm_model, output_type=verification)
-        # --- FEATURE RE-IMPLEMENTED: Retry Analyst Agent from old version ---
         self.retry_analyst = Agent(
             model=llm_model,
             system_prompt=(
@@ -333,6 +305,7 @@ class DAGAgent:
             new_task = Task(id=str(uuid.uuid4())[:8], desc=proposal.desc, parent=parent_id)
             self.registry.add_task(new_task)
             self.registry.tasks[parent_id].children.append(new_task.id)
+            self.registry.add_dependency(parent_id, new_task.id)
             local_to_global_id_map[proposal.local_id] = new_task.id
 
         for proposal in approved_proposals:
@@ -389,7 +362,6 @@ class DAGAgent:
         self._add_llm_data_to_span(t.span, plan_res, t)
         initial_plan = plan_res.output
 
-        # --- FEATURE RE-IMPLEMENTED: Cycle Breaking Logic ---
         if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
             fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
             fixed_plan_res = await self.cycle_breaker.run(user_prompt=fixer_prompt)
@@ -404,8 +376,9 @@ class DAGAgent:
         for sub in plan.subtasks:
             new_task = Task(id=str(uuid.uuid4())[:8], desc=sub.desc, parent=t.id,
                             can_request_new_subtasks=sub.can_request_new_subtasks)
-            self.registry.add_task(new_task);
+            self.registry.add_task(new_task)
             t.children.append(new_task.id)
+            self.registry.add_dependency(t.id, new_task.id)
             local_to_global_id_map[sub.local_id] = new_task.id
 
         for sub in plan.subtasks:
@@ -426,13 +399,12 @@ class DAGAgent:
             logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
             for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
 
-    # --- FEATURE RE-IMPLEMENTED: Full retry logic from old version ---
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
         child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
                          self.registry.tasks[cid].status == 'complete'}
         dep_results = {did: self.registry.tasks[did].result for did in t.deps if
-                       self.registry.tasks[did].status == 'complete'}
+                       self.registry.tasks[did].status == 'complete' and did not in child_results}
 
         prompt = f"Task: {t.desc}\n"
         if child_results:
@@ -489,25 +461,7 @@ class DAGAgent:
         return vout.get_successful()
 
 
-# --- FEATURE RE-IMPLEMENTED: print_topo_table from old version ---
-def print_topo_table(layers: List[List[Task]], show_status=False):
-    console = Console()
-    table = Table(title="Topological Task Waves")
-    if not layers: console.print("No tasks found."); return
-    for i in range(len(layers)): table.add_column(f"Wave {i}")
-    max_len = max(len(layer) for layer in layers) if layers else 0
-    for row in range(max_len):
-        row_cells = []
-        for wave in layers:
-            if row < len(wave):
-                t = wave[row]
-                s = f"{t.id[:6]}: {t.desc[:20]}" + (f" [{t.status}]" if show_status else "")
-                row_cells.append(s)
-            else:
-                row_cells.append("")
-        table.add_row(*row_cells)
-    console.print(table)
-
+# --- REMOVED: print_topo_table function is no longer needed ---
 
 if __name__ == "__main__":
     try:
@@ -543,15 +497,13 @@ if __name__ == "__main__":
 
 
     async def main():
-        print("\n--- TOPOLOGICAL TABLE BEFORE EXECUTION ---")
-        print_topo_table(reg.topological_layers(), show_status=True)
+        print("\n--- INITIAL TASK STATUS TREE ---")
+        reg.print_status_tree()
         print("\n===== EXECUTING DAG AGENT =====\n")
         await agent.run()
         print("\n===== DAG EXECUTION COMPLETE =====\n")
         print("\n--- FINAL TASK STATUS TREE ---")
         reg.print_status_tree()
-        print("\n--- TOPOLOGICAL TABLE AFTER EXECUTION ---")
-        print_topo_table(reg.topological_layers(), show_status=True)
 
         print("\n--- Final Output for Root Task ---\n")
         root_result = reg.tasks.get("ROOT_INVESTOR_BRIEFING")
