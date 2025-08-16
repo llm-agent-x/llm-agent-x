@@ -127,8 +127,7 @@ class TaskRegistry:
         id = md5(f"{document_name}{content}".encode()).hexdigest()
         print(f"Adding document {document_name} with id {id}")
         print(f"Document content: {content}")
-        self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete",
-                              result=content.get('markdown_content'))
+        self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete", result=content)
         return id
 
     def add_dependency(self, task_id: str, dep_id: str):
@@ -290,6 +289,8 @@ class DAGAgent:
 
     async def _run_global_resolution(self):
         logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
+        print("PROPOSED TASKS")
+        print(self.proposed_tasks_buffer)
         approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
         if len(approved_proposals) > self.global_proposal_limit:
             logger.warning(
