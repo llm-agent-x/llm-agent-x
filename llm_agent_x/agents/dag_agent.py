@@ -426,8 +426,9 @@ class DAGAgent:
             exec_res = await self.executor.run(user_prompt=prompt)
             self._add_llm_data_to_span(t.span, exec_res, t)
             result = exec_res.output
-
-            if await self._verify_task(t, result):
+            verify_task_result = await self._verify_task(t, result)
+            is_successful =verify_task_result.get_successful()
+            if is_successful:
                 t.result = result;
                 logger.info(f"COMPLETED [{t.id}]");
                 return
@@ -451,7 +452,7 @@ class DAGAgent:
                 t.span.set_status(trace.Status(StatusCode.ERROR, error_msg));
                 raise Exception(error_msg)
 
-            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Re-evaluate and try again."
+            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
 
     async def _verify_task(self, t: Task, candidate_result: str) -> bool:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
@@ -462,7 +463,7 @@ class DAGAgent:
         t.span.set_attribute("verification.score", vout.score);
         t.span.set_attribute("verification.reason", vout.reason)
         logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
-        return vout.get_successful()
+        return vout
 
 
 # --- REMOVED: print_topo_table function is no longer needed ---
