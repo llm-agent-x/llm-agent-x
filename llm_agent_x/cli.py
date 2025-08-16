@@ -79,7 +79,9 @@ def main():
 
     # --- Shared Setup ---
     client = AsyncOpenAI(max_retries=3)
-    available_tools = [brave_web_search]
+    available_tools = []
+    if not args.disable_web_search:
+        available_tools.append(brave_web_search)
     if args.enable_python_execution:
         available_tools.append(exec_python)
 
@@ -184,7 +186,8 @@ def main():
                     llm_model=args.model, # DAGAgent takes the model name string
                     tools=available_tools,
                     tracer=tracer,
-                    max_grace_attempts=args.max_grace_attempts
+                    max_grace_attempts=args.max_grace_attempts,
+                    global_proposal_limit=args.global_proposal_limit,
                 )
                 # Run logic for DAG agent
                 console.print("\n--- Initial Task Status ---")

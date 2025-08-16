@@ -116,3 +116,15 @@ dag_group.add_argument(
     default=1,
     help="[DAG-ONLY] The number of extra retries granted by the retry analyst."
 )
+
+dag_group.add_argument(
+    "--global-proposal-limit",
+    type=int,
+    default=5,
+)
+
+parser.add_argument(
+    "--disable-web-search",
+    type=bool,
+    help="[DAG-ONLY] Whether to disable the web search tool."
+)
