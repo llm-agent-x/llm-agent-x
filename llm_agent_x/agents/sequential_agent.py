@@ -335,10 +335,11 @@ class SequentialCodeAgent:
             if critique.mistakes:
                 ic("Critic found mistakes! Sending back for correction.")
                 # Formulate a new, corrective prompt that will be the 'user_input' for the next loop.
+                mistakes = '\n- '.join(critique.mistakes)
                 user_input = (
                     "A supervising critic has reviewed your plan and found the following flaws. "
                     "You MUST address these issues in your next step. DO NOT ignore them.\n\n"
-                    f"**CRITIC'S FEEDBACK:**\n- {'\n- '.join(critique.mistakes)}\n\n"
+                    f"**CRITIC'S FEEDBACK:**\n- {mistakes}\n\n"
                     "Please provide a new, corrected plan and the corresponding code."
                 )
                 # Continue to the next turn to let the agent process the critique.

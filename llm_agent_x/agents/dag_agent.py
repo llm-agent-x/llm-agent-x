@@ -123,9 +123,12 @@ class TaskRegistry:
         if task.id in self.tasks: raise ValueError(f"Task {task.id} already exists")
         self.tasks[task.id] = task
 
-    def add_document(self, document_name: str, content: str) -> str:
+    def add_document(self, document_name: str, content: Dict[str, str]) -> str:
         id = md5(f"{document_name}{content}".encode()).hexdigest()
-        self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete", result=content)
+        print(f"Adding document {document_name} with id {id}")
+        print(f"Document content: {content}")
+        self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete",
+                              result=content.get('markdown_content'))
         return id
 
     def add_dependency(self, task_id: str, dep_id: str):
