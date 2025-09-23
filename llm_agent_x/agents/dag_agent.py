@@ -127,6 +127,10 @@ class Task(BaseModel):
     user_response: Optional[str] = Field(None, description="The human operator's response to an agent's question.")
 
 
+    last_llm_history: Optional[Any] = None
+    agent_role_paused: bool = False
+
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -245,22 +249,27 @@ class DAGAgent:
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
         task.cost += cost
 
-    async def _handle_agent_output(self, ctx: TaskContext, agent_res: AgentRunResult, expected_output_type: Any) -> Tuple[bool, Any]:
+    async def _handle_agent_output(self, ctx: TaskContext, agent_res: AgentRunResult, expected_output_type: Any, agent_role_name: str = None) -> Tuple[bool, Any]:
         """
         Processes an agent's output. If it's a UserQuestion, pauses the task.
         Returns (is_paused, actual_output).
+
+        If agent_role_name is provided, it will be added as a tag to the task's span.
         """
         t = ctx.task
         self._add_llm_data_to_span(t.span, agent_res, t)
         actual_output = agent_res.output
 
-        if isinstance(actual_output, UserQuestion):
+        if agent_role_name:
+            t.span.set_attribute(f"agent_role.{agent_role_name}", "true")
+
+        if isinstance(actual_output, expected_output_type):
+            return False, actual_output # Not paused, here's the normal output
+        elif isinstance(actual_output, UserQuestion):
             logger.info(f"Task [{t.id}] asking human question (Priority: {actual_output.priority}): {actual_output.question[:80]}...")
             t.current_question = actual_output
             t.status = "waiting_for_user_response"
             return True, None # Indicate paused
-        elif isinstance(actual_output, expected_output_type):
-            return False, actual_output # Not paused, here's the normal output
         else:
             # This handles cases where the LLM produces a valid Pydantic model, but not the expected one
             # e.g., if we expect ExecutionPlan but the LLM just returns UserQuestion.
