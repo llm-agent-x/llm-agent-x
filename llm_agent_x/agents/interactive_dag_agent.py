@@ -14,7 +14,7 @@ from pydantic_ai.agent import AgentRunResult
 
 from llm_agent_x.agents.dag_agent import (
     DAGAgent, Task, TaskRegistry, TaskContext,
-    ExecutionPlan, ProposedSubtask, verification, RetryDecision, UserQuestion
+    ExecutionPlan, ProposedSubtask, verification, RetryDecision, UserQuestion, ProposalResolutionPlan
 )
 
 from dotenv import load_dotenv
@@ -33,17 +33,20 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.directives_queue = asyncio.Queue()
 
-        # Publisher connection (for broadcasting state updates)
+        # Publisher connection for broadcasting state updates (used by main thread)
         self._publisher_connection: Optional[pika.BlockingConnection] = None
         self._publish_channel: Optional[pika.adapters.blocking_connection.BlockingChannel] = None
         self.STATE_UPDATES_EXCHANGE = 'state_updates_exchange'
-        self.DIRECTIVES_QUEUE = 'directives_queue'  # The queue for inbound directives from gateway
 
-        # Consumer thread management
-        self._consumer_thread: Optional[threading.Thread] = None
-        self._consumer_connection_for_thread: Optional[pika.BlockingConnection] = None  # Separate connection for thread
+        # Consumer thread's dedicated connection (used only by the consumer thread)
+        self._consumer_connection_for_thread: Optional[pika.BlockingConnection] = None
         self._consumer_channel_for_thread: Optional[pika.adapters.blocking_connection.BlockingChannel] = None
+        self.DIRECTIVES_QUEUE = 'directives_queue'  # The queue for inbound directives from gateway
         self._shutdown_event = threading.Event()  # Event to signal consumer thread to stop
+        self._consumer_thread: Optional[threading.Thread] = None  # Reference to the consumer thread
+
+        # Store the main event loop reference (set in run())
+        self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Map agent role names to actual agent instances for dynamic lookup
         self._agent_role_map = {
@@ -123,12 +126,15 @@ class InteractiveDAGAgent(DAGAgent):
             def callback(ch, method, properties, body):
                 message = json.loads(body)
                 logger.debug(f"Received directive from RabbitMQ: {message}")
-                # Use thread-safe queue insertion by scheduling it on the main event loop
-                main_loop = asyncio.get_event_loop()
-                if main_loop.is_running():
+
+                # Use the stored main event loop reference
+                main_loop = self._main_event_loop
+                if main_loop and main_loop.is_running():  # Check if it's available and running
                     main_loop.call_soon_threadsafe(self.directives_queue.put_nowait, message)
                 else:
-                    logger.warning("Main asyncio loop not running, cannot put directive into queue. Directive dropped.")
+                    logger.warning(
+                        "Main asyncio loop not running or not set, cannot put directive into queue. Directive dropped. Message: %s",
+                        message)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
 
             self._consumer_channel_for_thread.basic_consume(queue=self.DIRECTIVES_QUEUE, on_message_callback=callback)
@@ -137,6 +143,7 @@ class InteractiveDAGAgent(DAGAgent):
             # Keep consuming until instructed to shut down
             while not self._shutdown_event.is_set():
                 # Process events for a short duration, allowing periodic checks for shutdown_event
+                # This ensures the thread doesn't block indefinitely on consumption if no messages arrive.
                 self._consumer_connection_for_thread.process_data_events(time_limit=0.1)
 
             logger.info("Consumer thread: Shutdown event received. Stopping consuming.")
@@ -159,6 +166,10 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _handle_directive(self, directive: dict):
         command = directive.get("command")
+
+        # The _handle_directive method *receives* directives from the queue.
+        # It does NOT publish them. The publisher connection is managed by `run()` and `_broadcast_state_update`.
+        # No publisher initialization is needed here.
 
         if command == "ADD_ROOT_TASK":
             payload = directive.get("payload", {})
@@ -187,11 +198,9 @@ class InteractiveDAGAgent(DAGAgent):
 
         logger.info(f"Handling command '{command}' for task {task_id}")
 
-        # If a task is currently in-flight, cancel its future before applying directives
         if task_id in self.task_futures and not self.task_futures[task_id].done():
             self.task_futures[task_id].cancel()
             logger.info(f"Cancelled in-flight asyncio.Task for {task_id} due to directive.")
-            # The main run loop's asyncio.wait will handle completed/cancelled futures.
 
         original_status = task.status
         if command == "PAUSE":
@@ -227,7 +236,7 @@ class InteractiveDAGAgent(DAGAgent):
             if task.status == "waiting_for_user_response" and task.current_question:
                 task.user_response = payload
                 task.current_question = None
-                task.status = "pending"  # Ready for _run_taskflow to pick up
+                task.status = "pending"
                 logger.info(f"Task {task_id} received answer to question: {payload[:50]}...")
             else:
                 logger.warning(f"Task {task_id} not waiting for a question, ignoring ANSWER_QUESTION directive.")
@@ -265,9 +274,25 @@ class InteractiveDAGAgent(DAGAgent):
                 self._broadcast_state_update(task)
 
     async def run(self):
+        # Capture the main event loop reference *before* starting any new threads
+        self._main_event_loop = asyncio.get_running_loop()
+
         # Start the consumer thread
         self._consumer_thread = threading.Thread(target=self._listen_for_directives_target, daemon=True)
         self._consumer_thread.start()
+
+        # Initialize publisher connection for the main thread
+        try:
+            self._publisher_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
+            self._publish_channel = self._publisher_connection.channel()
+            self._publish_channel.exchange_declare(exchange=self.STATE_UPDATES_EXCHANGE, exchange_type='fanout')
+            self._publish_channel.queue_declare(queue=self.DIRECTIVES_QUEUE, durable=True)
+            logger.info("Publisher RabbitMQ connection and channel initialized.")
+        except Exception as e:
+            logger.critical(f"Failed to initialize publisher RabbitMQ connection, agent cannot communicate state: {e}",
+                            exc_info=True)
+            self._shutdown_event.set()  # Signal consumer thread to stop
+            raise  # Propagate critical error to prevent agent from running silently.
 
         logger.info("Broadcasting initial state of all tasks (if any)...")
         for task in self.registry.tasks.values():
@@ -323,19 +348,27 @@ class InteractiveDAGAgent(DAGAgent):
 
                     ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
 
-                    # Condition to prevent stall/premature shutdown:
-                    # The loop should continue if:
-                    # 1. There are ready tasks.
-                    # 2. There are tasks currently in-flight.
-                    # 3. There are tasks awaiting user response.
-                    # 4. The `directives_queue` is not empty (still processing directives received from thread).
-                    # 5. The consumer thread is still alive (can receive more directives).
+                    # Check for graceful shutdown conditions.
+                    # The loop continues if there's work for agents, or if the consumer thread is still active
+                    # (meaning more directives could arrive).
                     has_pending_interaction = any(
                         t.status == 'waiting_for_user_response' for t in self.registry.tasks.values())
-                    if not ready and not self.inflight and not has_pending_interaction and self.directives_queue.empty() and not self._consumer_thread.is_alive():
-                        logger.info(
-                            "Interactive DAG execution complete (no pending, no inflight, no user interaction, no directives, consumer thread inactive).")
-                        break  # Exit the main loop
+                    if not ready and \
+                            not self.inflight and \
+                            not has_pending_interaction and \
+                            self.directives_queue.empty():  # Check internal queue for directives processed in this loop
+
+                        # If no internal work or pending interaction, check if external input is still possible.
+                        if self._shutdown_event.is_set() or not self._consumer_thread.is_alive():
+                            # Consumer thread is either signaled to stop, or already dead.
+                            # So no new directives will come in. It's safe to shut down.
+                            logger.info(
+                                "Interactive DAG execution complete (no pending, no inflight, no user interaction, no directives, consumer thread inactive/stopping).")
+                            break
+                        else:
+                            # Agent is idle, but consumer thread is still alive and waiting for external directives.
+                            # So, we should continue looping and waiting.
+                            logger.debug("Agent idle, but consumer thread active. Waiting for directives...")
 
                     for tid in ready:
                         self.inflight.add(tid)
@@ -387,13 +420,17 @@ class InteractiveDAGAgent(DAGAgent):
         finally:
             logger.info(
                 "Agent run loop is shutting down. Signaling consumer thread to stop and closing publisher connection.")
-            self._shutdown_event.set()  # Signal consumer thread to stop
+
+            # Signal consumer thread to stop
+            self._shutdown_event.set()
             if self._consumer_thread and self._consumer_thread.is_alive():
                 self._consumer_thread.join(timeout=5)  # Wait for consumer to finish gracefully
                 if self._consumer_thread.is_alive():
                     logger.warning("Consumer thread did not shut down gracefully after 5 seconds.")
 
+            # Close publisher connection
             if self._publisher_connection and self._publisher_connection.is_open:
+                logger.info("Closing publisher RabbitMQ connection.")
                 self._publisher_connection.close()
             self._publisher_connection = None
             self._publish_channel = None
@@ -536,7 +573,7 @@ class InteractiveDAGAgent(DAGAgent):
             if not is_paused and resolved_plan:
                 logger.info(
                     f"Global resolver for {ctx.task.id} (resumed) approved {len(resolved_plan.approved_tasks)} sub-tasks.")
-                ctx.task.status = "pending"  # Mark as pending to be picked up by global resolution in main loop
+                ctx.task.status = "pending"
                 self._broadcast_state_update(ctx.task)
             elif not is_paused and resolved_plan is None:
                 logger.warning(
@@ -551,21 +588,14 @@ class InteractiveDAGAgent(DAGAgent):
 
         elif original_agent_role_paused == "verifier":
             is_paused, vout = await self._handle_agent_output(ctx, resume_res, verification, original_agent_role_paused)
-            if not is_paused:  # If verifier didn't ask another question
-                # The _process_executor_output_for_verification handles the logic after verification
-                # It will need the `vout` directly or be able to re-evaluate based on the `t.verification_scores`.
-                # For simplicity, if verifier didn't ask question, we return to _run_task_execution's loop.
-                # _run_task_execution will then re-call _verify_task for the *current* result.
-                ctx.task.status = "pending"  # Set to pending to trigger re-evaluation in the _run_task_execution loop
+            if not is_paused:
+                ctx.task.status = "pending"
                 self._broadcast_state_update(ctx.task)
 
         elif original_agent_role_paused == "retry_analyst":
             is_paused, decision = await self._handle_agent_output(ctx, resume_res, RetryDecision,
                                                                   original_agent_role_paused)
-            if not is_paused:  # If analyst didn't ask another question
-                # The _process_executor_output_for_verification handles the logic after retry analyst
-                # It will need the `decision` directly or be able to infer it.
-                # Setting status to pending will trigger _run_task_execution's retry loop.
+            if not is_paused:
                 ctx.task.status = "pending"
                 self._broadcast_state_update(ctx.task)
 
@@ -576,9 +606,7 @@ class InteractiveDAGAgent(DAGAgent):
                 ctx.task.status = "pending"
                 self._broadcast_state_update(ctx.task)
 
-        # Clear remaining context fields after full resumption process
-        # This prevents an infinite loop where the task keeps trying to resume the same agent
-        if ctx.task.status != "waiting_for_user_response":  # Only clear if not paused again by the resumption itself
+        if ctx.task.status != "waiting_for_user_response":
             t.agent_role_paused = None
             t.last_llm_history = None
 
