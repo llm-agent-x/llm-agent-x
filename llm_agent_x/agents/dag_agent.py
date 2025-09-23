@@ -515,9 +515,6 @@ class DAGAgent:
             prompt += f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n"
             t.human_directive = None  # Clear after use
 
-        # If there's a user response (meaning it was paused earlier by THIS agent role), append it to the prompt.
-        # This part of the logic is now handled in InteractiveDAGAgent._resume_agent_from_question before this method is called.
-
         plan_res = await self.initial_planner.run(
             user_prompt=prompt,
             message_history=t.last_llm_history  # Pass the full message history
@@ -542,6 +539,17 @@ class DAGAgent:
         else:
             plan = initial_plan  # No subtasks or no issues
 
+        if not plan.needs_subtasks: return
+
+        # Delegate the actual commitment to a new helper method
+        await self._process_initial_planning_output(ctx, plan)
+
+    async def _process_initial_planning_output(self, ctx: TaskContext, plan: ExecutionPlan):
+        """
+        Helper method to process the output of initial planning and commit subtasks.
+        This is separated so it can be called directly by InteractiveDAGAgent's resume logic.
+        """
+        t = ctx.task
         if not plan.needs_subtasks: return
 
         local_to_global_id_map = {}
@@ -592,26 +600,28 @@ class DAGAgent:
         dep_results = {did: self.registry.tasks[did].result for did in t.deps if
                        self.registry.tasks[did].status == 'complete' and did not in child_results}
 
-        prompt = f"Task: {t.desc}\n"
+        prompt_base = f"Task: {t.desc}\n"
         if child_results:
-            prompt += "\nSynthesize the results from your sub-tasks into a final answer:\n"
+            prompt_base += "\nSynthesize the results from your sub-tasks into a final answer:\n"
             for cid, res in child_results.items():
-                prompt += f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n"
+                prompt_base += f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n"
         elif dep_results:
-            prompt += "\nUse data from dependencies to inform your answer:\n"
+            prompt_base += "\nUse data from dependencies to inform your answer:\n"
             for did, res in dep_results.items():
-                prompt += f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n"
-
-        # Inject human directive if present (only applies to current attempt, not future retries implicitly)
-        if t.human_directive:
-            prompt += f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n------------------------------\n"
-            t.human_directive = None  # Clear after use
+                prompt_base += f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n"
 
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
+
+            # Start with base prompt and add any current human directive or previous feedback
+            current_prompt = prompt_base
+            if t.human_directive:
+                current_prompt = f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n------------------------------\n" + current_prompt
+                t.human_directive = None  # Clear after use
+
             exec_res = await self.executor.run(
-                user_prompt=prompt,
+                user_prompt=current_prompt,
                 message_history=t.last_llm_history  # Pass the full message history
             )
             is_paused, result = await self._handle_agent_output(
@@ -619,47 +629,67 @@ class DAGAgent:
             )
             if is_paused: return  # Task is paused for user input
 
-            verify_task_result = await self._verify_task(t, result)
-            is_successful = verify_task_result.get_successful()
-
-            if is_successful:
-                t.result = result
-                logger.info(f"COMPLETED [{t.id}]");
-                t.last_llm_history = None  # Clear history on success
-                t.agent_role_paused = None
+            await self._process_executor_output_for_verification(ctx, result)
+            if t.status in ["complete", "failed", "waiting_for_user_response", "paused_by_human"]:
                 return
 
-            t.fix_attempts += 1
-            if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
-                analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\n" \
-                                 f"Score > 5 is a success. Should we retry?"
+            # If the task status is still "pending" or "running" after verification,
+            # it means a retry is in order. The loop will continue.
+            # The feedback for the retry is now managed by `t.human_directive` set in `_process_executor_output_for_verification`.
 
-                decision_res = await self.retry_analyst.run(
-                    user_prompt=analyst_prompt,
-                    message_history=t.last_llm_history  # Pass the full message history
-                )
-                is_paused, decision = await self._handle_agent_output(
-                    ctx=ctx, agent_res=decision_res, expected_output_type=RetryDecision, agent_role_name="retry_analyst"
-                )
-                if is_paused: return  # Task is paused for user input
+    async def _process_executor_output_for_verification(self, ctx: TaskContext, result: str):
+        """Helper to handle verification and retry logic after executor runs."""
+        t = ctx.task
+        verify_task_result = await self._verify_task(t, result)
+        is_successful = verify_task_result.get_successful()
 
-                if decision.should_retry:
-                    t.span.add_event("Grace attempt granted", {"reason": decision.reason})
-                    t.grace_attempts += 1
-                    prompt += f"\n\n--- GRACE ATTEMPT GRANTED ---\nAnalyst Suggestion: {decision.next_step_suggestion}\n"
-                    # The prompt is updated for the next iteration. `last_llm_history` will be updated by the next `executor.run`.
-                    continue
+        if is_successful:
+            t.result = result
+            logger.info(f"COMPLETED [{t.id}]");
+            t.status = "complete"  # Explicitly set status to complete
+            self._broadcast_state_update(t)
+            t.last_llm_history = None  # Clear history on success
+            t.agent_role_paused = None
+            return
 
-            if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
-                error_msg = f"Exceeded max attempts for task '{t.id}'"
-                t.span.set_status(trace.Status(StatusCode.ERROR, error_msg));
-                t.last_llm_history = None  # Clear history on failure
-                t.agent_role_paused = None
-                raise Exception(error_msg)
+        # If not successful, proceed with retry logic
+        t.fix_attempts += 1
+        if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\n" \
+                             f"Score > 5 is a success. Should we retry?"
 
-            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
-            # `t.last_llm_history` from the verifier call (and potentially retry analyst)
-            # is implicitly carried over to the next `executor.run` as the starting history.
+            decision_res = await self.retry_analyst.run(
+                user_prompt=analyst_prompt,
+                message_history=t.last_llm_history
+            )
+            is_paused, decision = await self._handle_agent_output(
+                ctx=ctx, agent_res=decision_res, expected_output_type=RetryDecision, agent_role_name="retry_analyst"
+            )
+            if is_paused: return  # Task is paused for user input
+
+            if decision.should_retry:
+                t.span.add_event("Grace attempt granted", {"reason": decision.reason})
+                t.grace_attempts += 1
+                t.human_directive = decision.next_step_suggestion  # Inject suggestion for next attempt
+                logger.info(f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}")
+                # Status remains "running" or "pending" to cause a retry with the new directive
+                return
+
+        # If max attempts (including grace) are exceeded
+        if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
+            error_msg = f"Exceeded max attempts for task '{t.id}'"
+            t.span.set_status(trace.Status(StatusCode.ERROR, error_msg));
+            t.status = "failed"
+            self._broadcast_state_update(t)
+            t.last_llm_history = None  # Clear history on failure
+            t.agent_role_paused = None
+            raise Exception(error_msg)
+
+        # If just a normal retry (within initial max_fix_attempts)
+        # Add feedback as a human directive for the next executor run
+        t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
+        logger.info(f"[{t.id}] Retrying execution. Feedback: {verify_task_result.reason[:50]}...")
+        # Status remains "running" or "pending" to trigger next iteration of _run_task_execution loop.
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
@@ -682,7 +712,6 @@ class DAGAgent:
         t.span.set_attribute("verification.reason", vout.reason)
         logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
         return vout
-
 
 # --- REMOVED: print_topo_table function is no longer needed ---
 
