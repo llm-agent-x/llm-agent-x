@@ -56,14 +56,6 @@ class InteractiveDAGAgent(DAGAgent):
             body=message  # The message is now already a properly formatted JSON string
         )
 
-    def _broadcast_state_update(self, task: Task):
-        message = task.model_dump_json(exclude={'span', 'otel_context'})
-        self.publish_channel.basic_publish(
-            exchange=self.STATE_UPDATES_EXCHANGE,
-            routing_key='',
-            body=message
-        )
-
     def _listen_for_directives(self):
         """Listens for messages from RabbitMQ and puts them in an async queue."""
 
@@ -273,57 +265,123 @@ class InteractiveDAGAgent(DAGAgent):
                 self._broadcast_state_update(t)
 
     async def _run_initial_planning(self, ctx: TaskContext):
-        # ... (This is the original function body)
-        pass  # NOTE: Replace with your actual implementation
+        """
+        Calls the LLM to break down a high-level task into a graph of sub-tasks.
+        """
+        t = ctx.task
+        logger.info(f"[{t.id}] Running initial planning for: {t.desc}")
+
+        # Gather context of existing, completed tasks (like documents)
+        completed_tasks = [tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id]
+        context_str = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
+        prompt = f"Objective: {t.desc}\n\nAvailable completed data sources:\n{context_str}"
+
+        # Call the planning agent
+        plan_res = await self.initial_planner.run(user_prompt=prompt)
+        self._add_llm_data_to_span(t.span, plan_res, t)
+        initial_plan = plan_res.output
+
+        # Optional: Cycle breaking logic (can be added if needed)
+        plan = initial_plan
+
+        if not plan or not plan.needs_subtasks or not plan.subtasks:
+            logger.warning(f"[{t.id}] Planner decided no sub-tasks are needed. Task will proceed to execution.")
+            # Set needs_planning to False so we don't try to plan it again
+            t.needs_planning = False
+            return
+
+        logger.info(f"[{t.id}] Planner created {len(plan.subtasks)} sub-tasks.")
+        local_to_global_id_map = {}
+        for sub in plan.subtasks:
+            new_task = Task(
+                id=str(uuid.uuid4())[:8],
+                desc=sub.desc,
+                parent=t.id,
+                can_request_new_subtasks=sub.can_request_new_subtasks
+            )
+            self.registry.add_task(new_task)
+            t.children.append(new_task.id)
+            self.registry.add_dependency(t.id, new_task.id)  # Parent depends on child completion
+            local_to_global_id_map[sub.local_id] = new_task.id
+            self._broadcast_state_update(new_task)  # Broadcast new child task
+
+        # Now link the dependencies between the new sub-tasks
+        for sub in plan.subtasks:
+            new_global_id = local_to_global_id_map.get(sub.local_id)
+            if not new_global_id: continue
+            for dep in sub.deps:
+                # Dependency could be another new sub-task or a pre-existing completed one
+                dep_global_id = local_to_global_id_map.get(dep.local_id) or (
+                    dep.local_id if dep.local_id in self.registry.tasks else None)
+                if dep_global_id:
+                    self.registry.add_dependency(new_global_id, dep_global_id)
+
+        # Broadcast the parent task now that its children are added
+        self._broadcast_state_update(t)
 
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
-        # ... (This is the original function body)
-        pass  # NOTE: Replace with your actual implementation
+        t = ctx.task
+        t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
+        prompt = f"Task: {t.desc}\n\nResults from dependencies:\n{t.dep_results}"
+        proposals_res = await self.adaptive_decomposer.run(user_prompt=prompt)
+        self._add_llm_data_to_span(t.span, proposals_res, t)
+        if proposals := proposals_res.output:
+            logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
+            for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
 
     async def _run_task_execution(self, ctx: TaskContext):
+        """
+        Calls the LLM to execute a single task, using results from dependencies.
+        """
         t = ctx.task
+        logger.info(f"[{t.id}] Running task execution for: {t.desc}")
+
+        # Gather results from completed children (for synthesis tasks) or dependencies
         child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
                          self.registry.tasks[cid].status == 'complete'}
         dep_results = {did: self.registry.tasks[did].result for did in t.deps if
                        self.registry.tasks[did].status == 'complete' and did not in child_results}
 
-        prompt = f"Task: {t.desc}\n"
+        prompt = f"Your task is: {t.desc}\n"
+
         if t.human_directive:
             prompt = f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n--------------------------------------\n\n" + prompt
             t.human_directive = None
             self._broadcast_state_update(t)
 
         if child_results:
-            prompt += "\nSynthesize the results from your sub-tasks:\n" + "".join(
-                f"- Sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n" for cid, res in child_results.items())
+            prompt += "\nSynthesize the results from your sub-tasks into a final answer:\n"
+            for cid, res in child_results.items():
+                prompt += f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n"
         elif dep_results:
-            prompt += "\nUse data from dependencies:\n" + "".join(
-                f"- Dependency '{self.registry.tasks[did].desc}':\n{res}\n\n" for did, res in dep_results.items())
+            prompt += "\nUse data from dependencies to inform your answer:\n"
+            for did, res in dep_results.items():
+                prompt += f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n"
 
+        # The execution/retry loop
         while True:
-            current_attempt = t.fix_attempts + t.grace_attempts
-            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
+            current_attempt = t.fix_attempts + t.grace_attempts + 1
+            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
+
+            logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
             exec_res = await self.executor.run(user_prompt=prompt)
             self._add_llm_data_to_span(t.span, exec_res, t)
             result = exec_res.output
-            verify_task_result = await self._verify_task(t, result)
 
+            # Verification step
+            verify_task_result = await self._verify_task(t, result)
             if verify_task_result.get_successful():
-                t.result = result;
-                logger.info(f"COMPLETED [{t.id}]");
+                t.result = result
+                logger.info(f"COMPLETED [{t.id}] with result: {result[:100]}...")
                 return
 
             t.fix_attempts += 1
-            if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
-                # ... retry logic ...
-                pass
+            if t.fix_attempts >= t.max_fix_attempts:
+                # Add your grace attempt / retry analyst logic here if needed
+                logger.error(f"[{t.id}] Exceeded max attempts.")
+                raise Exception(f"Exceeded max attempts for task '{t.id}'")
 
-            if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
-                error_msg = f"Exceeded max attempts for task '{t.id}'";
-                t.span.set_status(trace.Status(StatusCode.ERROR, error_msg));
-                raise Exception(error_msg)
-
-            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nReason: {verify_task_result.reason}\nRe-evaluate and try again."
+            prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Reason: {verify_task_result.reason}\nPlease re-evaluate and provide a better answer."
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
