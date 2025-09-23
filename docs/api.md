@@ -1,188 +1,172 @@
 # Python API Usage
 
-LLM Agent X can be integrated into your Python projects, allowing you to leverage its task decomposition and execution capabilities programmatically. The core component for this is the `RecursiveAgent`.
+LLM Agent X offers two distinct agent architectures for programmatic use, each suited for different kinds of tasks.
 
-## Core Concepts
+*   **`RecursiveAgent`**: A hierarchical agent that excels at tasks that can be broken down into a clear, tree-like structure. It operates by recursively decomposing a task into sub-tasks until they are simple enough to be executed directly. This is the original agent architecture and is ideal for straightforward, structured problems.
 
--   **`RecursiveAgent`**: The main class that takes a task, decomposes it if necessary, and executes it. It can use tools and delegate to child agents.
+*   **`DAGAgent`**: An evolution of the recursive model, the `DAGAgent` (Directed Acyclic Graph Agent) treats tasks as nodes in a graph. This allows for complex, non-linear dependencies where a task can depend on multiple other tasks, not just a single parent. It features a more sophisticated, multi-phase planning and execution process, making it suitable for complex problems that require adaptation and overcoming uncertainty.
+
+This guide covers the API for both architectures.
+
+## `RecursiveAgent`
+
+The `RecursiveAgent` is the original hierarchical agent in LLM Agent X. It's ideal for tasks that can be neatly broken down into a tree of sub-tasks.
+
+### Core Concepts (`RecursiveAgent`)
+
+-   **`RecursiveAgent`**: The main class that takes a task, decomposes it if necessary, and executes it.
 -   **`RecursiveAgentOptions`**: A Pydantic model to configure the behavior of `RecursiveAgent`.
--   **Tools**: Python functions that the agent can decide to call to gather information or perform actions (e.g., `brave_web_search`, `exec_python`).
--   **LLM**: The language model used by the agent for reasoning, task splitting, and summarization. LLM Agent X uses `pydantic-ai` which supports various models, primarily demonstrated with OpenAI's GPT series.
--   **Task Limits**: Configuration that defines how many subtasks can be created at each level of recursion.
+-   **Task Limits**: A configuration (`task_limits`) that defines how many subtasks can be created at each level of recursion, controlling the shape of the execution tree.
 
-## Getting Started
+### Getting Started (`RecursiveAgent`)
 
 Here's a basic example of how to use `RecursiveAgent`:
 
 ```python
 import asyncio
-from llm_agent_x import RecursiveAgent, RecursiveAgentOptions, TaskLimit
+from llm_agent_x.agents.recursive_agent import RecursiveAgent, RecursiveAgentOptions, TaskLimit
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from openai import AsyncOpenAI
-from llm_agent_x.tools.brave_web_search import brave_web_search # Example tool
-# Ensure NLTK data is available (RecursiveAgent might use it indirectly)
-import nltk
-try:
-    nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
-    nltk.download('punkt', quiet=True)
-
+from llm_agent_x.tools.brave_web_search import brave_web_search
 
 async def main():
     # 1. Configure the LLM
-    # Ensure OPENAI_API_KEY is set in your environment
     client = AsyncOpenAI()
     llm = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
 
     # 2. Define Agent Options
     agent_options = RecursiveAgentOptions(
         llm=llm,
-        tools=[brave_web_search], # List of available tools
-        tools_dict={"web_search": brave_web_search, "brave_web_search": brave_web_search}, # Mapping for the LLM to identify tools
-        task_limits=TaskLimit.from_array([2, 1, 0]), # Max 2 subtasks at layer 0, 1 at layer 1, 0 at layer 2
-        allow_search=True, # Allow agent to use search tools if available
-        allow_tools=True, # Allow agent to use any provided tools
-        mcp_servers=[], # Meta-Cognitive Process servers (optional)
-        # You can also specify callbacks like on_task_executed, pre_task_executed
+        tools=[brave_web_search],
+        tools_dict={"web_search": brave_web_search},
+        task_limits=TaskLimit.from_array([2, 1, 0]), # Max 2 subtasks, then 1, then 0
     )
 
-    # 3. Create the Agent
-    task_description = "Research the benefits of renewable energy sources and summarize them."
-    user_instructions = "Focus on solar and wind power. Keep the summary concise."
-
+    # 3. Create and Run the Agent
     agent = RecursiveAgent(
-        task=task_description,
-        u_inst=user_instructions,
+        task="Research the benefits of renewable energy sources and summarize them.",
+        u_inst="Focus on solar and wind power. Keep the summary concise.",
         agent_options=agent_options,
-        # task_type_override can be 'research', 'search', 'basic', 'text/reasoning'
     )
-
-    # 4. Run the Agent
-    try:
-        print(f"Starting agent for task: {task_description}")
-        result = await agent.run()
-        print("\nFinal Result:")
-        print(result)
-        print(f"\nEstimated Cost: ${agent.cost:.4f}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    result = await agent.run()
+    print(result)
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## `RecursiveAgent`
+### `RecursiveAgentOptions`
 
-The `RecursiveAgent` is initialized with the following key parameters:
+This Pydantic model holds the configuration for a `RecursiveAgent`. Key fields include:
+-   `llm`, `tools`, `tools_dict`, `task_limits`.
+-   `merger`: The strategy for merging results from subtasks (`LLMMerger`, `AppendMerger`).
+-   `pre_task_executed`, `on_task_executed`: Callbacks for monitoring the agent's lifecycle.
 
--   `task` (str or `TaskObject`): The description of the task to be performed.
--   `u_inst` (str): Specific user instructions to guide the agent.
--   `agent_options` (`RecursiveAgentOptions`): Configuration object for the agent.
--   `tracer` (Optional `opentelemetry.trace.Tracer`): For OpenTelemetry tracing.
--   `tracer_span` (Optional `opentelemetry.trace.Span`): Parent span for tracing.
--   `allow_subtasks` (bool, default `True`): Whether this agent instance is allowed to create subtasks.
--   `current_layer` (int, default `0`): The current recursion depth.
--   `parent` (Optional `RecursiveAgent`): The parent agent, if this is a subtask.
--   `context` (Optional `TaskContext`): Contextual information for the task.
--   `task_type_override` (Optional str): Overrides the default task type (e.g., "research", "basic").
--   `max_fix_attempts` (int, default `2`): How many times to attempt self-correction if verification fails.
+---
 
-The primary method is `await agent.run()`, which executes the task and returns the final result as a string.
+## `DAGAgent`
 
-## `RecursiveAgentOptions`
+The `DAGAgent` provides a more powerful and flexible approach to task execution by modeling the workflow as a Directed Acyclic Graph (DAG). This is ideal for complex scenarios where tasks have intricate dependencies.
 
-This Pydantic model holds the configuration for an agent. Key fields include:
+### Core Concepts (`DAGAgent`)
 
--   `llm` (Any): The language model instance (e.g., `OpenAIModel` from `pydantic-ai`).
--   `tools` (List[Callable]): A list of Python functions that the agent can use.
--   `tools_dict` (Dict[str, Callable]): A dictionary mapping tool names (as the LLM might call them) to the actual tool functions.
--   `task_limits` (`TaskLimit`): Defines the maximum number of subtasks per layer (e.g., `TaskLimit.from_array([3, 2, 1, 0])`).
--   `search_tool` (Any, Optional): A specific tool designated for search operations.
--   `merger` (Any, default `LLMMerger`): Class responsible for merging results from subtasks. Options include `LLMMerger`, `AppendMerger`, `AlgorithmicMerger`.
--   `allow_search` (bool, default `True`): If `True` and a search tool is available, the agent can use it.
--   `allow_tools` (bool, default `False`): If `True`, the agent can use any of the tools provided in the `tools` list.
--   `mcp_servers` (List[`MCPServer`], default `[]`): List of Meta-Cognitive Process server instances.
--   `pre_task_executed`, `on_task_executed`, `on_tool_call_executed` (Callable, Optional): Callbacks for monitoring agent lifecycle events.
-    -   `pre_task_executed(task: str, uuid: str, parent_agent_uuid: Optional[str])`
-    -   `on_task_executed(task: str, uuid: str, result: str, parent_agent_uuid: Optional[str])`
-    -   `on_tool_call_executed(tool_name: str, tool_input: Any, tool_output: Any, task_uuid: str)`
--   `similarity_threshold` (float, default `0.8`): If a subtask is too similar to its parent, it might be executed as a single task instead of further splitting.
--   `align_summaries` (bool, default `True`): Whether to run an additional LLM call to align merged summaries with the original task and user instructions.
--   `max_fix_attempts` (int, default `2`): Default number of self-correction attempts if a task fails verification.
+-   **`TaskRegistry`**: The central hub for a `DAGAgent`'s operation. It holds all tasks, documents, and their states (e.g., pending, running, complete). You initialize a registry and populate it with initial data and root tasks.
+-   **`Task`**: A Pydantic model representing a single node in the graph. Each task has a unique ID, a description, a status, and a set of dependencies on other tasks.
+-   **Hybrid Planning**: The `DAGAgent` uses a two-stage planning process:
+    1.  **Initial Planning (Top-Down)**: When a task is marked with `needs_planning=True`, a "planner" agent creates an initial, high-level execution plan, breaking the root task into several sub-tasks with defined dependencies.
+    2.  **Adaptive Decomposition (Bottom-Up)**: During execution, a task can be flagged with `can_request_new_subtasks=True`. If such a task is still too complex, an "explorer" agent can propose a new set of more granular sub-tasks. These are then reviewed and integrated into the main graph.
 
-## Tools
+### Getting Started with `DAGAgent`
 
-Tools are standard Python functions that the agent can choose to execute.
+Here is a typical workflow for using the `DAGAgent`:
 
--   **Signature**: Tools should be well-documented with type hints and clear docstrings, especially the first line of the docstring, as this is often what the LLM uses to understand the tool's purpose.
--   **Registration**: Provide tools to `RecursiveAgentOptions` via the `tools` list and `tools_dict`.
-    -   `tools`: A list of the callable functions.
-    -   `tools_dict`: A dictionary where keys are names the LLM might use to refer to the tool (e.g., "web_search", "python_executor") and values are the corresponding functions.
--   **Example Tool (`brave_web_search`)**:
-    ```python
-    from llm_agent_x.tools.brave_web_search import brave_web_search
-    # ...
-    agent_options = RecursiveAgentOptions(
-        # ...
-        tools=[brave_web_search],
-        tools_dict={"web_search": brave_web_search, "brave_web_search": brave_web_search},
-        allow_search=True, # Important for search tools
-        allow_tools=True   # General tool allowance
-    )
-    ```
--   **Python Execution (`exec_python`)**:
-    LLM Agent X includes an `exec_python` tool for executing Python code.
-    To enable it:
-    ```python
-    from llm_agent_x.tools.exec_python import exec_python
-    # ...
-    agent_options = RecursiveAgentOptions(
-        # ...
-        tools=[brave_web_search, exec_python], # Add exec_python
-        tools_dict={
-            "web_search": brave_web_search,
-            "exec_python": exec_python,
-            "exec": exec_python # Alias
-        },
-        allow_tools=True
-    )
-    ```
-    When using `exec_python`, it's highly recommended to also set up and use the [Python Sandbox](./sandbox.md) for security. The `exec_python` tool can be configured to use it.
-
-## Callbacks
-
-You can hook into the agent's lifecycle using callbacks defined in `RecursiveAgentOptions`:
-
--   `pre_task_executed(task: str, uuid: str, parent_agent_uuid: Optional[str])`: Called before a task (or subtask) starts execution.
--   `on_task_executed(task: str, uuid: str, result: str, parent_agent_uuid: Optional[str])`: Called after a task (or subtask) finishes execution.
--   `on_tool_call_executed(tool_name: str, tool_input: Any, tool_output: Any, task_uuid: str)`: Called after a tool is used by the agent.
-
-Example:
 ```python
-def my_task_tracker(task, uuid, result, parent_uuid):
-    print(f"Task Completed (UUID: {uuid}): {task} -> Result: {result[:50]}...")
+import asyncio
+from llm_agent_x.agents.dag_agent import DAGAgent, TaskRegistry, Task
+from llm_agent_x.tools.brave_web_search import brave_web_search # Example tool
 
-agent_options = RecursiveAgentOptions(
-    # ... other options
-    on_task_executed=my_task_tracker
-)
+async def run_dag_agent():
+    # 1. Initialize the Task Registry
+    registry = TaskRegistry()
+
+    # 2. Add Initial Data (Optional)
+    registry.add_document(
+        "Financial_Report_Q1",
+        "Q1 revenue was $1.2M with a profit of $200k."
+    )
+    registry.add_document(
+        "Market_Analysis_Q1",
+        "Competitor A launched a new product, impacting our market share by 5%."
+    )
+
+    # 3. Define the Root Task
+    root_task = Task(
+        id="ROOT_Q1_BRIEFING",
+        desc="Create a comprehensive investor briefing for Q1. First, plan to analyze financial reports and market data. Then, synthesize the findings into a summary.",
+        needs_planning=True,
+    )
+    registry.add_task(root_task)
+
+    # 4. Initialize and Configure the DAGAgent
+    agent = DAGAgent(
+        registry=registry,
+        llm_model="gpt-4o-mini",
+        tools=[brave_web_search]
+    )
+
+    # 5. Run the Agent
+    await agent.run()
+
+    # 6. Retrieve the Final Result
+    final_result_task = registry.tasks.get("ROOT_Q1_BRIEFING")
+    if final_result_task and final_result_task.status == 'complete':
+        print("\n--- Agent's Final Report ---")
+        print(final_result_task.result)
+    else:
+        print(f"Agent failed to complete the root task. Status: {final_result_task.status}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-## Error Handling
+### `TaskRegistry`
 
-The `agent.run()` method can raise `TaskFailedException` if a task fails critically after exhausting retries or if an unrecoverable error occurs. It's good practice to wrap the `run()` call in a `try...except` block.
+The `TaskRegistry` is the cornerstone of the `DAGAgent`.
 
-## Advanced: Task Types and Merging
+-   `registry.add_task(task: Task)`: Adds a new task to the registry.
+-   `registry.add_document(name: str, content: dict) -> str`: Adds a data source as a completed task. Returns the unique ID of the document task.
+-   `registry.add_dependency(task_id: str, dep_id: str)`: Manually creates a dependency between two tasks.
 
--   **Task Types**: The `task_type_override` parameter in `RecursiveAgent` (or `type` in `TaskObject`) can influence how the agent approaches a task (e.g., "research", "basic", "search"). "basic" tasks are often simpler and may not involve extensive web searching or complex summarization.
--   **Merging Strategies**: When subtasks complete, their results need to be merged. The `merger` option in `RecursiveAgentOptions` controls this:
-    -   `LLMMerger` (default): Uses an LLM to synthesize a coherent summary from subtask results.
-    -   `AppendMerger`: Simply concatenates the results from subtasks.
-    -   `AlgorithmicMerger`: A more structured, non-LLM based approach to merging (details may vary based on implementation).
+### `Task` Model
 
-## Tracing with OpenTelemetry
+The `Task` model has several key fields for controlling execution:
 
-If you provide a `tracer` and `tracer_span` to `RecursiveAgent`, it will create spans for its operations, allowing you to visualize the execution flow in distributed tracing systems like Jaeger or Arize Phoenix.
+-   `id` (str): A unique identifier for the task.
+-   `desc` (str): The description of what needs to be done.
+-   `deps` (Set[str]): A set of other task IDs that this task depends on.
+-   `status` (str): The current lifecycle status (e.g., `pending`, `running`, `complete`, `failed`).
+-   `result` (Optional[str]): The output of the task once completed.
+-   `needs_planning` (bool): If `True`, the agent will first create a sub-plan to execute this task.
+-   `can_request_new_subtasks` (bool): If `True`, the agent can propose new, more granular sub-tasks during execution if it deems it necessary.
 
-This API provides a flexible way to incorporate LLM Agent X's recursive reasoning and tool use into various Python applications. Remember to manage API keys and other sensitive configurations securely, typically through environment variables.Tool output for `create_file_with_block`:
+---
+
+## Common Concepts
+
+### Tools
+
+Both `RecursiveAgent` and `DAGAgent` can be equipped with tools. Tools are standard Python functions that the agent can choose to execute to gather information or perform actions.
+
+-   **Signature**: Tools should be well-documented with type hints and clear docstrings.
+-   **Registration**:
+    -   For `RecursiveAgent`, provide tools to `RecursiveAgentOptions` via the `tools` list and `tools_dict`.
+    -   For `DAGAgent`, provide a list of tool functions to the constructor via the `tools` argument.
+
+### Error Handling
+
+Both agents can fail. It's good practice to wrap the `agent.run()` call in a `try...except` block to handle any exceptions gracefully.
+
+### Tracing with OpenTelemetry
+
+Both agents are instrumented with OpenTelemetry. If you configure an OpenTelemetry tracer, you can visualize the execution flow in compatible systems like Jaeger or Arize Phoenix.
