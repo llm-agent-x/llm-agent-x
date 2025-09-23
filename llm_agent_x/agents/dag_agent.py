@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from hashlib import md5
 from os import getenv
-from typing import Set, Dict, Any, Optional, List, Tuple, Union
+from typing import Set, Dict, Any, Optional, List, Tuple, Union, get_origin, get_args  # Added get_origin, get_args
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
@@ -277,12 +277,31 @@ class DAGAgent:
             t.agent_role_paused = agent_role_name  # Store which agent role asked the question
             t.status = "waiting_for_user_response"
             return True, None  # Indicate paused
-        elif isinstance(actual_output, expected_output_type):
-            return False, actual_output  # Not paused, here's the normal output
         else:
-            logger.warning(
-                f"Task [{t.id}] received unexpected output type from agent. Expected {expected_output_type.__name__} or UserQuestion, got {type(actual_output).__name__}.")
-            return False, actual_output
+            # Safely check if actual_output matches the expected_output_type,
+            # especially for generic types like List[X] or Union[X,Y]
+            is_type_match = False
+            origin_type = get_origin(
+                expected_output_type)  # e.g. list from List[X], UnionType from Union[X,Y], or None for non-generics
+
+            if origin_type is Union:  # Handle Union types
+                # Check if actual_output is an instance of any type within the Union
+                is_type_match = any(isinstance(actual_output, arg) for arg in get_args(expected_output_type))
+            elif origin_type is not None:
+                # This means expected_output_type is a generic type like List[ProposedSubtask] (origin_type will be 'list')
+                # Check if actual_output is an instance of the origin type (e.g., list)
+                # Pydantic-AI handles the inner type validation during deserialization to actual_output
+                is_type_match = isinstance(actual_output, origin_type)
+            else:
+                # Not a generic type (e.g., BaseModel, str), so direct isinstance check is fine
+                is_type_match = isinstance(actual_output, expected_output_type)
+
+            if is_type_match:
+                return False, actual_output  # Not paused, here's the normal output
+            else:
+                logger.warning(
+                    f"Task [{t.id}] received unexpected output type from agent. Expected {str(expected_output_type)} or UserQuestion, got {type(actual_output).__name__}.")
+                return False, actual_output
 
     async def run(self):
         with self.tracer.start_as_current_span("DAGAgent.run") as root_span:

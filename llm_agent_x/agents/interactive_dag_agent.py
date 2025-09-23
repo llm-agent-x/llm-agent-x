@@ -5,7 +5,7 @@ import os
 import threading
 import uuid
 from collections import deque
-from typing import List, Tuple, Union, Dict, Any, Optional
+from typing import List, Tuple, Union, Dict, Any, Optional, get_origin, get_args  # Added get_origin, get_args
 
 import pika
 from opentelemetry import trace
@@ -103,12 +103,31 @@ class InteractiveDAGAgent(DAGAgent):
             t.status = "waiting_for_user_response"
             self._broadcast_state_update(t)
             return True, None
-        elif isinstance(actual_output, expected_output_type):
-            return False, actual_output
         else:
-            logger.warning(
-                f"Task [{t.id}] received unexpected output type from agent. Expected {expected_output_type.__name__} or UserQuestion, got {type(actual_output).__name__}.")
-            return False, actual_output
+            # Safely check if actual_output matches the expected_output_type,
+            # especially for generic types like List[X] or Union[X,Y]
+            is_type_match = False
+            origin_type = get_origin(
+                expected_output_type)  # e.g. list from List[X], UnionType from Union[X,Y], or None for non-generics
+
+            if origin_type is Union:  # Handle Union types
+                # Check if actual_output is an instance of any type within the Union
+                is_type_match = any(isinstance(actual_output, arg) for arg in get_args(expected_output_type))
+            elif origin_type is not None:
+                # This means expected_output_type is a generic type like List[ProposedSubtask] (origin_type will be 'list')
+                # Check if actual_output is an instance of the origin type (e.g., list)
+                # Pydantic-AI handles the inner type validation during deserialization to actual_output
+                is_type_match = isinstance(actual_output, origin_type)
+            else:
+                # Not a generic type (e.g., BaseModel, str), so direct isinstance check is fine
+                is_type_match = isinstance(actual_output, expected_output_type)
+
+            if is_type_match:
+                return False, actual_output
+            else:
+                logger.warning(
+                    f"Task [{t.id}] received unexpected output type from agent. Expected {str(expected_output_type)} or UserQuestion, got {type(actual_output).__name__}.")
+                return False, actual_output
 
     def _listen_for_directives_target(self):
         """
@@ -118,7 +137,8 @@ class InteractiveDAGAgent(DAGAgent):
         logger.info("Consumer thread starting: Connecting to RabbitMQ for directives...")
         try:
             # Establish an independent connection for this thread
-            self._consumer_connection_for_thread = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
+            self._consumer_connection_for_thread = pika.BlockingConnection(
+                pika.ConnectionParameters(RABBITMQ_HOST))
             self._consumer_channel_for_thread = self._consumer_connection_for_thread.channel()
             self._consumer_channel_for_thread.queue_declare(queue=self.DIRECTIVES_QUEUE, durable=True)
             self._consumer_channel_for_thread.basic_qos(prefetch_count=1)
@@ -137,7 +157,8 @@ class InteractiveDAGAgent(DAGAgent):
                         message)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
 
-            self._consumer_channel_for_thread.basic_consume(queue=self.DIRECTIVES_QUEUE, on_message_callback=callback)
+            self._consumer_channel_for_thread.basic_consume(queue=self.DIRECTIVES_QUEUE,
+                                                            on_message_callback=callback)
             logger.info("Consumer thread: Starting to consume directives...")
 
             # Keep consuming until instructed to shut down
@@ -239,7 +260,8 @@ class InteractiveDAGAgent(DAGAgent):
                 task.status = "pending"
                 logger.info(f"Task {task_id} received answer to question: {payload[:50]}...")
             else:
-                logger.warning(f"Task {task_id} not waiting for a question, ignoring ANSWER_QUESTION directive.")
+                logger.warning(
+                    f"Task {task_id} not waiting for a question, ignoring ANSWER_QUESTION directive.")
 
         if task.status != original_status or command == "MANUAL_OVERRIDE" or command == "ANSWER_QUESTION":
             self._broadcast_state_update(task)
@@ -259,7 +281,8 @@ class InteractiveDAGAgent(DAGAgent):
         logger.info(f"Cascading invalidation will reset tasks: {dependents}")
         for tid in dependents:
             task = self.registry.tasks[tid]
-            if task.status in ["complete", "failed", "running", "paused_by_human", "waiting_for_user_response",
+            if task.status in ["complete", "failed", "running", "paused_by_human",
+                               "waiting_for_user_response",
                                "planning", "proposing", "waiting_for_children"]:
                 task.status = "pending"
                 task.result = None
@@ -285,12 +308,14 @@ class InteractiveDAGAgent(DAGAgent):
         try:
             self._publisher_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
             self._publish_channel = self._publisher_connection.channel()
-            self._publish_channel.exchange_declare(exchange=self.STATE_UPDATES_EXCHANGE, exchange_type='fanout')
+            self._publish_channel.exchange_declare(exchange=self.STATE_UPDATES_EXCHANGE,
+                                                   exchange_type='fanout')
             self._publish_channel.queue_declare(queue=self.DIRECTIVES_QUEUE, durable=True)
             logger.info("Publisher RabbitMQ connection and channel initialized.")
         except Exception as e:
-            logger.critical(f"Failed to initialize publisher RabbitMQ connection, agent cannot communicate state: {e}",
-                            exc_info=True)
+            logger.critical(
+                f"Failed to initialize publisher RabbitMQ connection, agent cannot communicate state: {e}",
+                exc_info=True)
             self._shutdown_event.set()  # Signal consumer thread to stop
             raise  # Propagate critical error to prevent agent from running silently.
 
@@ -307,7 +332,8 @@ class InteractiveDAGAgent(DAGAgent):
                         await self._handle_directive(directive)
 
                     all_task_ids = set(self.registry.tasks.keys())
-                    executable_statuses = {'pending', 'running', 'planning', 'proposing', 'waiting_for_children'}
+                    executable_statuses = {'pending', 'running', 'planning', 'proposing',
+                                           'waiting_for_children'}
                     non_executable_tasks = {t.id for t in self.registry.tasks.values() if
                                             t.status not in executable_statuses}
 
@@ -335,7 +361,8 @@ class InteractiveDAGAgent(DAGAgent):
                             ready_to_run_ids.add(tid)
                         # Condition 3: Parent task waiting for children, and all children are complete/failed
                         elif task.status == 'waiting_for_children' and \
-                                all(self.registry.tasks[c].status in ['complete', 'failed'] for c in task.children):
+                                all(self.registry.tasks[c].status in ['complete', 'failed'] for c in
+                                    task.children):
                             if any(self.registry.tasks[c].status == 'failed' for c in task.children):
                                 task.status, task.result = "failed", "A child task failed, cannot synthesize."
                                 self._broadcast_state_update(task)
@@ -368,7 +395,8 @@ class InteractiveDAGAgent(DAGAgent):
                         else:
                             # Agent is idle, but consumer thread is still alive and waiting for external directives.
                             # So, we should continue looping and waiting.
-                            logger.debug("Agent idle, but consumer thread active. Waiting for directives...")
+                            logger.debug(
+                                "Agent idle, but consumer thread active. Waiting for directives...")
 
                     for tid in ready:
                         self.inflight.add(tid)
@@ -376,7 +404,8 @@ class InteractiveDAGAgent(DAGAgent):
                         self._broadcast_state_update(self.registry.tasks[tid])
 
                     if self.task_futures:
-                        done, pending_futures = await asyncio.wait(list(self.task_futures.values()), timeout=0.1,
+                        done, pending_futures = await asyncio.wait(list(self.task_futures.values()),
+                                                                   timeout=0.1,
                                                                    return_when=asyncio.FIRST_COMPLETED)
                         for fut in done:
                             tid = next((tid for tid, f in self.task_futures.items() if f == fut), None)
@@ -400,7 +429,8 @@ class InteractiveDAGAgent(DAGAgent):
                         global_resolver_ctx_id = "GLOBAL_RESOLVER"
                         if global_resolver_ctx_id not in self.registry.tasks:
                             self.registry.add_task(
-                                Task(id=global_resolver_ctx_id, desc="Internal task for global conflict resolution.",
+                                Task(id=global_resolver_ctx_id,
+                                     desc="Internal task for global conflict resolution.",
                                      status="pending"))
                         global_resolver_task = self.registry.tasks[global_resolver_ctx_id]
 
