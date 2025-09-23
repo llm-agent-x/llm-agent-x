@@ -111,6 +111,8 @@ class Task(BaseModel):
     otel_context: Optional[Any] = None
     span: Optional[Span] = None
 
+    human_directive: Optional[str] = Field(None, description="A direct, corrective instruction from the operator.")
+
     class Config:
         arbitrary_types_allowed = True
 

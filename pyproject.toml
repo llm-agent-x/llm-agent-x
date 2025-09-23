@@ -8,7 +8,7 @@ readme = "readme.md"
 packages = [{include = "llm_agent_x"}]
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.14"
+python = ">=3.10,<3.14"
 requests = "*"
 pydantic = "^2.0"
 langchain-openai = "^0.3.18"
@@ -35,9 +35,14 @@ astunparse = "^1.6.3"
 black = "^25.1.0"
 nest-asyncio = "^1.6.0"
 asyncio-throttle = "^1.0.2"
+pika = "^1.3.2"
+python-socketio = "^5.13.0"
+aio-pika = "^9.5.7"
 
 [tool.poetry.scripts]
 llm-agent-x = "llm_agent_x.cli:main"
+llm-agent-x-gateway = "llm_agent_x.entrypoints.gateway:main"
+llm-agent-x-worker = "llm_agent_x.entrypoints.worker:main"
 llm-agent-x-eval = "llm_agent_x.cli_evaluate:main"
 
 [build-system]
