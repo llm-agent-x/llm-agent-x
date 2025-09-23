@@ -39,9 +39,21 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
                 <span className="bg-blue-900/50 text-blue-300 p-2 rounded-md block animate-pulse">{task.human_directive}</span>
             }/>
         )}
+        {task.current_question && (
+            <DetailRow label="Agent's Question" value={
+                <span className="bg-orange-900/50 text-orange-300 p-2 rounded-md block animate-pulse">
+                    Priority {task.current_question.priority}/10: {task.current_question.question}
+                </span>
+            }/>
+        )}
+         {task.user_response && (
+            <DetailRow label="Your Last Response" value={
+                <span className="bg-green-900/50 text-green-300 p-2 rounded-md block">{task.user_response}</span>
+            }/>
+        )}
       </dl>
 
-      <CommandPalette taskId={task.id} taskStatus={task.status} />
+      <CommandPalette taskId={task.id} taskStatus={task.status} currentQuestion={task.current_question} />
     </div>
   );
 };

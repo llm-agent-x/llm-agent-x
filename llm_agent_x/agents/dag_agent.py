@@ -1,10 +1,11 @@
+# llm_agent_x/agents/dag_agent.py
 import asyncio
 import uuid
 import logging
 from collections import defaultdict, deque
 from hashlib import md5
 from os import getenv
-from typing import Set, Dict, Any, Optional, List, Tuple
+from typing import Set, Dict, Any, Optional, List, Tuple, Union
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
@@ -50,6 +51,16 @@ class RetryDecision(BaseModel):
     next_step_suggestion: str = Field(
         description="A specific, actionable suggestion for the next attempt to improve the result.")
 
+class UserQuestion(BaseModel):
+    """
+    A specific output type for agents to ask clarifying questions to the human operator.
+    The task will pause until the human provides an answer.
+    """
+    question: str = Field(description="The clarifying question to ask the human operator.")
+    priority: int = Field(description="A numerical score from 1 (lowest) to 10 (highest) representing the urgency or criticality of getting an answer.", ge=1, le=10)
+    details: Dict[str, Any] = Field(default_factory=dict, description="Any additional context or structured data relevant to the question.")
+    # task_id is implicitly available from the task context, no need to include here.
+
 
 # Models for Initial, Top-Down Planning (The "Architect")
 class Dependency(BaseModel):
@@ -91,7 +102,7 @@ class Task(BaseModel):
     id: str
     desc: str
     deps: Set[str] = Field(default_factory=set)
-    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed
+    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, paused_by_human, waiting_for_user_response
     result: Optional[str] = None
     cost: float = 0.0
     parent: Optional[str] = None
@@ -112,6 +123,9 @@ class Task(BaseModel):
     span: Optional[Span] = None
 
     human_directive: Optional[str] = Field(None, description="A direct, corrective instruction from the operator.")
+    current_question: Optional[UserQuestion] = Field(None, description="The question an agent is currently asking the human operator.")
+    user_response: Optional[str] = Field(None, description="The human operator's response to an agent's question.")
+
 
     class Config:
         arbitrary_types_allowed = True
@@ -145,7 +159,7 @@ class TaskRegistry:
     def _print_node(self, task: Task, level: int):
         prefix = "  " * level
         status_color = {"complete": "✅", "failed": "❌", "running": "⏳", "planning": "📝", "proposing": "💡",
-                        "waiting_for_children": "⏸️", "pending": "📋"}
+                        "waiting_for_children": "⏸️", "pending": "📋", "paused_by_human": "🛑", "waiting_for_user_response": "❓"}
         status_icon = status_color.get(task.status, "❓")
         logger.info(f"{prefix}- {status_icon} {task.id[:8]}: {task.status.upper()} | {task.desc[:60]}...")
         for child_id in task.children:
@@ -182,35 +196,36 @@ class DAGAgent:
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
 
         # --- AGENT ROLES ---
+        # Modify output_type to include UserQuestion
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
-            output_type=ExecutionPlan,
+            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true. If you need a crucial piece of information from the human manager to proceed with planning, you may output a `UserQuestion`.",
+            output_type=Union[ExecutionPlan, UserQuestion],
             tools=self.tools,
         )
-        self.cycle_breaker = Agent(
+        self.cycle_breaker = Agent( # Cycle breaker rarely needs to ask questions, but included for completeness
             model=llm_model,
             system_prompt=(
                 "You are a logical validation expert. Your task is to analyze an execution plan and resolve any circular dependencies (cycles). "
                 "A cycle is when Task A depends on B, and Task B depends on A (directly or indirectly). "
                 "If you find a cycle, you must remove the *least critical* dependency to break it. Use the 'reason' field for each dependency to decide. "
-                "Your final output MUST be the complete, corrected ExecutionPlan. If there are no cycles, return the original plan unchanged."
+                "Your final output MUST be the complete, corrected ExecutionPlan. If there are no cycles, return the original plan unchanged. If you need a crucial piece of information from the human manager to resolve a complex cycle, you may output a `UserQuestion`."
             ),
-            output_type=ExecutionPlan
+            output_type=Union[ExecutionPlan, UserQuestion]
         )
         self.adaptive_decomposer = Agent(
             model=llm_model,
-            system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
-            output_type=List[ProposedSubtask],
+            system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is. If you need a crucial piece of information from the human manager to proceed with decomposition, you may output a `UserQuestion`.",
+            output_type=Union[List[ProposedSubtask], UserQuestion],
             tools=self.tools,
         )
-        self.conflict_resolver = Agent(
+        self.conflict_resolver = Agent( # Conflict resolver rarely needs to ask questions, but included for completeness
             model=llm_model,
-            system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
-            output_type=ProposalResolutionPlan
+            system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks. If you need a crucial piece of information from the human manager to resolve a conflict, you may output a `UserQuestion`.",
+            output_type=Union[ProposalResolutionPlan, UserQuestion]
         )
-        self.executor = Agent(model=llm_model, output_type=str, tools=self.tools)
-        self.verifier = Agent(model=llm_model, output_type=verification)
+        self.executor = Agent(model=llm_model, output_type=Union[str, UserQuestion], tools=self.tools)
+        self.verifier = Agent(model=llm_model, output_type=Union[verification, UserQuestion])
         self.retry_analyst = Agent(
             model=llm_model,
             system_prompt=(
@@ -218,9 +233,9 @@ class DAGAgent:
                 "You will be given the task's original goal and a history of its verification scores. "
                 "If the scores are generally increasing and approaching the success threshold of 6, it is worth retrying. "
                 "If scores are stagnant or decreasing, it is not. "
-                "Crucially, you must provide a concrete and actionable 'next_step_suggestion'."
+                "Crucially, you must provide a concrete and actionable 'next_step_suggestion'. If you need a crucial piece of information from the human manager to make a decision, you may output a `UserQuestion`."
             ),
-            output_type=RetryDecision,
+            output_type=Union[RetryDecision, UserQuestion],
         )
 
     def _add_llm_data_to_span(self, span: Span, agent_res: AgentRunResult, task: Task):
@@ -230,18 +245,45 @@ class DAGAgent:
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
         task.cost += cost
 
+    async def _handle_agent_output(self, ctx: TaskContext, agent_res: AgentRunResult, expected_output_type: Any) -> Tuple[bool, Any]:
+        """
+        Processes an agent's output. If it's a UserQuestion, pauses the task.
+        Returns (is_paused, actual_output).
+        """
+        t = ctx.task
+        self._add_llm_data_to_span(t.span, agent_res, t)
+        actual_output = agent_res.output
+
+        if isinstance(actual_output, UserQuestion):
+            logger.info(f"Task [{t.id}] asking human question (Priority: {actual_output.priority}): {actual_output.question[:80]}...")
+            t.current_question = actual_output
+            t.status = "waiting_for_user_response"
+            return True, None # Indicate paused
+        elif isinstance(actual_output, expected_output_type):
+            return False, actual_output # Not paused, here's the normal output
+        else:
+            # This handles cases where the LLM produces a valid Pydantic model, but not the expected one
+            # e.g., if we expect ExecutionPlan but the LLM just returns UserQuestion.
+            # The type Union[ExecutionPlan, UserQuestion] handles this in Pydantic-AI.
+            # This 'else' block would catch if it produced something completely unexpected.
+            # For robust production code, consider raising an error or logging a warning here
+            # if the output is not UserQuestion AND not expected_output_type.
+            logger.warning(f"Task [{t.id}] received unexpected output type from agent. Expected {expected_output_type.__name__} or UserQuestion, got {type(actual_output).__name__}.")
+            return False, actual_output
+
+
     async def run(self):
         with self.tracer.start_as_current_span("DAGAgent.run") as root_span:
             while True:
                 all_task_ids = set(self.registry.tasks.keys())
-                completed_or_failed = {t.id for t in self.registry.tasks.values() if t.status in ('complete', 'failed')}
+                completed_or_failed_or_paused = {t.id for t in self.registry.tasks.values() if t.status in ('complete', 'failed', 'paused_by_human', 'waiting_for_user_response')}
 
-                for tid in all_task_ids - completed_or_failed:
+                for tid in all_task_ids - completed_or_failed_or_paused:
                     task = self.registry.tasks[tid]
                     if any(self.registry.tasks.get(d, {}).status == "failed" for d in task.deps):
                         task.status, task.result = "failed", "Upstream dependency failed."
 
-                pending_tasks = all_task_ids - completed_or_failed
+                pending_tasks = all_task_ids - completed_or_failed_or_paused
                 ready_to_run_ids = {
                     tid for tid in pending_tasks if
                     self.registry.tasks[tid].status == "pending" and
@@ -255,7 +297,11 @@ class DAGAgent:
                         if any(self.registry.tasks[c].status == 'failed' for c in task.children):
                             task.status, task.result = "failed", "A child task failed, cannot synthesize."
                         else:
+                            # Child tasks completed, parent is ready to run (e.g., synthesize)
                             ready_to_run_ids.add(tid)
+                            # Also important: reset its status to pending so it can be picked up
+                            task.status = "pending" # Ensures _run_taskflow picks it up for execution/synthesis
+
 
                 ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
 
@@ -274,7 +320,8 @@ class DAGAgent:
 
                 if not self.task_futures: continue
 
-                done, _ = await asyncio.wait(self.task_futures.values(), return_when=asyncio.ALL_COMPLETED)
+                # Wait for any task to complete or for a short timeout to check for new directives/tasks
+                done, _ = await asyncio.wait(self.task_futures.values(), return_when=asyncio.FIRST_COMPLETED, timeout=0.1)
 
                 for fut in done:
                     tid = next((tid for tid, f in self.task_futures.items() if f == fut), None)
@@ -283,6 +330,8 @@ class DAGAgent:
                         del self.task_futures[tid]
                         try:
                             fut.result()
+                        except asyncio.CancelledError:
+                            logger.info(f"Task [{tid}] was cancelled.")
                         except Exception as e:
                             logger.error(f"Task [{tid}] future failed: {e}")
 
@@ -291,38 +340,54 @@ class DAGAgent:
 
     async def _run_global_resolution(self):
         logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
-        print("PROPOSED TASKS")
-        print(self.proposed_tasks_buffer)
         approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
+        parent_map = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer} # store parent_id
+
         if len(approved_proposals) > self.global_proposal_limit:
             logger.warning(
-                f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver.")
-            prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
-                           approved_proposals]
+                f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver."
+            )
+            prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in approved_proposals]
             resolver_res = await self.conflict_resolver.run(
-                user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}")
-            approved_proposals = resolver_res.output.approved_tasks
+                user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
+            )
+            is_paused, resolved_plan = await self._handle_agent_output(
+                ctx=TaskContext("global_resolver", self.registry), # Dummy context for logging cost
+                agent_res=resolver_res,
+                expected_output_type=ProposalResolutionPlan
+            )
+            if is_paused:
+                # The conflict resolver asked a question, we cannot proceed with global resolution now.
+                # This is an edge case, but we should handle it. The task that triggered this
+                # would be the 'global_resolver' (a meta-task). For simplicity, we just
+                # clear the buffer and wait for the human. The proposals will be re-generated later.
+                logger.warning("Conflict resolver paused for human input. Discarding current proposals for now.")
+                self.proposed_tasks_buffer = [] # Discard for now, they might be proposed again later.
+                return
+            approved_proposals = resolved_plan.approved_tasks
 
         logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
-        self._commit_proposals(approved_proposals)
+        self._commit_proposals(approved_proposals, parent_map)
         self.proposed_tasks_buffer = []
 
-    def _commit_proposals(self, approved_proposals: List[ProposedSubtask]):
-        local_to_global_id_map, proposal_to_parent_map = {}, {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
+    def _commit_proposals(self, approved_proposals: List[ProposedSubtask], proposal_to_parent_map: Dict[str, str]):
+        local_to_global_id_map = {}
         for proposal in approved_proposals:
             parent_id = proposal_to_parent_map.get(proposal.local_id)
             if not parent_id: continue
-            new_task = Task(id=str(uuid.uuid4())[:8], desc=proposal.desc, parent=parent_id)
+            new_task = Task(id=str(uuid.uuid4())[:8], desc=proposal.desc, parent=parent_id,
+                            can_request_new_subtasks=False) # Newly proposed tasks don't get dynamic decomposition by default
             self.registry.add_task(new_task)
             self.registry.tasks[parent_id].children.append(new_task.id)
-            self.registry.add_dependency(parent_id, new_task.id)
+            self.registry.add_dependency(parent_id, new_task.id) # Parent will wait for children for synthesis
             local_to_global_id_map[proposal.local_id] = new_task.id
 
         for proposal in approved_proposals:
             new_task_global_id = local_to_global_id_map.get(proposal.local_id)
             if not new_task_global_id: continue
             for dep_local_id in proposal.deps:
-                dep_global_id = local_to_global_id_map.get(dep_local_id)
+                dep_global_id = local_to_global_id_map.get(dep_local_id) or (
+                    dep_local_id if dep_local_id in self.registry.tasks else None) # Check if it's an existing global ID
                 if dep_global_id: self.registry.add_dependency(new_task_global_id, dep_global_id)
 
     async def _run_taskflow(self, tid: str):
@@ -331,36 +396,58 @@ class DAGAgent:
         with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}") as span:
             t.span = span
             span.set_attribute("dag.task.id", t.id)
-            span.set_attribute("dag.task.status", t.status)
+            span.set_attribute("dag.task.status", t.status) # Initial status for the span
+
+            # If the task is paused by human or waiting for user response, just return.
+            # It will be picked up again when its status changes.
+            if t.status in ["paused_by_human", "waiting_for_user_response"]:
+                logger.info(f"[{t.id}] Task is {t.status}, skipping execution for now.")
+                return
+
             try:
+                # Store parent context for trace continuity if needed within sub-functions
+                otel_ctx_token = otel_context.attach(trace.set_span_in_context(span))
+
                 if t.status == 'waiting_for_children':
-                    t.status = 'running';
+                    # This implies all children have completed, and now this parent needs to synthesize.
+                    # It transitions from 'waiting_for_children' to 'running' for execution.
+                    t.status = 'running'
                     logger.info(f"SYNTHESIS PHASE for [{t.id}].")
                     await self._run_task_execution(ctx)
                 elif t.needs_planning and not t.already_planned:
-                    t.status = 'planning';
+                    t.status = 'planning'
                     logger.info(f"ARCHITECT PHASE for [{t.id}].")
                     await self._run_initial_planning(ctx)
-                    t.already_planned = True
-                    t.status = "waiting_for_children" if t.children else "complete"
+                    # After planning, if it generated children, it waits for them.
+                    # If not, it means the planner decided no subtasks were needed, so it's complete.
+                    if t.status not in ["waiting_for_user_response", "paused_by_human"]:
+                        t.already_planned = True # Only mark as planned if not paused for a question
+                        t.status = "waiting_for_children" if t.children else "complete"
                 elif t.can_request_new_subtasks and t.status != 'proposing':
-                    t.status = 'proposing';
+                    t.status = 'proposing'
                     logger.info(f"EXPLORER PHASE for [{t.id}].")
                     await self._run_adaptive_decomposition(ctx)
-                    t.status = "waiting_for_children"
+                    # After proposing, it will wait for children (if proposals are approved)
+                    if t.status not in ["waiting_for_user_response", "paused_by_human"]:
+                        t.status = "waiting_for_children"
                 else:
-                    t.status = 'running';
+                    # Regular execution (for leaf tasks, or tasks after waiting for children)
+                    t.status = 'running'
                     logger.info(f"WORKER PHASE for [{t.id}].")
                     await self._run_task_execution(ctx)
 
-                if t.status not in ["waiting_for_children", "failed"]: t.status = "complete"
+                # Final status update for the task itself (if not already paused or failed)
+                if t.status not in ["waiting_for_children", "failed", "paused_by_human", "waiting_for_user_response"]:
+                    t.status = "complete"
+
             except Exception as e:
-                span.record_exception(e);
+                span.record_exception(e)
                 span.set_status(trace.Status(StatusCode.ERROR, str(e)))
-                t.status = "failed";
+                t.status = "failed"
                 raise
             finally:
-                span.set_attribute("dag.task.status", t.status)
+                otel_context.detach(otel_ctx_token) # Detach the context
+                span.set_attribute("dag.task.status", t.status) # Final status for the span
 
     async def _run_initial_planning(self, ctx: TaskContext):
         t = ctx.task
@@ -368,17 +455,26 @@ class DAGAgent:
         context = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
         prompt = f"Objective: {t.desc}\n\nAvailable completed data sources:\n{context}"
 
+        # If there's a user response, append it to the prompt and clear it.
+        if t.user_response:
+            prompt += f"\n\n--- HUMAN MANAGER RESPONSE ---\n{t.user_response}\n----------------------------\n"
+            t.user_response = None
+
         plan_res = await self.initial_planner.run(user_prompt=prompt)
-        self._add_llm_data_to_span(t.span, plan_res, t)
-        initial_plan = plan_res.output
+        is_paused, initial_plan = await self._handle_agent_output(
+            ctx=ctx, agent_res=plan_res, expected_output_type=ExecutionPlan
+        )
+        if is_paused: return # Task is paused for user input
 
         if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
             fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
             fixed_plan_res = await self.cycle_breaker.run(user_prompt=fixer_prompt)
-            self._add_llm_data_to_span(t.span, fixed_plan_res, t)
-            plan = fixed_plan_res.output
+            is_paused, plan = await self._handle_agent_output(
+                ctx=ctx, agent_res=fixed_plan_res, expected_output_type=ExecutionPlan
+            )
+            if is_paused: return # Task is paused for user input
         else:
-            plan = initial_plan
+            plan = initial_plan # No subtasks or no issues
 
         if not plan.needs_subtasks: return
 
@@ -403,9 +499,18 @@ class DAGAgent:
         t = ctx.task
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
         prompt = f"Task: {t.desc}\n\nResults from dependencies:\n{t.dep_results}"
+
+        if t.user_response:
+            prompt += f"\n\n--- HUMAN MANAGER RESPONSE ---\n{t.user_response}\n----------------------------\n"
+            t.user_response = None
+
         proposals_res = await self.adaptive_decomposer.run(user_prompt=prompt)
-        self._add_llm_data_to_span(t.span, proposals_res, t)
-        if proposals := proposals_res.output:
+        is_paused, proposals = await self._handle_agent_output(
+            ctx=ctx, agent_res=proposals_res, expected_output_type=List[ProposedSubtask]
+        )
+        if is_paused: return # Task is paused for user input
+
+        if proposals:
             logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
             for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
 
@@ -426,16 +531,38 @@ class DAGAgent:
             for did, res in dep_results.items():
                 prompt += f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n"
 
+        # Inject human directive if present
+        if t.human_directive:
+            prompt += f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n------------------------------\n"
+            t.human_directive = None # Clear after use
+
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
             exec_res = await self.executor.run(user_prompt=prompt)
-            self._add_llm_data_to_span(t.span, exec_res, t)
-            result = exec_res.output
+            is_paused, result = await self._handle_agent_output(
+                ctx=ctx, agent_res=exec_res, expected_output_type=str
+            )
+            if is_paused: return # Task is paused for user input
+
+            # If the user has provided a response to a previous question asked by THIS agent,
+            # incorporate it and re-run verification (or direct to result).
+            if t.user_response:
+                logger.info(f"[{t.id}] Incorporating human response: {t.user_response[:80]}...")
+                prompt += f"\n\n--- HUMAN MANAGER RESPONSE ---\n{t.user_response}\n----------------------------\n"
+                t.user_response = None  # Clear after use.
+                # To ensure the prompt is re-run, invoke self.executor.run here directly.
+                exec_res = await self.executor.run(user_prompt=prompt)
+                is_paused, result = await self._handle_agent_output(
+                    ctx=ctx, agent_res=exec_res, expected_output_type=str
+                )
+                if is_paused: return  # Task is paused for user input
+
             verify_task_result = await self._verify_task(t, result)
-            is_successful =verify_task_result.get_successful()
+            is_successful = verify_task_result.get_successful()
+
             if is_successful:
-                t.result = result;
+                t.result = result
                 logger.info(f"COMPLETED [{t.id}]");
                 return
 
@@ -444,8 +571,10 @@ class DAGAgent:
                 analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\n" \
                                  f"Score > 5 is a success. Should we retry?"
                 decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt)
-                self._add_llm_data_to_span(t.span, decision_res, t)
-                decision = decision_res.output
+                is_paused, decision = await self._handle_agent_output(
+                    ctx=ctx, agent_res=decision_res, expected_output_type=RetryDecision
+                )
+                if is_paused: return # Task is paused for user input
 
                 if decision.should_retry:
                     t.span.add_event("Grace attempt granted", {"reason": decision.reason})
@@ -460,11 +589,24 @@ class DAGAgent:
 
             prompt += f"\n\n--- PREVIOUS ATTEMPT FAILED ---\nYour last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
 
-    async def _verify_task(self, t: Task, candidate_result: str) -> bool:
+    async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
+
+        if t.user_response: # If there's a user response, it's likely a response to a question asked by verifier itself.
+            ver_prompt += f"\n\n--- HUMAN MANAGER RESPONSE ---\n{t.user_response}\n----------------------------\n"
+            t.user_response = None # Clear after use.
+
         vres = await self.verifier.run(user_prompt=ver_prompt)
-        self._add_llm_data_to_span(t.span, vres, t);
-        vout = vres.output
+        is_paused, vout = await self._handle_agent_output(
+            ctx=TaskContext(t.id, self.registry), agent_res=vres, expected_output_type=verification
+        )
+        if is_paused:
+            # If verifier asks a question, we must pause the *current* execution path.
+            # The execution loop in _run_task_execution will handle this return.
+            # We need to make sure `_run_task_execution` correctly handles the pause.
+            # Returning a dummy verification object for type safety, but the `is_paused` flag is key.
+            return verification(reason="Verifier asked a question, pausing.", message_for_user="", score=0)
+
         t.verification_scores.append(vout.score)
         t.span.set_attribute("verification.score", vout.score);
         t.span.set_attribute("verification.reason", vout.reason)
@@ -493,7 +635,7 @@ if __name__ == "__main__":
         id="ROOT_INVESTOR_BRIEFING",
         desc=("Create a comprehensive investor briefing for Apple's Q2 2024 performance. "
               "First, plan to consolidate all relevant data. Then, synthesize the information into a report. "
-              "Ignore irrelevant data."),
+              "Ignore irrelevant data. If unsure about audience focus, ask the manager."),
         needs_planning=True,
     )
     reg.add_task(root_task)

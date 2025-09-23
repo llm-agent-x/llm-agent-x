@@ -1,6 +1,6 @@
-// app/components/StatusBadge.tsx
+// mission-control-ui/src/app/components/StatusBadge.tsx
 
-import { CheckCircle, XCircle, Loader, PauseCircle, Clock, BrainCircuit, Lightbulb, Combine } from 'lucide-react';
+import { CheckCircle, XCircle, Loader, PauseCircle, Clock, BrainCircuit, Lightbulb, Combine, MessageCircleQuestion } from 'lucide-react'; // Import MessageCircleQuestion
 
 const statusConfig: { [key: string]: { icon: React.ReactNode; color: string; label?: string; } } = {
   pending: { icon: <Clock size={14} />, color: 'bg-gray-500' },
@@ -11,6 +11,7 @@ const statusConfig: { [key: string]: { icon: React.ReactNode; color: string; lab
   planning: { icon: <BrainCircuit size={14} />, color: 'bg-purple-500' },
   proposing: { icon: <Lightbulb size={14} />, color: 'bg-indigo-500' },
   waiting_for_children: { icon: <Combine size={14} />, color: 'bg-teal-500', label: 'Waiting' },
+  waiting_for_user_response: { icon: <MessageCircleQuestion size={14} />, color: 'bg-orange-500', label: 'Question' }, // New status
 };
 
 export const StatusBadge = ({ status }: { status: string }) => {
