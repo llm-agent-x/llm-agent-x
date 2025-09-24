@@ -595,7 +595,7 @@ class DAGAgent:
             f"Objective: {t.desc}",
             f"\n\nAvailable completed data sources:\n{context}",
             f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-            self._get_notebook_tool_guidance(t, "initial_planner")  # Add guidance here
+            self._get_notebook_tool_guidance(t, "initial_planner")
         ]
 
         # Inject human directive if present, *before* passing to LLM
@@ -604,7 +604,7 @@ class DAGAgent:
                 f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None  # Clear after use
 
-        full_prompt = "\n".join(prompt_parts)
+        full_prompt = "\n".join(prompt_parts) # Join at the end
 
         plan_res = await self.initial_planner.run(
             user_prompt=full_prompt,
@@ -675,7 +675,7 @@ class DAGAgent:
                 f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
 
-        full_prompt = "\n".join(prompt_parts)
+        full_prompt = "\n".join(prompt_parts) # Join at the end
 
         proposals_res = await self.adaptive_decomposer.run(
             user_prompt=full_prompt,
@@ -698,34 +698,38 @@ class DAGAgent:
         dep_results = {did: self.registry.tasks[did].result for did in t.deps if
                        self.registry.tasks[did].status == 'complete' and did not in child_results}
 
-        prompt_parts = [
+        prompt_lines = [ # Use a new variable name to avoid confusion with prompt_base
             f"Task: {t.desc}"
         ]
         if child_results:
-            prompt_parts.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
+            prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
             for cid, res in child_results.items():
-                prompt_parts.append(f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n")
+                prompt_lines.append(f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n")
         elif dep_results:
-            prompt_parts.append("\nUse data from dependencies to inform your answer:\n")
+            prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
             for did, res in dep_results.items():
-                prompt_parts.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n")
+                prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n")
 
-        prompt_parts.extend([
-            f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-            self._get_notebook_tool_guidance(t, "executor")  # Add guidance here
-        ])
-
-        prompt_base = "\n".join(prompt_parts)
+        # Join these initial parts to form the base, before notebook and guidance
+        prompt_base_content = "\n".join(prompt_lines)
 
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
 
-            # Start with base prompt and add any current human directive or previous feedback
-            current_prompt = prompt_base
+            # Build current prompt dynamically for each attempt
+            current_prompt_parts = [
+                prompt_base_content, # Start with the generated base content
+                f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
+                self._get_notebook_tool_guidance(t, "executor")
+            ]
+
             if t.human_directive:
-                current_prompt = f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n------------------------------\n" + current_prompt
+                current_prompt_parts.insert(0, # Insert at the beginning to be critical guidance
+                    f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n------------------------------\n")
                 t.human_directive = None  # Clear after use
+
+            current_prompt = "\n".join(current_prompt_parts) # Join all parts
 
             exec_res = await self.executor.run(
                 user_prompt=current_prompt,

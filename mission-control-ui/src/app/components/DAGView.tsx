@@ -99,8 +99,7 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [layoutDirection, setLayoutDirection] = useState<'TB' | 'LR'>('TB'); // Top-Bottom or Left-Right
 
-  const proOptions = { hideAttribution: true }; // Hide React Flow attribution
-
+  const proOptions = { hideAttribution: true, showConnections: true }; // Show connections
   useEffect(() => {
     const newNodes: Node[] = [];
     const newEdges: Edge[] = [];
