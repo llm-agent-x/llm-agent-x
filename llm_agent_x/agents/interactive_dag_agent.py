@@ -38,6 +38,8 @@ class InteractiveDAGAgent(DAGAgent):
 
         # Important: Call super.__init__ first with *base* tools.
         # This will set up agents in DAGAgent._setup_agent_roles with only the initial tools.
+        # Remove min_question_priority as InteractiveDAGAgent's agents will not ask questions
+        kwargs.pop("min_question_priority", None)
         super().__init__(*args, **kwargs)
 
         self.directives_queue = asyncio.Queue()
@@ -72,7 +74,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true. If you need a crucial piece of information from the human manager to proceed with planning, you may output a `UserQuestion`.",
+            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
             output_type=ExecutionPlan,  # MODIFIED: Removed Union[..., UserQuestion]
             tools=self._tools_for_agents,  # Use the internal tools list
         )
@@ -89,7 +91,7 @@ class InteractiveDAGAgent(DAGAgent):
         )
         self.adaptive_decomposer = Agent(
             model=llm_model,
-            system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is. If you need a crucial piece of information from the human manager to proceed with decomposition, you may output a `UserQuestion`.",
+            system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
             output_type=List[ProposedSubtask],  # MODIFIED: Removed Union[..., UserQuestion]
             tools=self._tools_for_agents,  # Use the internal tools list
         )
@@ -98,6 +100,7 @@ class InteractiveDAGAgent(DAGAgent):
             system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
             output_type=ProposalResolutionPlan,
             tools=self._tools_for_agents,  # Use the internal tools list
+            retries=3,
         )
         self.executor = Agent(model=llm_model, output_type=str,
                               tools=self._tools_for_agents)  # MODIFIED: Removed Union[..., UserQuestion]
@@ -345,7 +348,7 @@ class InteractiveDAGAgent(DAGAgent):
             # This directive is still supported for human-initiated answers,
             # but agents will no longer set 'waiting_for_user_response' or 'current_question'.
             # If the UI sends it for a task not explicitly asking, it might be ignored or used as a hint.
-            if task.status == "waiting_for_user_response" and task.current_question:
+            if task.status == "waiting_for_user_response": # MODIFIED: Removed `and task.current_question`
                 task.user_response = payload
                 task.current_question = None
                 task.status = "pending"
@@ -383,8 +386,8 @@ class InteractiveDAGAgent(DAGAgent):
                 task.current_question = None
                 task.last_llm_history = None
                 task.agent_role_paused = None
-                task.shared_notebook = {}  # Clear notebook on reset
-                self._broadcast_state_update(task)
+                task.shared_notebook = {}  # Clear notebook on reset - ADDED
+                self._broadcast_state_update(task) # ADDED
 
     async def run(self):
         # Capture the main event loop reference *before* starting any new threads
@@ -574,7 +577,8 @@ class InteractiveDAGAgent(DAGAgent):
                     logger.info(f"[{t.id}] Resuming {t.agent_role_paused} after human-provided response.")
                     await self._resume_agent_from_question(ctx)
                     # If after resuming, it's still waiting for user response (e.g., asked another question - this should no longer happen for agents), or failed/paused, return.
-                    if t.status in ["waiting_for_user_response", "failed", "paused_by_human", "complete"]:
+                    # MODIFIED: Removed "waiting_for_user_response" from this check
+                    if t.status in ["failed", "paused_by_human", "complete"]:
                         return
                     # If it successfully processed the answer and is now 'pending', let the rest of _run_taskflow handle its transition.
                     t.status = "pending"  # Explicitly set to pending so subsequent `elif` blocks can pick it up
@@ -598,14 +602,16 @@ class InteractiveDAGAgent(DAGAgent):
                     update_status_and_broadcast('planning')
                     await self._run_initial_planning(ctx)
                     # Agents no longer ask questions, so no 'waiting_for_user_response' from agents
-                    if t.status not in ["paused_by_human"]:  # Removed "waiting_for_user_response"
+                    # MODIFIED: Removed "waiting_for_user_response" from this check
+                    if t.status not in ["paused_by_human"]:
                         t.already_planned = True
                         update_status_and_broadcast("waiting_for_children" if t.children else "complete")
                 elif t.can_request_new_subtasks and t.status != 'proposing':
                     update_status_and_broadcast('proposing')
                     await self._run_adaptive_decomposition(ctx)
                     # Agents no longer ask questions, so no 'waiting_for_user_response' from agents
-                    if t.status not in ["paused_by_human"]:  # Removed "waiting_for_user_response"
+                    # MODIFIED: Removed "waiting_for_user_response" from this check
+                    if t.status not in ["paused_by_human"]:
                         update_status_and_broadcast("waiting_for_children")
                 elif t.status == "pending" or t.status == "running":  # Catch-all for regular execution
                     update_status_and_broadcast('running')
@@ -613,7 +619,8 @@ class InteractiveDAGAgent(DAGAgent):
                 else:
                     logger.warning(f"[{t.id}] Task in unhandled status '{t.status}'. Skipping.")
 
-                if t.status not in ["waiting_for_children", "failed", "paused_by_human", "waiting_for_user_response"]:
+                # MODIFIED: Removed "waiting_for_user_response" from this check
+                if t.status not in ["waiting_for_children", "failed", "paused_by_human"]:
                     update_status_and_broadcast("complete")
                     t.last_llm_history = None
                     t.agent_role_paused = None
@@ -664,6 +671,7 @@ class InteractiveDAGAgent(DAGAgent):
             resumption_prompt_parts.insert(0, # Insert at the beginning
                 f"\n\n--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n------------------------------\n")
             t.human_directive = None
+            self._broadcast_state_update(t) # ADDED: Broadcast cleared directive
 
         full_resumption_prompt = "\n".join(resumption_prompt_parts) # Join here
 
@@ -706,34 +714,32 @@ class InteractiveDAGAgent(DAGAgent):
                     user_prompt=f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}",
                     message_history=t.last_llm_history
                 )
+                # MODIFIED: Removed "is_paused_cb" check here as agents won't pause for questions
                 is_paused_cb, plan = await self._handle_agent_output(
                     ctx=ctx, agent_res=fixed_plan_res, expected_output_type=ExecutionPlan, agent_role_name="cycle_breaker"
                 )
-                if not is_paused_cb and plan:
+                # MODIFIED: Simplified logic as is_paused_cb should be False
+                if plan:
                     await self._process_initial_planning_output(ctx, plan)
-                    if ctx.task.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+                    # MODIFIED: Removed "waiting_for_user_response"
+                    if ctx.task.status not in ["paused_by_human"]:
                         ctx.task.already_planned = True
                         ctx.task.status = "waiting_for_children" if ctx.task.children else "complete"
                         if ctx.task.status == "complete":
                             ctx.task.last_llm_history = None
                             ctx.task.agent_role_paused = None
                         self._broadcast_state_update(ctx.task)
-                elif is_paused_cb:
-                    logger.warning(f"Cycle breaker for {ctx.task.id} unexpectedly paused. This should not happen.")
-                    # Revert status to pending or keep it paused if it somehow got paused by human
-                    if ctx.task.status == "waiting_for_user_response":
-                        ctx.task.status = "pending"
-                        self._broadcast_state_update(ctx.task)
-            else:
-                ctx.task.status = "failed" # If initial plan is None after resumption, it's a failure
-                self._broadcast_state_update(ctx.task)
+                else: # If initial plan is None after resumption, it's a failure
+                    ctx.task.status = "failed"
+                    self._broadcast_state_update(ctx.task)
 
 
         elif original_agent_role_paused == "cycle_breaker":
             fixed_plan = agent_output
             if fixed_plan:
                 await self._process_initial_planning_output(ctx, fixed_plan)
-                if ctx.task.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+                # MODIFIED: Removed "waiting_for_user_response"
+                if ctx.task.status not in ["paused_by_human"]:
                     ctx.task.already_planned = True
                     ctx.task.status = "waiting_for_children" if ctx.task.children else "complete"
                     if ctx.task.status == "complete":
@@ -749,7 +755,8 @@ class InteractiveDAGAgent(DAGAgent):
             if proposals:
                 logger.info(f"Task [{t.id}] (resumed) proposing {len(proposals)} new sub-tasks.")
                 for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
-            if ctx.task.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+            # MODIFIED: Removed "waiting_for_user_response"
+            if ctx.task.status not in ["paused_by_human"]:
                 ctx.task.status = "waiting_for_children"
                 self._broadcast_state_update(ctx.task)
 
@@ -773,8 +780,9 @@ class InteractiveDAGAgent(DAGAgent):
             else:
                 # Treat empty/invalid output from executor as failed attempt
                 ctx.task.fix_attempts += 1
-                ctx.task.human_directive = f"Your last answer was empty or invalid. Re-evaluate and try again."
+                ctx.task.human_directive = f"Your last answer was empty or invalid. Please re-evaluate and try again."
                 logger.info(f"[{ctx.task.id}] Executor (resumed) returned no result. Retrying.")
+                self._broadcast_state_update(ctx.task) # ADDED: Broadcast directive/status
                 # The task remains 'running' or 'pending' to trigger the retry loop.
                 if (ctx.task.fix_attempts + ctx.task.grace_attempts) > (ctx.task.max_fix_attempts + self.max_grace_attempts):
                     ctx.task.status = "failed"
@@ -807,12 +815,14 @@ class InteractiveDAGAgent(DAGAgent):
         else:
             logger.warning(
                 f"[{t.id}] Resumption for role '{original_agent_role_paused}' completed, but specific processing logic is missing. Setting to pending.")
-            if ctx.task.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+            # MODIFIED: Removed "waiting_for_user_response"
+            if ctx.task.status not in ["paused_by_human"]:
                 ctx.task.status = "pending"
                 self._broadcast_state_update(ctx.task)
 
         # Clear agent-related pause context fields if not paused by human or waiting for explicit user directive again
-        if ctx.task.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+        # MODIFIED: Removed "waiting_for_user_response"
+        if ctx.task.status not in ["paused_by_human"]:
             t.agent_role_paused = None
             t.last_llm_history = None
 
@@ -832,7 +842,7 @@ class InteractiveDAGAgent(DAGAgent):
         if t.human_directive:
             prompt_parts.append(f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
-            self._broadcast_state_update(t)
+            self._broadcast_state_update(t) # ADDED: Broadcast cleared directive
 
         full_prompt = "\n".join(prompt_parts)
 
@@ -858,6 +868,7 @@ class InteractiveDAGAgent(DAGAgent):
                 user_prompt=fixer_prompt,
                 message_history=t.last_llm_history
             )
+            # MODIFIED: is_paused_cb check removed here
             is_paused_cb, plan = await self._handle_agent_output(
                 ctx=ctx, agent_res=fixed_plan_res, expected_output_type=ExecutionPlan, agent_role_name="cycle_breaker"
             )
@@ -878,36 +889,14 @@ class InteractiveDAGAgent(DAGAgent):
             return
 
         await self._process_initial_planning_output(ctx, plan)
-        if t.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+        # MODIFIED: Removed "waiting_for_user_response"
+        if t.status not in ["paused_by_human"]:
             t.already_planned = True
             t.status = "waiting_for_children" if t.children else "complete"
             if t.status == "complete":
                 t.last_llm_history = None
                 t.agent_role_paused = None
             self._broadcast_state_update(t)
-
-    async def _process_initial_planning_output(self, ctx: TaskContext, plan: ExecutionPlan):
-        """Helper to encapsulate common logic after initial planning produces an ExecutionPlan."""
-        t = ctx.task
-        if not plan.needs_subtasks: return
-
-        local_to_global_id_map = {}
-        for sub in plan.subtasks:
-            new_task = Task(id=str(uuid.uuid4())[:8], desc=sub.desc, parent=t.id,
-                            can_request_new_subtasks=sub.can_request_new_subtasks)
-            self.registry.add_task(new_task)
-            t.children.append(new_task.id)
-            self.registry.add_dependency(t.id, new_task.id)
-            local_to_global_id_map[sub.local_id] = new_task.id
-            self._broadcast_state_update(new_task)
-
-        for sub in plan.subtasks:
-            new_global_id = local_to_global_id_map.get(sub.local_id)
-            if not new_global_id: continue
-            for dep in sub.deps:
-                dep_global_id = local_to_global_id_map.get(dep.local_id) or (
-                    dep.local_id if dep.local_id in self.registry.tasks else None)
-                if dep_global_id: self.registry.add_dependency(new_global_id, dep_global_id)
 
     async def _process_initial_planning_output(self, ctx: TaskContext, plan: ExecutionPlan):
         """Helper to encapsulate common logic after initial planning produces an ExecutionPlan."""
@@ -945,7 +934,7 @@ class InteractiveDAGAgent(DAGAgent):
         if t.human_directive:
             prompt_parts.append(f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
-            self._broadcast_state_update(t)
+            self._broadcast_state_update(t) # ADDED: Broadcast cleared directive
 
         full_prompt = "\n".join(prompt_parts)
 
@@ -967,7 +956,8 @@ class InteractiveDAGAgent(DAGAgent):
         if proposals:
             logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
             for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
-        if t.status not in ["paused_by_human"]: # Removed "waiting_for_user_response"
+        # MODIFIED: Removed "waiting_for_user_response"
+        if t.status not in ["paused_by_human"]:
             t.status = "waiting_for_children"
             self._broadcast_state_update(t)
 
@@ -980,7 +970,7 @@ class InteractiveDAGAgent(DAGAgent):
         dep_results = {did: self.registry.tasks[did].result for did in t.deps if
                        self.registry.tasks[did].status == 'complete' and did not in child_results}
 
-        prompt_lines = [ # Changed variable name to avoid conflict
+        prompt_lines = [ # Use a new variable name to avoid confusion with prompt_base
             f"Your task is: {t.desc}\n"
         ]
         if child_results:
@@ -992,24 +982,24 @@ class InteractiveDAGAgent(DAGAgent):
             for did, res in dep_results.items():
                 prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")
 
-        # Join the base parts first
+        # Join these initial parts to form the base, before notebook and guidance
         prompt_base_content = "\n".join(prompt_lines)
 
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts + 1
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
 
-            current_prompt_parts = [ # Build a new list for each iteration
-                prompt_base_content,
+            current_prompt_parts = [ # Build current prompt dynamically for each attempt
+                prompt_base_content, # Start with the generated base content
                 f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
                 self._get_notebook_tool_guidance(t, "executor")
             ]
 
             if t.human_directive:
-                current_prompt_parts.insert(0, # Insert at the beginning for critical guidance
+                current_prompt_parts.insert(0, # Insert at the beginning to be critical guidance
                     f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n--------------------------------------\n\n")
                 t.human_directive = None
-                self._broadcast_state_update(t)
+                self._broadcast_state_update(t) # ADDED: Broadcast cleared directive
 
             current_prompt = "\n".join(current_prompt_parts) # Join all parts to create the final prompt
 
@@ -1026,6 +1016,7 @@ class InteractiveDAGAgent(DAGAgent):
                 t.human_directive = "Your last output was empty or invalid. Please re-evaluate and try again."
                 t.fix_attempts += 1
                 logger.warning(f"[{t.id}] Executor (attempt {current_attempt}) returned no result. Triggering retry.")
+                self._broadcast_state_update(t) # ADDED: Broadcast directive/status
                 if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
                     t.status = "failed"
                     self._broadcast_state_update(t)
@@ -1033,16 +1024,15 @@ class InteractiveDAGAgent(DAGAgent):
                 continue # Retry immediately
 
             await self._process_executor_output_for_verification(ctx, result)
-            if t.status in ["complete", "failed", "paused_by_human"]: # Removed "waiting_for_user_response"
+            # MODIFIED: Removed "waiting_for_user_response"
+            if t.status in ["complete", "failed", "paused_by_human"]:
                 return
 
     async def _process_executor_output_for_verification(self, ctx: TaskContext, result: str):
         """Helper to handle verification and retry logic after executor runs."""
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
-        is_successful = verify_task_result.get_successful()
-
-        if is_successful:
+        if verify_task_result.get_successful():
             t.result = result
             logger.info(f"COMPLETED [{t.id}]");
             t.status = "complete"
@@ -1075,6 +1065,7 @@ class InteractiveDAGAgent(DAGAgent):
                 t.grace_attempts += 1
                 t.human_directive = decision.next_step_suggestion
                 logger.info(f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}")
+                self._broadcast_state_update(t) # ADDED: Broadcast directive/status
                 return
 
         if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
@@ -1088,6 +1079,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
         logger.info(f"[{t.id}] Retrying execution. Feedback: {verify_task_result.reason[:50]}...")
+        self._broadcast_state_update(t) # ADDED: Broadcast directive/status
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
