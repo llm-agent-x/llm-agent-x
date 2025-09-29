@@ -11,7 +11,7 @@ interface McpServer {
   type: 'sse' | 'streamable_http';
 }
 
-// --- SELF-CONTAINED UI COMPONENTS (No shadcn/ui needed) ---
+// --- SELF-CONTAINED UI COMPONENTS (No changes here) ---
 
 const Button = ({ children, onClick, className = '', ...props }: { children: ReactNode; onClick?: () => void; className?: string; [key: string]: any; }) => (
   <button
@@ -40,7 +40,8 @@ const Label = ({ children, ...props }: { children: ReactNode; [key: string]: any
 // --- MCP SERVER MANAGER COMPONENT ---
 
 export function McpServerManager() {
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpen] = useState(false); // Controls if the component is in the DOM
+  const [isVisible, setIsVisible] = useState(false); // Controls the animation state (opacity, transform)
   const [mcpServers, setMcpServers] = useState<McpServer[]>([
     { id: '1', address: 'http://localhost:8081/mcp', type: 'sse' },
     { id: '2', address: 'http://localhost:8082/mcp', type: 'streamable_http' },
@@ -49,30 +50,56 @@ export function McpServerManager() {
   const [newServerType, setNewServerType] = useState<'sse' | 'streamable_http'>('sse');
 
   const drawerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const TRANSITION_DURATION = 300; // ms
+
+  // --- NEW ANIMATION LOGIC ---
+  const openDrawer = () => {
+    setIsOpen(true);
+    // Use a tiny timeout to allow the component to mount with initial (hidden) styles,
+    // then apply the visible styles to trigger the transition.
+    setTimeout(() => {
+        setIsVisible(true);
+    }, 10);
+  };
+
+  const closeDrawer = () => {
+    setIsVisible(false); // Trigger exit animation
+    // Wait for the animation to finish before unmounting the component
+    setTimeout(() => {
+        setIsOpen(false);
+    }, TRANSITION_DURATION);
+  };
 
   // Close drawer on escape key
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setIsOpen(false);
+        closeDrawer();
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, []); // Empty dependency array as closeDrawer is stable
 
   // Close drawer on outside click
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-        if (drawerRef.current && !drawerRef.current.contains(event.target as Node)) {
-            setIsOpen(false);
+        if (
+            drawerRef.current &&
+            !drawerRef.current.contains(event.target as Node) &&
+            triggerRef.current &&
+            !triggerRef.current.contains(event.target as Node)
+        ) {
+            closeDrawer();
         }
     };
     if (isOpen) {
         document.addEventListener('mousedown', handleClickOutside);
     }
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [isOpen]);
+  }, [isOpen]); // Re-attach listener when isOpen changes
 
 
   const handleAddServer = () => {
@@ -86,7 +113,7 @@ export function McpServerManager() {
       type: newServerType,
     };
     setMcpServers(prev => [...prev, newServer]);
-    setNewServerAddress(''); // Reset form
+    setNewServerAddress('');
   };
 
   const handleRemoveServer = (idToRemove: string) => {
@@ -97,7 +124,8 @@ export function McpServerManager() {
     <>
       {/* TRIGGER BUTTON */}
       <Button
-        onClick={() => setIsOpen(true)}
+        ref={triggerRef}
+        onClick={openDrawer}
         className="h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
         title="Manage MCP Servers"
       >
@@ -105,20 +133,24 @@ export function McpServerManager() {
         <span className="sr-only">Manage MCP Servers</span>
       </Button>
 
-      {/* DRAWER / SIDE PANEL */}
+      {/* DRAWER / SIDE PANEL - Only mounts when isOpen is true */}
       {isOpen && (
         <div className="fixed inset-0 z-50">
-          {/* OVERLAY */}
+          {/* OVERLAY with transition classes */}
           <div
-            onClick={() => setIsOpen(false)}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={closeDrawer}
+            className={`fixed inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-${TRANSITION_DURATION} ease-in-out
+                ${isVisible ? 'opacity-100' : 'opacity-0'}
+            `}
             aria-hidden="true"
           />
 
-          {/* CONTENT */}
+          {/* CONTENT with transition classes */}
           <div
             ref={drawerRef}
-            className="fixed top-0 right-0 h-full w-full max-w-md bg-zinc-950 border-l border-zinc-800 text-zinc-100 flex flex-col shadow-2xl"
+            className={`fixed top-0 right-0 h-full w-full max-w-md bg-zinc-950 border-l border-zinc-800 text-zinc-100 flex flex-col shadow-2xl transition-transform duration-${TRANSITION_DURATION} ease-in-out
+                ${isVisible ? 'translate-x-0' : 'translate-x-full'}
+            `}
           >
             {/* HEADER */}
             <div className="flex items-center justify-between p-6 border-b border-zinc-800">
@@ -126,7 +158,7 @@ export function McpServerManager() {
                     <h2 className="text-xl font-semibold text-zinc-100">Manage MCP Servers</h2>
                     <p className="text-sm text-zinc-400">Add or remove servers from the network.</p>
                 </div>
-                <Button onClick={() => setIsOpen(false)} className="h-8 w-8 p-0 bg-transparent hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100">
+                <Button onClick={closeDrawer} className="h-8 w-8 p-0 bg-transparent hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100">
                     <X className="h-5 w-5" />
                 </Button>
             </div>
