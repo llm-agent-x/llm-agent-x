@@ -12,7 +12,7 @@ interface McpServerSelectorProps {
 }
 
 export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionChange }: McpServerSelectorProps) => {
-  const [isOpen, setIsOpen] = useState(false); // Controls the collapsible panel
+  const [isOpen, setIsOpen] = useState(false);
 
   const handleCheckboxChange = (serverId: string) => {
     const newSelection = selectedServerIds.includes(serverId)
@@ -21,38 +21,47 @@ export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionCh
     onSelectionChange(newSelection);
   };
 
-  // Select/Deselect all servers
   const handleSelectAll = () => {
     if (selectedServerIds.length === allServers.length) {
-      onSelectionChange([]); // Deselect all
+      onSelectionChange([]);
     } else {
-      onSelectionChange(allServers.map(s => s.id)); // Select all
+      onSelectionChange(allServers.map(s => s.id));
     }
   };
 
   return (
+    // The main container provides space between this component and the input field below it.
     <div className="mb-2">
-      {/* --- TRIGGER BUTTON --- */}
-      <button
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex justify-between items-center bg-zinc-900 border border-zinc-700 rounded-md p-2 text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
-        aria-expanded={isOpen}
-      >
-        <span>
-          Targeting {selectedServerIds.length} of {allServers.length} Servers
-        </span>
-        <ChevronDown size={18} className={`transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`} />
-      </button>
+      {/*
+        KEY CHANGE: We use `flex-col-reverse`.
+        This visually reverses the order of its children. The button (second in the DOM)
+        will appear on top, and the content panel (first in the DOM) will appear below it.
+        When the content panel expands, it will do so *above* the stationary button.
+      */}
+      <div className="flex flex-col-reverse">
 
-      {/* --- COLLAPSIBLE CONTENT --- */}
-      <div
-        className={`grid transition-all duration-300 ease-in-out overflow-hidden ${
-          isOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
-        }`}
-      >
-        <div className="overflow-hidden"> {/* This inner div is required for the grid transition to work smoothly */}
-            <div className="mt-2 p-2 border border-zinc-700 rounded-md bg-zinc-900/50">
+        {/* --- TRIGGER BUTTON (DOM Order: Second) --- */}
+        <button
+          type="button"
+          onClick={() => setIsOpen(!isOpen)}
+          className="w-full flex justify-between items-center bg-zinc-900 border border-zinc-700 rounded-md p-2 text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
+          aria-expanded={isOpen}
+        >
+          <span>
+            Targeting {selectedServerIds.length} of {allServers.length} Servers
+          </span>
+          <ChevronDown size={18} className={`transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`} />
+        </button>
+
+        {/* --- COLLAPSIBLE CONTENT (DOM Order: First) --- */}
+        <div
+          className={`grid transition-all duration-300 ease-in-out overflow-hidden ${
+            isOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
+          }`}
+        >
+          <div className="overflow-hidden">
+            {/* This inner div has margin-bottom to create space between itself and the button when open */}
+            <div className="mb-2 p-2 border border-zinc-700 rounded-md bg-zinc-900/50">
               <div className="max-h-40 overflow-y-auto pr-1">
                 {allServers.map(server => (
                   <label
@@ -81,7 +90,9 @@ export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionCh
                  </div>
               )}
             </div>
+          </div>
         </div>
+
       </div>
     </div>
   );
