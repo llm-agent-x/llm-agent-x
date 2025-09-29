@@ -22,16 +22,10 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (description.trim() && selectedServerIds.length > 0) {
-      // --- THIS IS THE KEY CHANGE ---
-      // Filter the full server list to get the objects that match the selected IDs.
       const selectedServers = mcpServers.filter(server =>
         selectedServerIds.includes(server.id)
       );
-
-      // Pass the description and the array of full server objects to the API call.
       await addTask(description, selectedServers);
-      // --- END OF CHANGE ---
-
       setDescription('');
     }
   };
@@ -42,6 +36,14 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
     <div className="mt-4 p-3 bg-zinc-800/70 rounded-lg border border-zinc-700">
       <h3 className="text-md font-semibold text-zinc-300 mb-2">Launch New Task</h3>
       <form onSubmit={handleSubmit}>
+
+        {/* --- MOVED THE SELECTOR TO BE ABOVE THE INPUT --- */}
+        <McpServerSelector
+            allServers={mcpServers}
+            selectedServerIds={selectedServerIds}
+            onSelectionChange={setSelectedServerIds}
+        />
+
         <div className="flex gap-2">
             <input
               type="text"
@@ -60,13 +62,6 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
               <Send size={18} />
             </button>
         </div>
-
-        <McpServerSelector
-            allServers={mcpServers}
-            selectedServerIds={selectedServerIds}
-            onSelectionChange={setSelectedServerIds}
-        />
-
       </form>
     </div>
   );
