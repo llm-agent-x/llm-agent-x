@@ -137,6 +137,9 @@ class Task(BaseModel):
     agent_role_paused: Optional[str] = Field(None,
                                              description="Stores the name of the agent role that paused for human input.")
 
+    # --- MCP FIEDS ---
+    mcp_servers: List[Dict[str, Any]] = Field(default_factory=list)
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -210,27 +213,7 @@ class DAGAgent:
         self.mcp_tool_schemas_str = "No remote tools are available for planning."  # NEW: To hold tool schemas for planner
 
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
-        self.mcp_servers = []
-
-        # NEW: Handle MCP Client Setup
-        if mcp_server_url:
-            logger.info(f"Connecting to MCP server at {mcp_server_url}")
-            try:
-                # The client will be passed to the executor's tools list
-                server = MCPServerStreamableHTTP(mcp_server_url)
-                self.mcp_servers.append(server)
-
-                # Fetch the schemas for the planner's context
-                tools = asyncio.run(server.list_tools())
-                self.mcp_tool_schemas_str = json.dumps(tools, indent=2)
-                logger.info("Successfully fetched remote tool schemas for planner.")
-            except Exception as e:
-
-                raise e
-
-                logger.error(f"Failed to connect to MCP server or fetch schemas: {e}")
-                logger.info("Skipping use of MCP tools. The planner will be less capable without them.")
-                self.mcp_tool_schemas_str = ""
+        self.mcp_servers = [] # For future use
 
         self._setup_agent_roles()
 
@@ -543,34 +526,125 @@ class DAGAgent:
             logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
             for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
 
-    async def _run_task_execution(self, ctx: TaskContext):
-        t = ctx.task
-        child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
-                         self.registry.tasks[cid].status == 'complete'}
-        dep_results = {did: self.registry.tasks[did].result for did in t.deps if
-                       self.registry.tasks[did].status == 'complete' and did not in child_results}
-        prompt_lines = [f"Task: {t.desc}"]
-        if child_results:
-            prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
-            for cid, res in child_results.items(): prompt_lines.append(f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n")
-        elif dep_results:
-            prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
-            for did, res in dep_results.items(): prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n")
-        prompt_base_content = "\n".join(prompt_lines)
-        while True:
-            current_attempt = t.fix_attempts + t.grace_attempts
-            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt + 1})
-            current_prompt_parts = [prompt_base_content, f"\n--- Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-                                    self._get_notebook_tool_guidance(t, "executor")]
-            if t.human_directive:
-                current_prompt_parts.insert(0, f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n------------------------------\n")
-                t.human_directive = None
-            exec_res = await self.executor.run(user_prompt="\n".join(current_prompt_parts), message_history=t.last_llm_history)
-            is_paused, result = await self._handle_agent_output(ctx=ctx, agent_res=exec_res, expected_output_type=str,
-                                                                agent_role_name="executor")
-            if is_paused: return
-            await self._process_executor_output_for_verification(ctx, result)
-            if t.status in ["complete", "failed", "waiting_for_user_response", "paused_by_human"]: return
+    class DAGAgent:
+        # ... (other methods of DAGAgent)
+
+        async def _run_task_execution(self, ctx: TaskContext):
+            t = ctx.task
+            logger.info(f"[{t.id}] Running task execution for: {t.desc}")
+
+            child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
+                             self.registry.tasks[cid].status == 'complete'}
+            dep_results = {did: self.registry.tasks[did].result for did in t.deps if
+                           self.registry.tasks[did].status == 'complete' and did not in child_results}
+
+            prompt_lines = [
+                f"Your task is: {t.desc}\n"  # Corrected string format as per your interactive_dag_agent
+            ]
+            if child_results:
+                prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
+                for cid, res in child_results.items():
+                    prompt_lines.append(
+                        f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n")  # Added double newline for spacing
+            elif dep_results:
+                prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
+                for did, res in dep_results.items():
+                    prompt_lines.append(
+                        f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")  # Added double newline for spacing
+
+            # Join these initial parts to form the base, before notebook and guidance
+            prompt_base_content = "\n".join(prompt_lines)
+
+            # --- NEW: Dynamically create MCP clients and a task-specific executor ---
+            task_specific_mcp_clients = []
+            task_specific_tools = list(self._tools_for_agents)  # Start with base tools, if any
+
+            if t.mcp_servers:
+                logger.info(f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients.")
+                for server_config in t.mcp_servers:
+                    address = server_config.get("address")
+                    server_type = server_config.get("type")
+                    server_name = server_config.get("name", address)  # Use name if provided, else address
+
+                    if not address:
+                        logger.warning(f"Task [{t.id}]: MCP server config missing address. Skipping.")
+                        continue
+
+                    try:
+                        if server_type == 'streamable_http':
+                            client = MCPServerStreamableHTTP(address)
+                            task_specific_mcp_clients.append(client)
+                            logger.info(
+                                f"[{t.id}]: Initialized StreamableHTTP MCP client for '{server_name}' at {address}")
+                        # elif server_type == 'sse':
+                        #    # Uncomment and implement if you have an MCPServerSSE class
+                        #    client = MCPServerSSE(address)
+                        #    task_specific_mcp_clients.append(client)
+                        #    logger.info(f"[{t.id}]: Initialized SSE MCP client for '{server_name}' at {address}")
+                        else:
+                            logger.warning(
+                                f"[{t.id}]: Unknown MCP server type '{server_type}' for '{server_name}'. Skipping.")
+
+                    except Exception as e:
+                        logger.error(f"[{t.id}]: Failed to create MCP client for '{server_name}' at {address}: {e}")
+
+            # Create a temporary executor instance with the correct clients for this task
+            # It's important that this `Agent` constructor matches `self.executor`'s constructor arguments.
+            task_executor = Agent(
+                model=self.base_llm_model,
+                output_type=Union[str, UserQuestion],  # Keep UserQuestion for base DAGAgent
+                tools=task_specific_tools,
+                mcp_servers=task_specific_mcp_clients  # Pass the dynamically created MCP clients
+            )
+            # --- END NEW DYNAMIC SETUP ---
+
+            while True:
+                current_attempt = t.fix_attempts + t.grace_attempts + 1  # Corrected to start at 1
+                t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
+
+                current_prompt_parts = [
+                    prompt_base_content,  # Start with the generated base content
+                    f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
+                    self._get_notebook_tool_guidance(t, "executor")
+                ]
+
+                if t.human_directive:
+                    current_prompt_parts.insert(0,  # Insert at the beginning to be critical guidance
+                                                f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n--------------------------------------\n\n")
+                    t.human_directive = None
+
+                current_prompt = "\n".join(current_prompt_parts)
+
+                logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
+                exec_res = await task_executor.run(  # Use the dynamically created executor
+                    user_prompt=current_prompt,
+                    message_history=t.last_llm_history
+                )
+                is_paused, result = await self._handle_agent_output(
+                    ctx=ctx, agent_res=exec_res, expected_output_type=str, agent_role_name="executor"
+                )
+
+                # --- Original logic for handling is_paused remains ---
+                if is_paused:
+                    return
+
+                if result is None:  # Treat empty result from executor as an error
+                    t.human_directive = "Your last output was empty or invalid. Please re-evaluate and try again."
+                    t.fix_attempts += 1
+                    logger.warning(
+                        f"[{t.id}] Executor (attempt {current_attempt}) returned no result. Triggering retry.")
+                    self._broadcast_state_update(t)  # Only in InteractiveDAGAgent, but harmless here
+                    if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
+                        t.status = "failed"
+                        self._broadcast_state_update(t)  # Only in InteractiveDAGAgent, but harmless here
+                        raise Exception(f"Exceeded max attempts for task '{t.id}' after empty/invalid executor result.")
+                    continue  # Retry immediately
+
+                await self._process_executor_output_for_verification(ctx, result)
+
+                # --- Original logic for checking task status remains ---
+                if t.status in ["complete", "failed", "waiting_for_user_response", "paused_by_human"]:
+                    return
 
     async def _process_executor_output_for_verification(self, ctx: TaskContext, result: str):
         t = ctx.task

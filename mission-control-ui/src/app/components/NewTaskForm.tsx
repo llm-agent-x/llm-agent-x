@@ -21,16 +21,16 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (description.trim() && selectedServerIds.length > 0) {
-      const selectedServers = mcpServers.filter(server =>
-        selectedServerIds.includes(server.id)
-      );
+    if (description.trim()) {
+      const selectedServers = selectedServerIds.length > 0
+        ? mcpServers.filter(server => selectedServerIds.includes(server.id))
+        : mcpServers;
       await addTask(description, selectedServers);
       setDescription('');
     }
   };
 
-  const isSubmitDisabled = !description.trim() || selectedServerIds.length === 0;
+  const isSubmitDisabled = !description.trim();
 
   return (
     <div className="mt-4 p-3 bg-zinc-800/70 rounded-lg border border-zinc-700">

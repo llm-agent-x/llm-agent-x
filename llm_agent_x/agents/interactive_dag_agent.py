@@ -289,11 +289,16 @@ class InteractiveDAGAgent(DAGAgent):
                 logger.warning("ADD_ROOT_TASK directive received with no description.")
                 return
 
+
+            mcp_servers_config = payload.get("mcp_servers", [])
+
+
             new_task = Task(
                 id=str(uuid.uuid4())[:8],
                 desc=desc,
                 needs_planning=payload.get("needs_planning", True),
-                status="pending"
+                status="pending",
+                mcp_servers=mcp_servers_config
             )
             self.registry.add_task(new_task)
             logger.info(f"Added new root task from directive: {new_task.id} - {new_task.desc}")
@@ -906,7 +911,7 @@ class InteractiveDAGAgent(DAGAgent):
         local_to_global_id_map = {}
         for sub in plan.subtasks:
             new_task = Task(id=str(uuid.uuid4())[:8], desc=sub.desc, parent=t.id,
-                            can_request_new_subtasks=sub.can_request_new_subtasks)
+                            can_request_new_subtasks=sub.can_request_new_subtasks, mcp_servers=t.mcp_servers)
             self.registry.add_task(new_task)
             t.children.append(new_task.id)
             self.registry.add_dependency(t.id, new_task.id)
