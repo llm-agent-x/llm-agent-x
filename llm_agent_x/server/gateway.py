@@ -59,12 +59,14 @@ async def get_all_tasks():
 async def add_root_task(request: Request):
     body = await request.json()
     desc = body.get("desc")
+
+    mcp_servers = body.get("mcp_servers", [])
     if not desc:
         return {"status": "error", "message": "Description cannot be empty"}, 400
     message = {
         "task_id": str(uuid.uuid4()),
         "command": "ADD_ROOT_TASK",
-        "payload": {"desc": desc, "needs_planning": True}
+        "payload": {"desc": desc, "needs_planning": True, "mcp_servers": mcp_servers}
     }
     rabbit_channel.basic_publish(exchange='', routing_key=DIRECTIVES_QUEUE, body=json.dumps(message),
                                  properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE))

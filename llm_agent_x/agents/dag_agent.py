@@ -4,10 +4,12 @@ import logging
 from collections import defaultdict, deque
 from hashlib import md5
 from os import getenv
-from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable  # Added Callable and Union
+import json  # NEW: For pretty-printing tool schemas
+from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
+from pydantic_ai.mcp import MCPServerStreamableHTTP  # NEW: Import MCPServerStreamableHTTP
 from dotenv import load_dotenv
 
 # --- OpenTelemetry Imports ---
@@ -17,8 +19,6 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
-
-# --- rich imports removed as they are no longer needed ---
 
 # --- Basic Setup ---
 load_dotenv(".env", override=True)
@@ -51,7 +51,6 @@ class RetryDecision(BaseModel):
         description="A specific, actionable suggestion for the next attempt to improve the result.")
 
 
-# NEW: Model for asking clarifying questions
 class UserQuestion(BaseModel):
     """
     A specific output type for agents to ask clarifying questions to the human operator.
@@ -127,11 +126,12 @@ class Task(BaseModel):
     otel_context: Optional[Any] = None
     span: Optional[Span] = None
 
-    # --- NEW INTERACTIVITY FIELDS ---
     human_directive: Optional[str] = Field(None, description="A direct, corrective instruction from the operator.")
     current_question: Optional[UserQuestion] = Field(None,
                                                      description="The question an agent is currently asking the human operator.")
     user_response: Optional[str] = Field(None, description="The human operator's response to an agent's question.")
+
+    # --- NEW CONTEXT FIELDS ---
     last_llm_history: Optional[List[Dict[str, Any]]] = Field(None,
                                                              description="Stores the full message history of the last LLM interaction for resuming context.")
     agent_role_paused: Optional[str] = Field(None,
@@ -194,6 +194,7 @@ class DAGAgent:
             global_proposal_limit: int = 5,
             max_grace_attempts: int = 1,
             min_question_priority: int = 1,
+            mcp_server_url: Optional[str] = None,  # NEW: MCP server URL parameter
     ):
         self.registry = registry
         self.inflight = set()
@@ -206,8 +207,30 @@ class DAGAgent:
 
         self._tools_for_agents: List[Any] = tools or []
         self._agent_role_map: Dict[str, Agent] = {}
+        self.mcp_tool_schemas_str = "No remote tools are available for planning."  # NEW: To hold tool schemas for planner
 
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
+        self.mcp_servers = []
+
+        # NEW: Handle MCP Client Setup
+        if mcp_server_url:
+            logger.info(f"Connecting to MCP server at {mcp_server_url}")
+            try:
+                # The client will be passed to the executor's tools list
+                server = MCPServerStreamableHTTP(mcp_server_url)
+                self.mcp_servers.append(server)
+
+                # Fetch the schemas for the planner's context
+                tools = asyncio.run(server.list_tools())
+                self.mcp_tool_schemas_str = json.dumps(tools, indent=2)
+                logger.info("Successfully fetched remote tool schemas for planner.")
+            except Exception as e:
+
+                raise e
+
+                logger.error(f"Failed to connect to MCP server or fetch schemas: {e}")
+                logger.info("Skipping use of MCP tools. The planner will be less capable without them.")
+                self.mcp_tool_schemas_str = ""
 
         self._setup_agent_roles()
 
@@ -215,11 +238,20 @@ class DAGAgent:
         """Initializes or reinitializes all agent roles."""
         llm_model = self.base_llm_model
 
+        # NEW: Create a dynamic system prompt for the planner
+        planner_system_prompt = (
+            "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
+            "You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true. "
+            "If you need a crucial piece of information from the human manager to proceed with planning, you may output a `UserQuestion`.\n\n"
+            f"The executor has access to the following remote tools. You can create sub-tasks that use these tools, but you cannot execute them yourself:\n"
+            f"--- AVAILABLE REMOTE TOOLS ---\n{self.mcp_tool_schemas_str}\n------------------------------"
+        )
+
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true. If you need a crucial piece of information from the human manager to proceed with planning, you may output a `UserQuestion`.",
+            system_prompt=planner_system_prompt,  # MODIFIED: Use dynamic prompt
             output_type=Union[ExecutionPlan, UserQuestion],
-            tools=self._tools_for_agents,
+            tools=[],  # MODIFIED: Planner explicitly has no tools to execute
         )
         self.cycle_breaker = Agent(
             model=llm_model,
@@ -230,7 +262,7 @@ class DAGAgent:
                 "Your final output MUST be the complete, corrected ExecutionPlan. If there are no cycles, return the original plan unchanged."
             ),
             output_type=ExecutionPlan,
-            tools=self._tools_for_agents,
+            tools=[],  # Planner-related agents should not have execution tools
         )
         self.adaptive_decomposer = Agent(
             model=llm_model,
@@ -242,10 +274,11 @@ class DAGAgent:
             model=llm_model,
             system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
             output_type=ProposalResolutionPlan,
-            tools=self._tools_for_agents,
+            tools=[],  # Planner-related agents should not have execution tools
             retries=3,
         )
-        self.executor = Agent(model=llm_model, output_type=Union[str, UserQuestion], tools=self._tools_for_agents)
+        # MODIFIED: Executor now gets the full list of tools, including the McpClient
+        self.executor = Agent(model=llm_model, output_type=Union[str, UserQuestion], tools=self._tools_for_agents, mcp_servers=self.mcp_servers)
         self.verifier = Agent(
             model=llm_model,
             system_prompt="You are a meticulous quality assurance verifier. Your job is to check if the provided 'Candidate Result' accurately and completely addresses the 'Task', considering the history and user instructions. Output JSON matching the 'verification' schema. Be strict.",
@@ -596,8 +629,12 @@ if __name__ == "__main__":
     )
     reg.add_task(root_task)
     agent = DAGAgent(
-        registry=reg, llm_model="gpt-4o-mini", tracer=trace.get_tracer("hybrid_dag_demo"),
-        global_proposal_limit=2, max_grace_attempts=1
+        registry=reg,
+        llm_model="gpt-4o-mini",
+        tracer=trace.get_tracer("hybrid_dag_demo"),
+        global_proposal_limit=2,
+        max_grace_attempts=1,
+        mcp_server_url=os.getenv("MCP_SERVER_URL") # NEW: Pass the MCP server URL
     )
     async def main():
         print("\n--- INITIAL TASK STATUS TREE ---"); reg.print_status_tree()
