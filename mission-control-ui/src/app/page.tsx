@@ -7,14 +7,55 @@ import { TaskList } from './components/TaskList';
 import { TaskInspector } from './components/TaskInspector';
 import { NewTaskForm } from './components/NewTaskForm';
 import { DAGView } from './components/DAGView';
-import { McpServerManager } from './components/McpServerManager'; // Import the new component
+import { McpServerManager, McpServer } from './components/McpServerManager'; // Adjust import
 
 const API_BASE_URL = "http://localhost:8000";
+
+// --- STATE LIFTED UP FROM McpServerManager ---
+const DEFAULT_SERVERS: McpServer[] = [
+  { id: '1', address: 'http://localhost:8081/mcp', type: 'sse' },
+  { id: '2', address: 'http://localhost:8082/mcp', type: 'streamable_http' },
+];
+const LOCAL_STORAGE_KEY = 'mcpServers';
+// --- END LIFTED STATE ---
 
 export default function MissionControl() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [tasks, setTasks] = useState<{ [key: string]: any }>({});
   const [isConnected, setIsConnected] = useState(false);
+
+  // --- MCP SERVER STATE AND LOGIC NOW LIVES HERE ---
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+
+  // On initial mount, load servers from localStorage
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        setMcpServers(Array.isArray(parsed) ? parsed : DEFAULT_SERVERS);
+      } else {
+        setMcpServers(DEFAULT_SERVERS);
+      }
+    } catch (error) {
+      console.error("Failed to parse MCP servers from localStorage:", error);
+      setMcpServers(DEFAULT_SERVERS);
+    }
+  }, []); // Empty array ensures this runs only once on mount
+
+  // When servers change, save them back to localStorage
+  useEffect(() => {
+    // We check if the initial load is done to avoid overwriting on first render
+    if (mcpServers.length > 0) {
+        try {
+            window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(mcpServers));
+        } catch (error) {
+            console.error("Failed to save MCP servers to localStorage:", error);
+        }
+    }
+  }, [mcpServers]);
+  // --- END MCP SERVER LOGIC ---
+
 
   useEffect(() => {
     const socket: Socket = io(API_BASE_URL);
@@ -48,25 +89,23 @@ export default function MissionControl() {
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("task_update", onTaskUpdate);
-
-    return () => {
-        socket.disconnect();
-    };
+    return () => { socket.disconnect(); };
   }, []);
 
   const taskList = Object.values(tasks).sort((a,b) => a.id.localeCompare(b.id));
   const selectedTask = tasks[selectedTaskId!] || null;
 
   useEffect(() => {
-      // If the selected task is removed or no longer exists, deselect it
-      if (selectedTaskId && !tasks[selectedTaskId]) {
-          setSelectedTaskId(null);
-      }
-      // If there's no selected task but tasks exist, select the first one
-      if (!selectedTaskId && taskList.length > 0) {
-        setSelectedTaskId(taskList[0].id);
-      }
+    if (selectedTaskId && !tasks[selectedTaskId]) { setSelectedTaskId(null); }
+    if (!selectedTaskId && taskList.length > 0) { setSelectedTaskId(taskList[0].id); }
   }, [tasks, selectedTaskId, taskList]);
+
+
+  // Now you can use `mcpServers` anywhere in this component or pass it to children
+  useEffect(() => {
+    console.log("Current MCP Servers:", mcpServers);
+  }, [mcpServers]);
+
 
   return (
     <main className="bg-zinc-900 text-white min-h-screen p-4 md:p-6 lg:p-8 max-h-screen">
@@ -80,38 +119,28 @@ export default function MissionControl() {
                 <span>Gateway Status</span>
                 <div className={`w-3 h-3 rounded-full transition-colors ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} title={isConnected ? 'Connected' : 'Disconnected'}></div>
             </div>
-            {/* Use the new component here */}
-            <McpServerManager />
+            {/* Pass state and setters down as props */}
+            <McpServerManager
+              servers={mcpServers}
+              setServers={setMcpServers}
+              defaultServers={DEFAULT_SERVERS}
+            />
         </div>
       </header>
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-6 h-[calc(100vh-120px)]">
-        {/* Left Column: Task List & New Task Form */}
+        {/* ... rest of the JSX ... */}
+        {/* For example, you could now pass the list to the NewTaskForm */}
+        {/* <NewTaskForm mcpServers={mcpServers} /> */}
         <div className="flex flex-col h-[calc(100vh-120px)]">
-          <div className="flex-grow overflow-y-auto pr-2 bg-zinc-800/50 p-3 rounded-lg border border-zinc-700">
-            <TaskList
-              tasks={taskList}
-              selectedTaskId={selectedTaskId}
-              onSelectTask={setSelectedTaskId}
-            />
-          </div>
-          <div className="flex-shrink-0">
-            <NewTaskForm />
-          </div>
+            <div className="flex-grow overflow-y-auto pr-2 bg-zinc-800/50 p-3 rounded-lg border border-zinc-700">
+                <TaskList tasks={taskList} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} />
+            </div>
+            <div className="flex-shrink-0">
+                <NewTaskForm />
+            </div>
         </div>
-
-        {/* Middle Column: DAG Visualization */}
-        <div className="lg:col-span-1 h-full">
-            <DAGView
-                tasks={taskList}
-                selectedTaskId={selectedTaskId}
-                onSelectTask={setSelectedTaskId}
-            />
-        </div>
-
-        {/* Right Column: Task Inspector */}
-        <div className="lg:col-span-1 h-full">
-          <TaskInspector task={selectedTask} />
-        </div>
+        <div className="lg:col-span-1 h-full"><DAGView tasks={taskList} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} /></div>
+        <div className="lg:col-span-1 h-full"><TaskInspector task={selectedTask} /></div>
       </div>
     </main>
   );
