@@ -1,30 +1,28 @@
 // mission-control-ui/src/app/page.tsx
 "use client";
 
+// ... (all imports remain the same)
 import { useState, useEffect } from 'react';
 import { io, Socket } from "socket.io-client";
 import { TaskList } from './components/TaskList';
 import { TaskInspector } from './components/TaskInspector';
 import { NewTaskForm } from './components/NewTaskForm';
 import { DAGView } from './components/DAGView';
-import { McpServerManager, McpServer } from './components/McpServerManager'; // Adjust import
+import { McpServerManager, McpServer } from './components/McpServerManager';
 
 const API_BASE_URL = "http://localhost:8000";
 
-// --- STATE LIFTED UP FROM McpServerManager ---
 const DEFAULT_SERVERS: McpServer[] = [
   { id: '1', name: "Test MCP Server 1", address: 'http://localhost:8081/mcp', type: 'sse' },
   { id: '2', name: "Test MCP Server 2", address: 'http://localhost:8082/mcp', type: 'streamable_http' },
 ];
 const LOCAL_STORAGE_KEY = 'mcpServers';
-// --- END LIFTED STATE ---
 
 export default function MissionControl() {
+  // ... (all state and useEffect hooks remain the same)
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [tasks, setTasks] = useState<{ [key: string]: any }>({});
   const [isConnected, setIsConnected] = useState(false);
-
-  // --- MCP SERVER STATE AND LOGIC NOW LIVES HERE ---
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
 
   // On initial mount, load servers from localStorage
@@ -128,15 +126,13 @@ export default function MissionControl() {
         </div>
       </header>
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-6 h-[calc(100vh-120px)]">
-        {/* ... rest of the JSX ... */}
-        {/* For example, you could now pass the list to the NewTaskForm */}
-        {/* <NewTaskForm mcpServers={mcpServers} /> */}
         <div className="flex flex-col h-[calc(100vh-120px)]">
             <div className="flex-grow overflow-y-auto pr-2 bg-zinc-800/50 p-3 rounded-lg border border-zinc-700">
                 <TaskList tasks={taskList} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} />
             </div>
             <div className="flex-shrink-0">
-                <NewTaskForm />
+                {/* --- PASS MCP SERVERS TO THE FORM --- */}
+                <NewTaskForm mcpServers={mcpServers} />
             </div>
         </div>
         <div className="lg:col-span-1 h-full"><DAGView tasks={taskList} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} /></div>

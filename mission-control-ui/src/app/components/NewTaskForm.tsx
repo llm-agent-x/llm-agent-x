@@ -4,20 +4,17 @@
 import { useState, useEffect } from 'react';
 import { Send } from 'lucide-react';
 import { addTask } from '@/lib/api';
-import { McpServer } from './McpServerManager'; // Import the type
-import { McpServerSelector } from './McpServerSelector'; // Import the new component
+import { McpServer } from './McpServerManager';
+import { McpServerSelector } from './McpServerSelector';
 
-// Define props for the component
 interface NewTaskFormProps {
   mcpServers: McpServer[];
 }
 
 export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
   const [description, setDescription] = useState('');
-  // State to hold the IDs of the selected servers for this task
   const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
 
-  // Effect to pre-select all available servers by default
   useEffect(() => {
     setSelectedServerIds(mcpServers.map(s => s.id));
   }, [mcpServers]);
@@ -25,10 +22,17 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (description.trim() && selectedServerIds.length > 0) {
-      // Pass the selected server IDs to the API call
-      await addTask(description, selectedServerIds);
+      // --- THIS IS THE KEY CHANGE ---
+      // Filter the full server list to get the objects that match the selected IDs.
+      const selectedServers = mcpServers.filter(server =>
+        selectedServerIds.includes(server.id)
+      );
+
+      // Pass the description and the array of full server objects to the API call.
+      await addTask(description, selectedServers);
+      // --- END OF CHANGE ---
+
       setDescription('');
-      // We don't reset the selection, as the user might want to launch similar tasks
     }
   };
 
@@ -57,13 +61,11 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
             </button>
         </div>
 
-        {/* --- ADD THE NEW SERVER SELECTOR HERE --- */}
         <McpServerSelector
             allServers={mcpServers}
             selectedServerIds={selectedServerIds}
             onSelectionChange={setSelectedServerIds}
         />
-        {/* --- END SERVER SELECTOR --- */}
 
       </form>
     </div>
