@@ -6,6 +6,7 @@ import { Server, PlusCircle, Trash2, X, RotateCcw } from 'lucide-react';
 
 export interface McpServer {
   id: string;
+  name: string;
   address: string;
   type: 'sse' | 'streamable_http';
 }
@@ -38,6 +39,7 @@ export function McpServerManager({ servers, setServers, defaultServers }: McpSer
   const [isOpen, setIsOpen] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
   const [isConfirmingReset, setIsConfirmingReset] = useState(false);
+  const [newServerName, setNewServerName] = useState('');
   const [newServerAddress, setNewServerAddress] = useState('');
   const [newServerType, setNewServerType] = useState<'sse' | 'streamable_http'>('sse');
   const drawerRef = useRef<HTMLDivElement>(null);
@@ -49,7 +51,7 @@ export function McpServerManager({ servers, setServers, defaultServers }: McpSer
   useEffect(() => { const handleKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') { closeDrawer(); } }; document.addEventListener('keydown', handleKeyDown); return () => document.removeEventListener('keydown', handleKeyDown); }, []);
   useEffect(() => { const handleClickOutside = (event: MouseEvent) => { if (drawerRef.current && !drawerRef.current.contains(event.target as Node) && triggerRef.current && !triggerRef.current.contains(event.target as Node)) { closeDrawer(); } }; if (isOpen) { document.addEventListener('mousedown', handleClickOutside); } return () => document.removeEventListener('mousedown', handleClickOutside); }, [isOpen]);
 
-  const handleAddServer = () => { if (!newServerAddress.trim()) { return; } const newServer: McpServer = { id: Date.now().toString(), address: newServerAddress.trim(), type: newServerType, }; setServers(prev => [...prev, newServer]); setNewServerAddress(''); };
+  const handleAddServer = () => { if (!newServerAddress.trim()) { return; } const newServer: McpServer = { id: Date.now().toString(), name: newServerName.trim(), address: newServerAddress.trim(), type: newServerType, }; setServers(prev => [...prev, newServer]); setNewServerAddress(''); setNewServerName(''); };
   const handleRemoveServer = (idToRemove: string) => { setServers(prev => prev.filter(server => server.id !== idToRemove)); };
   const handleConfirmReset = () => { setServers(defaultServers); setIsConfirmingReset(false); };
   const handleCancelReset = () => { setIsConfirmingReset(false); };
@@ -83,7 +85,11 @@ export function McpServerManager({ servers, setServers, defaultServers }: McpSer
                 <div className="flex flex-col gap-3">
                     {servers.map(server => (
                         <div key={server.id} className="flex items-center justify-between p-3 bg-zinc-900/70 border border-zinc-800 rounded-md">
-                            <div className="flex flex-col"><span className="font-mono text-sm text-zinc-300">{server.address}</span><span className="text-xs uppercase bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded-full w-fit mt-1">{server.type.replace('_', ' ')}</span></div>
+                            <span className="font-mono text-sm text-zinc-300 truncate rounded-md" style={{maxWidth: '16ch'}}>{server.name}</span>
+                            <div className="flex flex-col">
+                                <span className="font-mono text-sm text-zinc-300">{server.address}</span>
+                                <span className="text-xs uppercase bg-zinc-700 text-zinc-300 px-2 py-0.5 rounded-full w-fit mt-1">{server.type.replace('_', ' ')}</span>
+                            </div>
                             <button onClick={() => handleRemoveServer(server.id)} className={`${baseButtonClasses} h-8 w-8 p-0 text-zinc-400 hover:bg-red-900/50 hover:text-red-400`}>
                                 <Trash2 className="h-4 w-4" />
                             </button>
@@ -113,6 +119,7 @@ export function McpServerManager({ servers, setServers, defaultServers }: McpSer
                     )}
                 </div>
                 <div className="grid gap-4">
+                    <div className="grid w-full items-center gap-1.5"><Label htmlFor="server-name">Server Name</Label><Input type="text" id="server-name" placeholder="My MCP Server" value={newServerName} onChange={(e) => setNewServerName(e.target.value)} /></div>
                     <div className="grid w-full items-center gap-1.5"><Label htmlFor="server-address">Server Address</Label><Input type="text" id="server-address" placeholder="http://localhost:8080/mcp" value={newServerAddress} onChange={(e) => setNewServerAddress(e.target.value)} /></div>
                     <div className="grid w-full items-center gap-1.5">
                         <Label htmlFor="server-type">Server Type</Label>

@@ -13,8 +13,8 @@ const API_BASE_URL = "http://localhost:8000";
 
 // --- STATE LIFTED UP FROM McpServerManager ---
 const DEFAULT_SERVERS: McpServer[] = [
-  { id: '1', address: 'http://localhost:8081/mcp', type: 'sse' },
-  { id: '2', address: 'http://localhost:8082/mcp', type: 'streamable_http' },
+  { id: '1', name: "Test MCP Server 1", address: 'http://localhost:8081/mcp', type: 'sse' },
+  { id: '2', name: "Test MCP Server 2", address: 'http://localhost:8082/mcp', type: 'streamable_http' },
 ];
 const LOCAL_STORAGE_KEY = 'mcpServers';
 // --- END LIFTED STATE ---
