@@ -19,7 +19,7 @@ def main():
         host=host,
         port=port,
         reload=reload,
-        log_level="info",
+        log_level="debug",
         # app=app,
     )
 

@@ -64,7 +64,7 @@ class InteractiveDAGAgent(DAGAgent):
         # Create the notebook tool and add it to the shared tools list, then re-setup agents.
         self.update_notebook_tool = self._create_notebook_tool(self.registry, self._broadcast_state_update)
         # Add to the internal list of tools that DAGAgent uses for agent constructors
-        self._tools_for_agents.append(self.update_notebook_tool)
+        # self._tools_for_agents.append(self.update_notebook_tool)
         # Re-setup agent roles now that the full set of tools (including the notebook tool) is ready
         self._setup_agent_roles()
 

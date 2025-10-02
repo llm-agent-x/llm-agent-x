@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pika.adapters.blocking_connection import BlockingChannel
 from dotenv import load_dotenv
+from starlette.responses import JSONResponse
 
 load_dotenv(".env", override=True)
 
@@ -35,7 +36,7 @@ app.add_middleware(
 
 # --- Socket.IO Setup ---
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-app_asgi = socketio.ASGIApp(sio, app)
+app_asgi = socketio.ASGIApp(sio, other_asgi_app=app)
 
 
 # --- RabbitMQ Connection for Publishing Directives ---
@@ -45,33 +46,74 @@ def get_rabbitmq_channel() -> BlockingChannel:
 
 
 DIRECTIVES_QUEUE = 'directives_queue'
-rabbit_channel = get_rabbitmq_channel()
-rabbit_channel.queue_declare(queue=DIRECTIVES_QUEUE, durable=True)
+
+# Initialize RabbitMQ connection safely
+rabbit_channel = None
+try:
+    rabbit_channel = get_rabbitmq_channel()
+    rabbit_channel.queue_declare(queue=DIRECTIVES_QUEUE, durable=True)
+    logger.info("RabbitMQ connection established successfully")
+except Exception as e:
+    logger.error(f"Failed to connect to RabbitMQ: {e}")
+    rabbit_channel = None
 
 
 # --- API Endpoints (Unchanged) ---
 @app.get("/api/tasks")
 async def get_all_tasks():
+    logger.info("Received request for all tasks.")
     return {"tasks": task_state_cache}
 
 
 @app.post("/api/tasks")
 async def add_root_task(request: Request):
-    body = await request.json()
-    desc = body.get("desc")
+    logger.info("Received request to add root task.")
+    try:
+        body = await request.json()
+        desc = body.get("desc")
+        mcp_servers = body.get("mcp_servers", [])
 
-    mcp_servers = body.get("mcp_servers", [])
-    if not desc:
-        return {"status": "error", "message": "Description cannot be empty"}, 400
-    message = {
-        "task_id": str(uuid.uuid4()),
-        "command": "ADD_ROOT_TASK",
-        "payload": {"desc": desc, "needs_planning": True, "mcp_servers": mcp_servers}
-    }
-    rabbit_channel.basic_publish(exchange='', routing_key=DIRECTIVES_QUEUE, body=json.dumps(message),
-                                 properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE))
-    logger.info(f"Published new task directive to queue: {desc}")
-    return {"status": "new task submitted"}
+        if not desc:
+            raise ValueError("Description cannot be empty")
+
+        message = {
+            "task_id": str(uuid.uuid4()),
+            "command": "ADD_ROOT_TASK",
+            "payload": {"desc": desc, "needs_planning": True, "mcp_servers": mcp_servers}
+        }
+
+        # Check if RabbitMQ connection is available
+        if rabbit_channel is None:
+            logger.error("RabbitMQ connection not available")
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "RabbitMQ connection not available"}
+            )
+
+        # Try publishing to RabbitMQ safely
+        try:
+            rabbit_channel.basic_publish(
+                exchange='',
+                routing_key=DIRECTIVES_QUEUE,
+                body=json.dumps(message),
+                properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
+            )
+        except Exception:
+            logger.exception("Failed to publish to RabbitMQ")
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Failed to enqueue task"}
+            )
+
+        logger.info(f"Published new task directive to queue: {desc}")
+        return {"status": "new task submitted"}
+
+    except Exception:
+        logger.exception("Error in add_root_task")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal server error"}
+        )
 
 
 @app.post("/api/tasks/{task_id}/directive")
@@ -118,6 +160,12 @@ def listen_for_state_updates():
         logger.error(f"RabbitMQ consumer thread stopped unexpectedly: {e}")
     finally:
         connection.close()
+
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
 
 # --- MODIFIED: The startup event now captures the loop ---
