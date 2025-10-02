@@ -93,6 +93,15 @@ class ProposedSubtask(BaseModel):
     deps: List[str] = Field(default_factory=list,
                             description="A list of local_ids of other PROPOSED tasks that this one depends on.")
 
+class AdaptiveDecomposerResponse(BaseModel):
+    """
+    The structured response from the adaptive_decomposer agent.
+    It can propose new tasks to be created and/or request dependencies on existing tasks.
+    """
+    tasks: List[ProposedSubtask] = Field(default_factory=list,
+                                         description="A list of new, granular sub-tasks to be created to achieve the parent objective.")
+    dep_requests: List[str] = Field(default_factory=list,
+                                    description="A list of IDs of EXISTING tasks whose results are needed as new dependencies for the current task.")
 
 class ProposalResolutionPlan(BaseModel):
     """The final, pruned list of approved sub-tasks."""
@@ -708,7 +717,7 @@ if __name__ == "__main__":
         tracer=trace.get_tracer("hybrid_dag_demo"),
         global_proposal_limit=2,
         max_grace_attempts=1,
-        mcp_server_url=os.getenv("MCP_SERVER_URL") # NEW: Pass the MCP server URL
+        mcp_server_url=getenv("MCP_SERVER_URL") # NEW: Pass the MCP server URL
     )
     async def main():
         print("\n--- INITIAL TASK STATUS TREE ---"); reg.print_status_tree()

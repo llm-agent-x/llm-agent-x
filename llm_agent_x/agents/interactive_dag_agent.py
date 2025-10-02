@@ -14,10 +14,12 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
 from pydantic_ai.agent import AgentRunResult, Agent
+from pydantic_ai.mcp import MCPServerStreamableHTTP
 
 from llm_agent_x.agents.dag_agent import (
     DAGAgent, Task, TaskRegistry, TaskContext,
-    ExecutionPlan, ProposedSubtask, verification, RetryDecision, UserQuestion, ProposalResolutionPlan
+    ExecutionPlan, ProposedSubtask, verification, RetryDecision, UserQuestion, ProposalResolutionPlan,
+    AdaptiveDecomposerResponse
 )
 
 from dotenv import load_dotenv
@@ -60,6 +62,7 @@ class InteractiveDAGAgent(DAGAgent):
         self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         self.proposed_tasks_buffer = []
+        self.proposed_task_dependencies_buffer = []  # FIXED: Initialize the missing buffer
 
         # Create the notebook tool and add it to the shared tools list, then re-setup agents.
         self.update_notebook_tool = self._create_notebook_tool(self.registry, self._broadcast_state_update)
@@ -92,7 +95,7 @@ class InteractiveDAGAgent(DAGAgent):
         self.adaptive_decomposer = Agent(
             model=llm_model,
             system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
-            output_type=List[ProposedSubtask],  # MODIFIED: Removed Union[..., UserQuestion]
+            output_type=AdaptiveDecomposerResponse,  # MODIFIED: Removed Union[..., UserQuestion]
             tools=self._tools_for_agents,  # Use the internal tools list
         )
         self.conflict_resolver = Agent(
@@ -102,8 +105,13 @@ class InteractiveDAGAgent(DAGAgent):
             tools=self._tools_for_agents,  # Use the internal tools list
             retries=3,
         )
-        self.executor = Agent(model=llm_model, output_type=str,
-                              tools=self._tools_for_agents)  # MODIFIED: Removed Union[..., UserQuestion]
+        self.executor = Agent(
+            model=llm_model,
+            system_prompt="You are the executor. Your job is to run the given task and return the result. If this task has MCP servers associated with it, you must use them to run the task. If no MCP servers are associated with a task, you must use the base tools.",
+            output_type=str,
+            tools=self._tools_for_agents,  # Use the internal tools list
+            mcp_servers=self.mcp_servers,  # Use the MCP servers list
+        )
         self.verifier = Agent(
             model=llm_model,
             system_prompt="You are a meticulous quality assurance verifier. Your job is to check if the provided 'Candidate Result' accurately and completely addresses the 'Task', considering the history and user instructions. Output JSON matching the 'verification' schema. Be strict.",
@@ -208,6 +216,10 @@ class InteractiveDAGAgent(DAGAgent):
         self._add_llm_data_to_span(t.span, agent_res, t)
 
         t.last_llm_history = agent_res.all_messages()
+
+        if agent_role_name == "executor":
+            t.executor_llm_history = agent_res.all_messages_json()
+
         actual_output = agent_res.output
 
         # REMOVED: The entire block that checked for UserQuestion and paused the task.
@@ -684,7 +696,7 @@ class InteractiveDAGAgent(DAGAgent):
         expected_type_map = {
             "initial_planner": ExecutionPlan,
             "cycle_breaker": ExecutionPlan,
-            "adaptive_decomposer": List[ProposedSubtask],
+            "adaptive_decomposer": AdaptiveDecomposerResponse,  # FIXED: Updated type
             "conflict_resolver": ProposalResolutionPlan,
             "executor": str,
             "verifier": verification,
@@ -756,11 +768,14 @@ class InteractiveDAGAgent(DAGAgent):
                 self._broadcast_state_update(ctx.task)
 
         elif original_agent_role_paused == "adaptive_decomposer":
-            proposals = agent_output
-            if proposals:
-                logger.info(f"Task [{t.id}] (resumed) proposing {len(proposals)} new sub-tasks.")
-                for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
-            # MODIFIED: Removed "waiting_for_user_response"
+            proposals_response = agent_output  # FIXED: Use a more descriptive name
+            if proposals_response:
+                if proposals_response.tasks:  # FIXED: Check for .tasks attribute
+                    logger.info(f"Task [{t.id}] (resumed) proposing {len(proposals_response.tasks)} new sub-tasks.")
+                    for sub in proposals_response.tasks: self.proposed_tasks_buffer.append((sub, t.id))
+                if proposals_response.dep_requests: # FIXED: Check for .dep_requests attribute
+                    logger.info(f"Task [{t.id}] (resumed) requesting results from {len(proposals_response.dep_requests)} new dependencies.")
+                    for dep in proposals_response.dep_requests: self.proposed_task_dependencies_buffer.append((dep, t.id))
             if ctx.task.status not in ["paused_by_human"]:
                 ctx.task.status = "waiting_for_children"
                 self._broadcast_state_update(ctx.task)
@@ -929,11 +944,11 @@ class InteractiveDAGAgent(DAGAgent):
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
         t = ctx.task
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
+        available_tasks = str([{"id": task.id, "desc": task.desc} for task in self.registry.tasks.values()])
         prompt_parts = [
             f"Task: {t.desc}",
             f"\n\nResults from dependencies:\n{t.dep_results}",
-            f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-            self._get_notebook_tool_guidance(t, "adaptive_decomposer")
+            f"\n\n--- Available tasks to request results from: {available_tasks}"
         ]
 
         if t.human_directive:
@@ -948,25 +963,32 @@ class InteractiveDAGAgent(DAGAgent):
             message_history=t.last_llm_history
         )
         # _handle_agent_output no longer pauses for UserQuestion.
-        is_paused, proposals = await self._handle_agent_output(
-            ctx=ctx, agent_res=proposals_res, expected_output_type=List[ProposedSubtask],
+        is_paused, proposals_response = await self._handle_agent_output(
+            ctx=ctx, agent_res=proposals_res, expected_output_type=AdaptiveDecomposerResponse,
             agent_role_name="adaptive_decomposer"
         )
-        if proposals is None: # Treat invalid/empty proposals as a failure
+        if proposals_response is None: # Treat invalid/empty proposals as a failure
             t.status = "failed"
             self._broadcast_state_update(t)
             logger.error(f"[{t.id}] Adaptive decomposer returned no proposals or invalid output.")
             return
 
-        if proposals:
-            logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
-            for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
+        if proposals_response.tasks:
+            logger.info(f"Task [{t.id}] proposing {len(proposals_response.tasks)} new sub-tasks.")
+            for sub in proposals_response.tasks: self.proposed_tasks_buffer.append((sub, t.id)) # FIXED: iterate over .tasks
+
+
+        if proposals_response.dep_requests:
+            logger.info(f"Task [{t.id}] requesting results from {len(proposals_response.dep_requests)} new dependencies.")
+            for dep in proposals_response.dep_requests: self.proposed_task_dependencies_buffer.append((dep, t.id))
+
         # MODIFIED: Removed "waiting_for_user_response"
         if t.status not in ["paused_by_human"]:
             t.status = "waiting_for_children"
             self._broadcast_state_update(t)
 
     async def _run_task_execution(self, ctx: TaskContext):
+        # FIXED: This entire method is replaced with the corrected logic for dynamic, task-specific executors.
         t = ctx.task
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
@@ -975,7 +997,7 @@ class InteractiveDAGAgent(DAGAgent):
         dep_results = {did: self.registry.tasks[did].result for did in t.deps if
                        self.registry.tasks[did].status == 'complete' and did not in child_results}
 
-        prompt_lines = [ # Use a new variable name to avoid confusion with prompt_base
+        prompt_lines = [
             f"Your task is: {t.desc}\n"
         ]
         if child_results:
@@ -987,49 +1009,85 @@ class InteractiveDAGAgent(DAGAgent):
             for did, res in dep_results.items():
                 prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")
 
-        # Join these initial parts to form the base, before notebook and guidance
-        prompt_base_content = "\n".join(prompt_lines)
+        prompt_base_content = "".join(prompt_lines)
+
+        # --- NEW: Dynamically create MCP clients and a task-specific executor ---
+        task_specific_mcp_clients = []
+        task_specific_tools = list(self._tools_for_agents)  # Start with base tools
+
+        if t.mcp_servers:
+            logger.info(f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients.")
+            for server_config in t.mcp_servers:
+                address = server_config.get("address")
+                server_type = server_config.get("type")
+                server_name = server_config.get("name", address)
+
+                if not address:
+                    logger.warning(f"Task [{t.id}]: MCP server config missing address. Skipping.")
+                    continue
+
+                try:
+                    if server_type == 'streamable_http':
+                        client = MCPServerStreamableHTTP(address)
+                        task_specific_mcp_clients.append(client)
+                        logger.info(
+                            f"[{t.id}]: Initialized StreamableHTTP MCP client for '{server_name}' at {address}")
+                    else:
+                        logger.warning(
+                            f"[{t.id}]: Unknown MCP server type '{server_type}' for '{server_name}'. Skipping.")
+                except Exception as e:
+                    logger.error(f"[{t.id}]: Failed to create MCP client for '{server_name}' at {address}: {e}")
+
+        # Create a temporary executor instance with the correct clients for this task.
+        task_executor = Agent(
+            model=self.base_llm_model,
+            system_prompt=self.executor.system_prompt,  # Reuse the system prompt
+            output_type=str,
+            tools=task_specific_tools,
+            mcp_servers=task_specific_mcp_clients  # Pass the dynamically created MCP clients
+        )
+        # --- END NEW DYNAMIC SETUP ---
 
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts + 1
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
 
-            current_prompt_parts = [ # Build current prompt dynamically for each attempt
-                prompt_base_content, # Start with the generated base content
+            current_prompt_parts = [
+                prompt_base_content,
                 f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
                 self._get_notebook_tool_guidance(t, "executor")
             ]
 
             if t.human_directive:
-                current_prompt_parts.insert(0, # Insert at the beginning to be critical guidance
+                current_prompt_parts.insert(0,
                     f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n--------------------------------------\n\n")
                 t.human_directive = None
-                self._broadcast_state_update(t) # ADDED: Broadcast cleared directive
+                self._broadcast_state_update(t)
 
-            current_prompt = "\n".join(current_prompt_parts) # Join all parts to create the final prompt
+            current_prompt = "".join(current_prompt_parts)
 
             logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
-            exec_res = await self.executor.run(
+            exec_res = await task_executor.run(  # Use the dynamic executor
                 user_prompt=current_prompt,
                 message_history=t.last_llm_history
             )
-            # _handle_agent_output no longer pauses for UserQuestion.
+
             is_paused, result = await self._handle_agent_output(
                 ctx=ctx, agent_res=exec_res, expected_output_type=str, agent_role_name="executor"
             )
-            if result is None: # Treat empty result from executor as an error
+
+            if result is None:
                 t.human_directive = "Your last output was empty or invalid. Please re-evaluate and try again."
                 t.fix_attempts += 1
                 logger.warning(f"[{t.id}] Executor (attempt {current_attempt}) returned no result. Triggering retry.")
-                self._broadcast_state_update(t) # ADDED: Broadcast directive/status
+                self._broadcast_state_update(t)
                 if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
                     t.status = "failed"
                     self._broadcast_state_update(t)
                     raise Exception(f"Exceeded max attempts for task '{t.id}' after empty/invalid executor result.")
-                continue # Retry immediately
+                continue
 
             await self._process_executor_output_for_verification(ctx, result)
-            # MODIFIED: Removed "waiting_for_user_response"
             if t.status in ["complete", "failed", "paused_by_human"]:
                 return
 
