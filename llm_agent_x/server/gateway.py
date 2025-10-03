@@ -16,7 +16,9 @@ from starlette.responses import JSONResponse
 load_dotenv(".env", override=True)
 
 # --- Basic Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("APIGateway")
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 
@@ -28,7 +30,10 @@ main_event_loop = None  # <<< NEW: Global variable to hold the main event loop
 app = FastAPI(title="LLM Agent X Gateway")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Add any other origins if needed
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ],  # Add any other origins if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,7 +50,7 @@ def get_rabbitmq_channel() -> BlockingChannel:
     return connection.channel()
 
 
-DIRECTIVES_QUEUE = 'directives_queue'
+DIRECTIVES_QUEUE = "directives_queue"
 
 # Initialize RabbitMQ connection safely
 rabbit_channel = None
@@ -79,7 +84,11 @@ async def add_root_task(request: Request):
         message = {
             "task_id": str(uuid.uuid4()),
             "command": "ADD_ROOT_TASK",
-            "payload": {"desc": desc, "needs_planning": True, "mcp_servers": mcp_servers}
+            "payload": {
+                "desc": desc,
+                "needs_planning": True,
+                "mcp_servers": mcp_servers,
+            },
         }
 
         # Check if RabbitMQ connection is available
@@ -87,22 +96,27 @@ async def add_root_task(request: Request):
             logger.error("RabbitMQ connection not available")
             return JSONResponse(
                 status_code=500,
-                content={"status": "error", "message": "RabbitMQ connection not available"}
+                content={
+                    "status": "error",
+                    "message": "RabbitMQ connection not available",
+                },
             )
 
         # Try publishing to RabbitMQ safely
         try:
             rabbit_channel.basic_publish(
-                exchange='',
+                exchange="",
                 routing_key=DIRECTIVES_QUEUE,
                 body=json.dumps(message),
-                properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+                ),
             )
         except Exception:
             logger.exception("Failed to publish to RabbitMQ")
             return JSONResponse(
                 status_code=500,
-                content={"status": "error", "message": "Failed to enqueue task"}
+                content={"status": "error", "message": "Failed to enqueue task"},
             )
 
         logger.info(f"Published new task directive to queue: {desc}")
@@ -112,16 +126,26 @@ async def add_root_task(request: Request):
         logger.exception("Error in add_root_task")
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "message": "Internal server error"}
+            content={"status": "error", "message": "Internal server error"},
         )
 
 
 @app.post("/api/tasks/{task_id}/directive")
 async def post_directive(task_id: str, request: Request):
     directive = await request.json()
-    message = {"task_id": task_id, "command": directive.get("command"), "payload": directive.get("payload")}
-    rabbit_channel.basic_publish(exchange='', routing_key=DIRECTIVES_QUEUE, body=json.dumps(message),
-                                 properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE))
+    message = {
+        "task_id": task_id,
+        "command": directive.get("command"),
+        "payload": directive.get("payload"),
+    }
+    rabbit_channel.basic_publish(
+        exchange="",
+        routing_key=DIRECTIVES_QUEUE,
+        body=json.dumps(message),
+        properties=pika.BasicProperties(
+            delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+        ),
+    )
     logger.info(f"Published directive to queue: {message}")
     return {"status": "directive sent"}
 
@@ -130,12 +154,12 @@ async def post_directive(task_id: str, request: Request):
 def listen_for_state_updates():
     connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
     channel = connection.channel()
-    exchange_name = 'state_updates_exchange'
-    channel.exchange_declare(exchange=exchange_name, exchange_type='fanout')
-    result = channel.queue_declare(queue='', exclusive=True)
+    exchange_name = "state_updates_exchange"
+    channel.exchange_declare(exchange=exchange_name, exchange_type="fanout")
+    result = channel.queue_declare(queue="", exclusive=True)
     queue_name = result.method.queue
     channel.queue_bind(exchange=exchange_name, queue=queue_name)
-    logger.info('Waiting for state updates from the agent...')
+    logger.info("Waiting for state updates from the agent...")
 
     def callback(ch, method, properties, body):
         global task_state_cache
@@ -148,8 +172,7 @@ def listen_for_state_updates():
             # --- MODIFIED: Use the captured main_event_loop ---
             if main_event_loop:
                 asyncio.run_coroutine_threadsafe(
-                    sio.emit('task_update', {'task': update}),
-                    main_event_loop
+                    sio.emit("task_update", {"task": update}), main_event_loop
                 )
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -160,7 +183,6 @@ def listen_for_state_updates():
         logger.error(f"RabbitMQ consumer thread stopped unexpectedly: {e}")
     finally:
         connection.close()
-
 
 
 @app.get("/health")

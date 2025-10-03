@@ -93,6 +93,7 @@ class ProposedSubtask(BaseModel):
     deps: List[str] = Field(default_factory=list,
                             description="A list of local_ids of other PROPOSED tasks that this one depends on.")
 
+
 class AdaptiveDecomposerResponse(BaseModel):
     """
     The structured response from the adaptive_decomposer agent.
@@ -102,6 +103,7 @@ class AdaptiveDecomposerResponse(BaseModel):
                                          description="A list of new, granular sub-tasks to be created to achieve the parent objective.")
     dep_requests: List[str] = Field(default_factory=list,
                                     description="A list of IDs of EXISTING tasks whose results are needed as new dependencies for the current task.")
+
 
 class ProposalResolutionPlan(BaseModel):
     """The final, pruned list of approved sub-tasks."""
@@ -143,6 +145,8 @@ class Task(BaseModel):
     # --- NEW CONTEXT FIELDS ---
     last_llm_history: Optional[List[Dict[str, Any]]] = Field(None,
                                                              description="Stores the full message history of the last LLM interaction for resuming context.")
+    executor_llm_history: Optional[List[Dict[str, Any]]] = Field(None,
+                                                                  description="Stores the full message history of the last LLM interaction for the executor of this task.")
     agent_role_paused: Optional[str] = Field(None,
                                              description="Stores the name of the agent role that paused for human input.")
 
@@ -222,7 +226,7 @@ class DAGAgent:
         self.mcp_tool_schemas_str = "No remote tools are available for planning."  # NEW: To hold tool schemas for planner
 
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
-        self.mcp_servers = [] # For future use
+        self.mcp_servers = []  # For future use
 
         self._setup_agent_roles()
 
@@ -270,7 +274,8 @@ class DAGAgent:
             retries=3,
         )
         # MODIFIED: Executor now gets the full list of tools, including the McpClient
-        self.executor = Agent(model=llm_model, output_type=Union[str, UserQuestion], tools=self._tools_for_agents, mcp_servers=self.mcp_servers)
+        self.executor = Agent(model=llm_model, output_type=Union[str, UserQuestion], tools=self._tools_for_agents,
+                              mcp_servers=self.mcp_servers)
         self.verifier = Agent(
             model=llm_model,
             system_prompt="You are a meticulous quality assurance verifier. Your job is to check if the provided 'Candidate Result' accurately and completely addresses the 'Task', considering the history and user instructions. Output JSON matching the 'verification' schema. Be strict.",
@@ -382,19 +387,24 @@ class DAGAgent:
                             task.status = "pending"
                 ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
                 if not ready and not self.inflight and pending_tasks:
-                    logger.error("Stalled DAG!"); self.registry.print_status_tree()
-                    root_span.set_status(trace.Status(StatusCode.ERROR, "DAG Stalled")); break
+                    logger.error("Stalled DAG!");
+                    self.registry.print_status_tree()
+                    root_span.set_status(trace.Status(StatusCode.ERROR, "DAG Stalled"));
+                    break
                 if not pending_tasks and not self.inflight:
-                    logger.info("DAG execution complete."); break
+                    logger.info("DAG execution complete.");
+                    break
                 for tid in ready:
-                    self.inflight.add(tid); self.task_futures[tid] = asyncio.create_task(self._run_taskflow(tid))
+                    self.inflight.add(tid);
+                    self.task_futures[tid] = asyncio.create_task(self._run_taskflow(tid))
                 if not self.task_futures: continue
                 done, _ = await asyncio.wait(self.task_futures.values(), return_when=asyncio.FIRST_COMPLETED,
                                              timeout=0.1)
                 for fut in done:
                     tid = next((tid for tid, f in self.task_futures.items() if f == fut), None)
                     if tid:
-                        self.inflight.discard(tid); del self.task_futures[tid]
+                        self.inflight.discard(tid);
+                        del self.task_futures[tid]
                         try:
                             fut.result()
                         except asyncio.CancelledError:
@@ -403,12 +413,14 @@ class DAGAgent:
                             logger.error(f"Task [{tid}] future failed: {e}")
                             t = self.registry.tasks.get(tid)
                             if t and t.status != "failed":
-                                t.status = "failed"; t.last_llm_history, t.agent_role_paused = None, None
+                                t.status = "failed";
+                                t.last_llm_history, t.agent_role_paused = None, None
                 if self.proposed_tasks_buffer: await self._run_global_resolution()
 
     async def _run_global_resolution(self):
         logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
-        approved_proposals, parent_map = [p[0] for p in self.proposed_tasks_buffer], {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
+        approved_proposals, parent_map = [p[0] for p in self.proposed_tasks_buffer], {p[0].local_id: p[1] for p in
+                                                                                      self.proposed_tasks_buffer}
         if len(approved_proposals) > self.global_proposal_limit:
             logger.warning(
                 f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver.")
@@ -422,34 +434,42 @@ class DAGAgent:
             global_resolver_task = self.registry.tasks[global_resolver_task_id]
             global_resolver_ctx = TaskContext(global_resolver_task_id, self.registry)
             resolver_res = await self.conflict_resolver.run(
-                user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}",
-                message_history=global_resolver_task.last_llm_history)
+                user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}")
+
+            logger.info(f"GLOBAL RESOLUTION: {resolver_res}")
             is_paused, resolved_plan = await self._handle_agent_output(ctx=global_resolver_ctx, agent_res=resolver_res,
                                                                        expected_output_type=ProposalResolutionPlan,
                                                                        agent_role_name="conflict_resolver")
             if is_paused:
                 logger.warning(
                     f"Conflict resolver paused. Discarding current proposals; they will be regenerated later.")
-                self.proposed_tasks_buffer = []; return
+                self.proposed_tasks_buffer = [];
+                return
             if resolved_plan is None and global_resolver_task.status == "waiting_for_user_response":
-                logger.warning("Conflict resolver paused, no plan resolved yet."); return
+                logger.warning("Conflict resolver paused, no plan resolved yet.");
+                return
             approved_proposals = resolved_plan.approved_tasks
         logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
-        self._commit_proposals(approved_proposals, parent_map); self.proposed_tasks_buffer = []
+        self._commit_proposals(approved_proposals, parent_map);
+        self.proposed_tasks_buffer = []
 
     def _commit_proposals(self, approved_proposals: List[ProposedSubtask], proposal_to_parent_map: Dict[str, str]):
         local_to_global_id_map = {}
         for proposal in approved_proposals:
             parent_id = proposal_to_parent_map.get(proposal.local_id)
             if not parent_id: continue
-            new_task = Task(id=str(uuid.uuid4())[:8], desc=proposal.desc, parent=parent_id, can_request_new_subtasks=False)
-            self.registry.add_task(new_task); self.registry.tasks[parent_id].children.append(new_task.id)
-            self.registry.add_dependency(parent_id, new_task.id); local_to_global_id_map[proposal.local_id] = new_task.id
+            new_task = Task(id=str(uuid.uuid4())[:8], desc=proposal.desc, parent=parent_id,
+                            can_request_new_subtasks=False)
+            self.registry.add_task(new_task);
+            self.registry.tasks[parent_id].children.append(new_task.id)
+            self.registry.add_dependency(parent_id, new_task.id);
+            local_to_global_id_map[proposal.local_id] = new_task.id
         for proposal in approved_proposals:
             new_task_global_id = local_to_global_id_map.get(proposal.local_id)
             if not new_task_global_id: continue
             for dep_local_id in proposal.deps:
-                dep_global_id = local_to_global_id_map.get(dep_local_id) or (dep_local_id if dep_local_id in self.registry.tasks else None)
+                dep_global_id = local_to_global_id_map.get(dep_local_id) or (
+                    dep_local_id if dep_local_id in self.registry.tasks else None)
                 if dep_global_id: self.registry.add_dependency(new_task_global_id, dep_global_id)
 
     async def _run_taskflow(self, tid: str):
@@ -457,46 +477,68 @@ class DAGAgent:
         with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}") as span:
             t.span, span.set_attribute("dag.task.id", t.id), span.set_attribute("dag.task.status", t.status)
             if t.status in ["paused_by_human", "waiting_for_user_response"]:
-                logger.info(f"[{t.id}] Task is {t.status}, skipping execution."); return
+                logger.info(f"[{t.id}] Task is {t.status}, skipping execution.");
+                return
             try:
                 otel_ctx_token = otel_context.attach(trace.set_span_in_context(span))
                 if t.status == 'waiting_for_children':
-                    t.status = 'running'; logger.info(f"SYNTHESIS PHASE for [{t.id}]."); await self._run_task_execution(ctx)
+                    t.status = 'running';
+                    logger.info(f"SYNTHESIS PHASE for [{t.id}].");
+                    await self._run_task_execution(ctx)
                 elif t.needs_planning and not t.already_planned:
-                    t.status = 'planning'; logger.info(f"ARCHITECT PHASE for [{t.id}]."); await self._run_initial_planning(ctx)
+                    t.status = 'planning';
+                    logger.info(f"ARCHITECT PHASE for [{t.id}].");
+                    await self._run_initial_planning(ctx)
                     if t.status not in ["waiting_for_user_response", "paused_by_human"]:
-                        t.already_planned = True; t.status = "waiting_for_children" if t.children else "complete"
+                        t.already_planned = True;
+                        t.status = "waiting_for_children" if t.children else "complete"
                 elif t.can_request_new_subtasks and t.status != 'proposing':
-                    t.status = 'proposing'; logger.info(f"EXPLORER PHASE for [{t.id}]."); await self._run_adaptive_decomposition(ctx)
-                    if t.status not in ["waiting_for_user_response", "paused_by_human"]: t.status = "waiting_for_children"
+                    t.status = 'proposing';
+                    logger.info(f"EXPLORER PHASE for [{t.id}].");
+                    await self._run_adaptive_decomposition(ctx)
+                    if t.status not in ["waiting_for_user_response",
+                                        "paused_by_human"]: t.status = "waiting_for_children"
                 else:
-                    t.status = 'running'; logger.info(f"WORKER PHASE for [{t.id}]."); await self._run_task_execution(ctx)
+                    t.status = 'running';
+                    logger.info(f"WORKER PHASE for [{t.id}].");
+                    await self._run_task_execution(ctx)
                 if t.status not in ["waiting_for_children", "failed", "paused_by_human", "waiting_for_user_response"]:
-                    t.status = "complete"; t.last_llm_history, t.agent_role_paused = None, None
+                    t.status = "complete";
+                    t.last_llm_history, t.agent_role_paused = None, None
             except Exception as e:
-                span.record_exception(e); span.set_status(trace.Status(StatusCode.ERROR, str(e)))
-                t.status = "failed"; t.last_llm_history, t.agent_role_paused = None, None; raise
+                span.record_exception(e);
+                span.set_status(trace.Status(StatusCode.ERROR, str(e)))
+                t.status = "failed";
+                t.last_llm_history, t.agent_role_paused = None, None;
+                raise
             finally:
-                otel_context.detach(otel_ctx_token); span.set_attribute("dag.task.status", t.status)
+                otel_context.detach(otel_ctx_token);
+                span.set_attribute("dag.task.status", t.status)
 
     async def _run_initial_planning(self, ctx: TaskContext):
-        t = ctx.task; completed_tasks = [tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id]
+        t = ctx.task;
+        completed_tasks = [tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id]
         context = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
         prompt_parts = [f"Objective: {t.desc}", f"\nAvailable completed data sources:\n{context}",
                         f"\n--- Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
                         self._get_notebook_tool_guidance(t, "initial_planner")]
         if t.human_directive:
-            prompt_parts.append(f"\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n"); t.human_directive = None
-        plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
+            prompt_parts.append(
+                f"\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n");
+            t.human_directive = None
+        plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts),
+                                                  message_history=t.last_llm_history)
         is_paused, initial_plan = await self._handle_agent_output(ctx=ctx, agent_res=plan_res,
-                                                                  expected_output_type=ExecutionPlan, agent_role_name="initial_planner")
+                                                                  expected_output_type=ExecutionPlan,
+                                                                  agent_role_name="initial_planner")
         if is_paused: return
         if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
             fixed_plan_res = await self.cycle_breaker.run(
                 user_prompt=f"Analyze and fix cycles in this plan:\n{initial_plan.model_dump_json(indent=2)}",
                 message_history=t.last_llm_history)
             is_paused, plan = await self._handle_agent_output(ctx=ctx, agent_res=fixed_plan_res,
-                                                              expected_output_type=ExecutionPlan, agent_role_name="cycle_breaker")
+                                                              expected_output_type=ExecutionPlan,
+                                                              agent_role_name="cycle_breaker")
             if is_paused: return
         else:
             plan = initial_plan
@@ -510,23 +552,30 @@ class DAGAgent:
         for sub in plan.subtasks:
             new_task = Task(id=str(uuid.uuid4())[:8], desc=sub.desc, parent=t.id,
                             can_request_new_subtasks=sub.can_request_new_subtasks)
-            self.registry.add_task(new_task); t.children.append(new_task.id); self.registry.add_dependency(t.id, new_task.id)
+            self.registry.add_task(new_task);
+            t.children.append(new_task.id);
+            self.registry.add_dependency(t.id, new_task.id)
             local_to_global_id_map[sub.local_id] = new_task.id
         for sub in plan.subtasks:
             new_global_id = local_to_global_id_map.get(sub.local_id)
             if not new_global_id: continue
             for dep in sub.deps:
-                dep_global_id = local_to_global_id_map.get(dep.local_id) or (dep.local_id if dep.local_id in self.registry.tasks else None)
+                dep_global_id = local_to_global_id_map.get(dep.local_id) or (
+                    dep.local_id if dep.local_id in self.registry.tasks else None)
                 if dep_global_id: self.registry.add_dependency(new_global_id, dep_global_id)
 
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
-        t = ctx.task; t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
+        t = ctx.task;
+        t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
         prompt_parts = [f"Task: {t.desc}", f"\nResults from dependencies:\n{t.dep_results}",
                         f"\n--- Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
                         self._get_notebook_tool_guidance(t, "adaptive_decomposer")]
         if t.human_directive:
-            prompt_parts.append(f"\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n"); t.human_directive = None
-        proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
+            prompt_parts.append(
+                f"\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n");
+            t.human_directive = None
+        proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts),
+                                                           message_history=t.last_llm_history)
         is_paused, proposals = await self._handle_agent_output(ctx=ctx, agent_res=proposals_res,
                                                                expected_output_type=List[ProposedSubtask],
                                                                agent_role_name="adaptive_decomposer")
@@ -535,132 +584,100 @@ class DAGAgent:
             logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
             for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
 
-    class DAGAgent:
-        # ... (other methods of DAGAgent)
+    async def _run_task_execution(self, ctx: TaskContext):
+        t = ctx.task
+        logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
-        async def _run_task_execution(self, ctx: TaskContext):
-            t = ctx.task
-            logger.info(f"[{t.id}] Running task execution for: {t.desc}")
+        child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
+                         self.registry.tasks[cid].status == 'complete'}
+        dep_results = {did: self.registry.tasks[did].result for did in t.deps if
+                       self.registry.tasks[did].status == 'complete' and did not in child_results}
 
-            child_results = {cid: self.registry.tasks[cid].result for cid in t.children if
-                             self.registry.tasks[cid].status == 'complete'}
-            dep_results = {did: self.registry.tasks[did].result for did in t.deps if
-                           self.registry.tasks[did].status == 'complete' and did not in child_results}
+        prompt_lines = [f"Your task is: {t.desc}\n"]
+        if child_results:
+            prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
+            for cid, res in child_results.items():
+                prompt_lines.append(f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n")
+        elif dep_results:
+            prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
+            for did, res in dep_results.items():
+                prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")
 
-            prompt_lines = [
-                f"Your task is: {t.desc}\n"  # Corrected string format as per your interactive_dag_agent
+        prompt_base_content = "".join(prompt_lines)  # FIXED: Use "" to join to avoid double newlines
+
+        task_specific_mcp_clients = []
+        task_specific_tools = list(self._tools_for_agents)
+
+        if t.mcp_servers:
+            logger.info(f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients.")
+            for server_config in t.mcp_servers:
+                address = server_config.get("address")
+                server_type = server_config.get("type")
+                server_name = server_config.get("name", address)
+                if not address:
+                    logger.warning(f"Task [{t.id}]: MCP server config missing address. Skipping.")
+                    continue
+                try:
+                    if server_type == 'streamable_http':
+                        client = MCPServerStreamableHTTP(address)
+                        task_specific_mcp_clients.append(client)
+                        logger.info(f"[{t.id}]: Initialized StreamableHTTP MCP client for '{server_name}' at {address}")
+                    else:
+                        logger.warning(
+                            f"[{t.id}]: Unknown MCP server type '{server_type}' for '{server_name}'. Skipping.")
+                except Exception as e:
+                    logger.error(f"[{t.id}]: Failed to create MCP client for '{server_name}' at {address}: {e}")
+
+        task_executor = Agent(
+            model=self.base_llm_model,
+            output_type=Union[str, UserQuestion],
+            tools=task_specific_tools,
+            mcp_servers=task_specific_mcp_clients
+        )
+
+        while True:
+            current_attempt = t.fix_attempts + t.grace_attempts + 1
+            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
+            current_prompt_parts = [
+                prompt_base_content,
+                f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
+                self._get_notebook_tool_guidance(t, "executor")
             ]
-            if child_results:
-                prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
-                for cid, res in child_results.items():
-                    prompt_lines.append(
-                        f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n")  # Added double newline for spacing
-            elif dep_results:
-                prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
-                for did, res in dep_results.items():
-                    prompt_lines.append(
-                        f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")  # Added double newline for spacing
+            if t.human_directive:
+                current_prompt_parts.insert(0,
+                                            f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n--------------------------------------\n\n")
+                t.human_directive = None
 
-            # Join these initial parts to form the base, before notebook and guidance
-            prompt_base_content = "\n".join(prompt_lines)
+            current_prompt = "".join(current_prompt_parts)  # FIXED: Use "" to join
 
-            # --- NEW: Dynamically create MCP clients and a task-specific executor ---
-            task_specific_mcp_clients = []
-            task_specific_tools = list(self._tools_for_agents)  # Start with base tools, if any
+            logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
+            exec_res = await task_executor.run(user_prompt=current_prompt, message_history=t.last_llm_history)
+            is_paused, result = await self._handle_agent_output(ctx=ctx, agent_res=exec_res, expected_output_type=str,
+                                                                agent_role_name="executor")
 
-            if t.mcp_servers:
-                logger.info(f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients.")
-                for server_config in t.mcp_servers:
-                    address = server_config.get("address")
-                    server_type = server_config.get("type")
-                    server_name = server_config.get("name", address)  # Use name if provided, else address
+            if is_paused: return
+            if result is None:
+                t.human_directive = "Your last output was empty or invalid. Please re-evaluate and try again."
+                t.fix_attempts += 1
+                logger.warning(f"[{t.id}] Executor (attempt {current_attempt}) returned no result. Triggering retry.")
+                if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
+                    t.status = "failed"
+                    raise Exception(f"Exceeded max attempts for task '{t.id}' after empty/invalid executor result.")
+                continue
 
-                    if not address:
-                        logger.warning(f"Task [{t.id}]: MCP server config missing address. Skipping.")
-                        continue
-
-                    try:
-                        if server_type == 'streamable_http':
-                            client = MCPServerStreamableHTTP(address)
-                            task_specific_mcp_clients.append(client)
-                            logger.info(
-                                f"[{t.id}]: Initialized StreamableHTTP MCP client for '{server_name}' at {address}")
-                        # elif server_type == 'sse':
-                        #    # Uncomment and implement if you have an MCPServerSSE class
-                        #    client = MCPServerSSE(address)
-                        #    task_specific_mcp_clients.append(client)
-                        #    logger.info(f"[{t.id}]: Initialized SSE MCP client for '{server_name}' at {address}")
-                        else:
-                            logger.warning(
-                                f"[{t.id}]: Unknown MCP server type '{server_type}' for '{server_name}'. Skipping.")
-
-                    except Exception as e:
-                        logger.error(f"[{t.id}]: Failed to create MCP client for '{server_name}' at {address}: {e}")
-
-            # Create a temporary executor instance with the correct clients for this task
-            # It's important that this `Agent` constructor matches `self.executor`'s constructor arguments.
-            task_executor = Agent(
-                model=self.base_llm_model,
-                output_type=Union[str, UserQuestion],  # Keep UserQuestion for base DAGAgent
-                tools=task_specific_tools,
-                mcp_servers=task_specific_mcp_clients  # Pass the dynamically created MCP clients
-            )
-            # --- END NEW DYNAMIC SETUP ---
-
-            while True:
-                current_attempt = t.fix_attempts + t.grace_attempts + 1  # Corrected to start at 1
-                t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
-
-                current_prompt_parts = [
-                    prompt_base_content,  # Start with the generated base content
-                    f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-                    self._get_notebook_tool_guidance(t, "executor")
-                ]
-
-                if t.human_directive:
-                    current_prompt_parts.insert(0,  # Insert at the beginning to be critical guidance
-                                                f"--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n--------------------------------------\n\n")
-                    t.human_directive = None
-
-                current_prompt = "\n".join(current_prompt_parts)
-
-                logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
-                exec_res = await task_executor.run(  # Use the dynamically created executor
-                    user_prompt=current_prompt,
-                    message_history=t.last_llm_history
-                )
-                is_paused, result = await self._handle_agent_output(
-                    ctx=ctx, agent_res=exec_res, expected_output_type=str, agent_role_name="executor"
-                )
-
-                # --- Original logic for handling is_paused remains ---
-                if is_paused:
-                    return
-
-                if result is None:  # Treat empty result from executor as an error
-                    t.human_directive = "Your last output was empty or invalid. Please re-evaluate and try again."
-                    t.fix_attempts += 1
-                    logger.warning(
-                        f"[{t.id}] Executor (attempt {current_attempt}) returned no result. Triggering retry.")
-                    self._broadcast_state_update(t)  # Only in InteractiveDAGAgent, but harmless here
-                    if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
-                        t.status = "failed"
-                        self._broadcast_state_update(t)  # Only in InteractiveDAGAgent, but harmless here
-                        raise Exception(f"Exceeded max attempts for task '{t.id}' after empty/invalid executor result.")
-                    continue  # Retry immediately
-
-                await self._process_executor_output_for_verification(ctx, result)
-
-                # --- Original logic for checking task status remains ---
-                if t.status in ["complete", "failed", "waiting_for_user_response", "paused_by_human"]:
-                    return
+            await self._process_executor_output_for_verification(ctx, result)
+            if t.status in ["complete", "failed", "waiting_for_user_response", "paused_by_human"]:
+                return
 
     async def _process_executor_output_for_verification(self, ctx: TaskContext, result: str):
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
         if verify_task_result.get_successful():
-            t.result = result; logger.info(f"COMPLETED [{t.id}]"); t.status = "complete"
-            t.last_llm_history, t.agent_role_paused = None, None; return
+            t.result = result;
+            logger.info(f"COMPLETED [{t.id}]");
+            t.status = "complete"
+            t.last_llm_history, t.agent_role_paused = None, None;
+            return
         t.fix_attempts += 1
         if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
             analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nScore > 5 is a success. Should we retry?"
@@ -670,12 +687,17 @@ class DAGAgent:
                                                                   agent_role_name="retry_analyst")
             if is_paused: return
             if decision.should_retry:
-                t.span.add_event("Grace attempt granted", {"reason": decision.reason}); t.grace_attempts += 1
+                t.span.add_event("Grace attempt granted", {"reason": decision.reason});
+                t.grace_attempts += 1
                 t.human_directive = decision.next_step_suggestion
-                logger.info(f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}"); return
+                logger.info(f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}");
+                return
         if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
-            error_msg = f"Exceeded max attempts for task '{t.id}'"; t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
-            t.status = "failed"; t.last_llm_history, t.agent_role_paused = None, None; raise Exception(error_msg)
+            error_msg = f"Exceeded max attempts for task '{t.id}'";
+            t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
+            t.status = "failed";
+            t.last_llm_history, t.agent_role_paused = None, None;
+            raise Exception(error_msg)
         t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
         logger.info(f"[{t.id}] Retrying execution. Feedback: {verify_task_result.reason[:50]}...")
 
@@ -685,15 +707,18 @@ class DAGAgent:
         is_paused, vout = await self._handle_agent_output(ctx=TaskContext(t.id, self.registry), agent_res=vres,
                                                           expected_output_type=verification, agent_role_name="verifier")
         if is_paused: return verification(reason="Verifier paused to ask question.", message_for_user="", score=0)
-        t.verification_scores.append(vout.score); t.span.set_attribute("verification.score", vout.score)
+        t.verification_scores.append(vout.score);
+        t.span.set_attribute("verification.score", vout.score)
         t.span.set_attribute("verification.reason", vout.reason)
         logger.info(f"   > Verification for [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
         return vout
 
 
 if __name__ == "__main__":
-    try: from nest_asyncio import apply; apply()
-    except ImportError: pass
+    try:
+        from nest_asyncio import apply; apply()
+    except ImportError:
+        pass
     logger.info("==== BEGIN DEMO: HYBRID PLANNING AGENT (WITH RETRIES & CYCLE BREAKING) ====")
     reg = TaskRegistry()
     doc_ids = [reg.add_document(name, content) for name, content in [
@@ -717,16 +742,23 @@ if __name__ == "__main__":
         tracer=trace.get_tracer("hybrid_dag_demo"),
         global_proposal_limit=2,
         max_grace_attempts=1,
-        mcp_server_url=getenv("MCP_SERVER_URL") # NEW: Pass the MCP server URL
+        mcp_server_url=getenv("MCP_SERVER_URL")  # NEW: Pass the MCP server URL
     )
+
+
     async def main():
-        print("\n--- INITIAL TASK STATUS TREE ---"); reg.print_status_tree()
-        print("\n===== EXECUTING DAG AGENT =====\n"); await agent.run()
-        print("\n===== DAG EXECUTION COMPLETE =====\n"); print("\n--- FINAL TASK STATUS TREE ---")
+        print("\n--- INITIAL TASK STATUS TREE ---");
+        reg.print_status_tree()
+        print("\n===== EXECUTING DAG AGENT =====\n");
+        await agent.run()
+        print("\n===== DAG EXECUTION COMPLETE =====\n");
+        print("\n--- FINAL TASK STATUS TREE ---")
         reg.print_status_tree()
         print("\n--- Final Output for Root Task ---\n")
         root_result = reg.tasks.get("ROOT_INVESTOR_BRIEFING")
         if root_result:
             print(f"Final Result (Status: {root_result.status}):\n{root_result.result}")
         print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.tasks.values()):.4f}")
+
+
     asyncio.run(main())

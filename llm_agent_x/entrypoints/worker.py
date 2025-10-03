@@ -9,13 +9,17 @@ from llm_agent_x.agents.interactive_dag_agent import InteractiveDAGAgent
 
 # --- Basic Setup ---
 load_dotenv(".env", override=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("AgentWorker")
 
 
 def setup_initial_tasks() -> TaskRegistry:
     """Creates the initial task registry. It is now empty by default."""
-    logger.info("Setting up an empty initial task registry. Waiting for tasks from the gateway.")
+    logger.info(
+        "Setting up an empty initial task registry. Waiting for tasks from the gateway."
+    )
     # The agent now starts clean. The operator will add the first task via the UI.
     return TaskRegistry()
 
@@ -39,6 +43,7 @@ def main():
     try:
         # For compatibility with some environments like Jupyter
         import nest_asyncio
+
         nest_asyncio.apply()
     except ImportError:
         pass

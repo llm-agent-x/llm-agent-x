@@ -42,7 +42,7 @@ from llm_agent_x.backend.callbacks.mermaidjs_callbacks import (
     on_tool_call_executed,
 )
 from llm_agent_x.console import console, live
-from llm_agent_x.cli_args_parser import parser # Your updated parser
+from llm_agent_x.cli_args_parser import parser  # Your updated parser
 from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
 from openai import AsyncOpenAI
 from pydantic_ai.models.openai import OpenAIModel
@@ -61,8 +61,10 @@ exporter = OTLPSpanExporter(
 )
 provider.add_span_processor(BatchSpanProcessor(exporter))
 
+
 def shutdown_telemetry():
     provider.shutdown()
+
 
 atexit.register(shutdown_telemetry)
 
@@ -98,9 +100,13 @@ def main():
             # --- Agent Dispatch Logic ---
             # ===============================================================
             if args.agent_type == "recursive":
-                console.print(f"Initializing [bold yellow]RecursiveAgent[/bold yellow] for task: '{args.task}'")
+                console.print(
+                    f"Initializing [bold yellow]RecursiveAgent[/bold yellow] for task: '{args.task}'"
+                )
                 # This setup is specific to the RecursiveAgent
-                model_for_recursive = OpenAIModel(args.model, provider=OpenAIProvider(openai_client=client))
+                model_for_recursive = OpenAIModel(
+                    args.model, provider=OpenAIProvider(openai_client=client)
+                )
                 tools_dict_for_agent = {"web_search": brave_web_search}
                 mcp_servers = []
 
@@ -113,15 +119,24 @@ def main():
                         for key, value in config.items():
                             mcp_client = None
                             if value.get("transport") == "streamable_http":
-                                mcp_client = MCPServerStreamableHTTP(url=value.get("url"))
+                                mcp_client = MCPServerStreamableHTTP(
+                                    url=value.get("url")
+                                )
                             if value.get("transport") == "stdio":
-                                mcp_client = MCPServerStdio(command=value.get("command"), args=value.get("args"))
+                                mcp_client = MCPServerStdio(
+                                    command=value.get("command"), args=value.get("args")
+                                )
                             if mcp_client:
                                 mcp_servers.append(mcp_client)
-                    except (FileNotFoundError, json.JSONDecodeError, AssertionError) as e:
-                        console.print(f"[bold red]Error loading MCP config:[/bold red] {e}")
+                    except (
+                        FileNotFoundError,
+                        json.JSONDecodeError,
+                        AssertionError,
+                    ) as e:
+                        console.print(
+                            f"[bold red]Error loading MCP config:[/bold red] {e}"
+                        )
                         sys.exit(1)
-
 
                 agent_instance = RecursiveAgent(
                     task=args.task,
@@ -140,7 +155,11 @@ def main():
                         allow_tools=True,
                         tools_dict=tools_dict_for_agent,
                         task_limits=TaskLimit.from_array(eval(args.task_limit)),
-                        merger={"ai": LLMMerger, "append": AppendMerger, "algorithmic": AlgorithmicMerger}[args.merger],
+                        merger={
+                            "ai": LLMMerger,
+                            "append": AppendMerger,
+                            "algorithmic": AlgorithmicMerger,
+                        }[args.merger],
                     ),
                 )
                 # Run logic for Recursive agent
@@ -155,24 +174,31 @@ def main():
                     total_cost = agent_instance.cost
                 except TaskFailedException as e:
                     console.print_exception()
-                    response = f"ERROR: Task '{args.task}' failed. See logs for details."
+                    response = (
+                        f"ERROR: Task '{args.task}' failed. See logs for details."
+                    )
 
             elif args.agent_type == "dag":
-                console.print(f"Initializing [bold cyan]DAGAgent[/bold cyan] for task: '{args.task}'")
+                console.print(
+                    f"Initializing [bold cyan]DAGAgent[/bold cyan] for task: '{args.task}'"
+                )
                 if not args.dag_documents:
-                    raise ValueError("DAG agent requires initial documents. Use the --dag-documents flag.")
+                    raise ValueError(
+                        "DAG agent requires initial documents. Use the --dag-documents flag."
+                    )
 
                 # This setup is specific to the DAGAgent
                 registry = TaskRegistry()
                 try:
-                    with open(args.dag_documents, 'r') as f:
+                    with open(args.dag_documents, "r") as f:
                         documents = json.load(f)
                     for doc in documents:
-                        registry.add_document(doc['name'], doc['content'])
+                        registry.add_document(doc["name"], doc["content"])
                 except (FileNotFoundError, json.JSONDecodeError) as e:
-                    console.print(f"[bold red]Error loading DAG documents:[/bold red] {e}")
+                    console.print(
+                        f"[bold red]Error loading DAG documents:[/bold red] {e}"
+                    )
                     sys.exit(1)
-
 
                 root_task = Task(
                     id="ROOT_TASK",
@@ -183,7 +209,7 @@ def main():
 
                 agent_instance = DAGAgent(
                     registry=registry,
-                    llm_model=args.model, # DAGAgent takes the model name string
+                    llm_model=args.model,  # DAGAgent takes the model name string
                     tools=available_tools,
                     tracer=tracer,
                     max_grace_attempts=args.max_grace_attempts,
@@ -199,7 +225,6 @@ def main():
                 response = registry.tasks.get("ROOT_TASK").result
                 total_cost = sum(t.cost for t in registry.tasks.values())
 
-
             # ===============================================================
             # --- Common Post-Execution Logic ---
             # ===============================================================
@@ -207,11 +232,15 @@ def main():
                 output_file = output_dir / args.output
                 with output_file.open("w", encoding="utf-8") as output_f:
                     output_f.write(str(response))
-                console.print(f"\nAgent response saved to {output_file}", style="bold magenta")
+                console.print(
+                    f"\nAgent response saved to {output_file}", style="bold magenta"
+                )
 
             console.print("\nFinal Response:\n", style="bold green")
             console.print(str(response))
-            console.print(f"\nTotal estimated cost: ${total_cost:.4f}", style="bold yellow")
+            console.print(
+                f"\nTotal estimated cost: ${total_cost:.4f}", style="bold yellow"
+            )
             span.set_attribute("agent.total_cost", total_cost)
 
     except Exception as e:
