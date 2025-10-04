@@ -352,16 +352,15 @@ class InteractiveDAGAgent(DAGAgent):
     # This ensures consistency for auto-answering and simple type checks.
     # Note: the broadcast_callback is specific to InteractiveDAGAgent.
     async def _handle_agent_output(
-        self,
-        ctx: TaskContext,
-        agent_res: AgentRunResult,
-        expected_output_type: Any,
-        agent_role_name: str,
+            self,
+            ctx: TaskContext,
+            agent_res: AgentRunResult,
+            expected_output_type: Any,
+            agent_role_name: str,
     ) -> Tuple[bool, Any]:
         """
-        Processes an agent's output. NO LONGER PAUSES FOR UserQuestion.
-        Stores the full message history of the agent run.
-        Returns (is_paused, actual_output).
+        Processes an agent's output. Allows ONLY the 'question_formulator'
+        to pause the task by asking a UserQuestion.
         """
         t = ctx.task
         self._add_llm_data_to_span(t.span, agent_res, t)
@@ -373,19 +372,38 @@ class InteractiveDAGAgent(DAGAgent):
 
         actual_output = agent_res.output
 
-        # REMOVED: The entire block that checked for UserQuestion and paused the task.
-        # Agents are no longer allowed to ask questions.
-        # If an LLM attempts to output a UserQuestion, Pydantic-AI will
-        # interpret it as a schema mismatch, resulting in actual_output being None
-        # or an invalid type, which will cause downstream retry/failure logic.
+        # --- NEW TARGETED EXCEPTION LOGIC ---
+        if isinstance(actual_output, UserQuestion):
+            # ONLY the question_formulator is allowed to pause the system.
+            if agent_role_name == "question_formulator":
+                logger.info(
+                    f"Task [{t.id}] escalating to human with question (Priority: {actual_output.priority}): {actual_output.question[:80]}..."
+                )
+                t.current_question = actual_output
+                t.agent_role_paused = agent_role_name
+                t.status = "waiting_for_user_response"
+                self._broadcast_state_update(t)  # Broadcast the pause state
+                return True, actual_output  # Signal that the task was successfully paused
+            else:
+                # Any other agent attempting to ask a question is violating the "forced decisiveness" rule.
+                logger.warning(
+                    f"Agent '{agent_role_name}' for task [{t.id}] attempted to ask a question, which is not allowed. "
+                    "This will be treated as an invalid output."
+                )
+                # Let it fall through to be treated as a schema mismatch / failure.
+                pass
+        # --- END OF NEW LOGIC ---
 
         if not isinstance(actual_output, BaseModel) and not isinstance(
-            actual_output, str
+                actual_output, str
         ):
             logger.warning(
-                f"Task [{t.id}] received an unexpected non-BaseModel/str output from agent. Expected {str(expected_output_type)}, got {type(actual_output).__name__}. This might indicate a schema mismatch or LLM deviation."
+                f"Task [{t.id}] received an unexpected non-BaseModel/str output from agent '{agent_role_name}'. "
+                f"Expected {str(expected_output_type)}, got {type(actual_output).__name__}. This might indicate a schema mismatch or LLM deviation."
             )
-        return False, actual_output  # MODIFIED: This is now the default behavior.
+
+        # Default behavior for all non-pausing scenarios.
+        return False, actual_output
 
     def _listen_for_directives_target(self):
         """
