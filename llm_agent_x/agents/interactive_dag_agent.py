@@ -1089,12 +1089,10 @@ class InteractiveDAGAgent(DAGAgent):
         t = ctx.task
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
-        # --- NEW DEPENDENCY PRUNING LOGIC ---
-        # Children are core to synthesis and are non-negotiable.
-        # Pruning applies to other, contextual dependencies.
+        # --- DEPENDENCY PRUNING LOGIC ---
         children_ids = set(t.children)
         prunable_deps_ids = t.deps - children_ids
-        final_deps_to_use = children_ids.copy()  # Start with all children
+        final_deps_to_use = children_ids.copy()
 
         if len(prunable_deps_ids) > self.max_dependencies_per_task:
             logger.warning(
@@ -1124,24 +1122,21 @@ class InteractiveDAGAgent(DAGAgent):
                 t.span.set_attribute("dependencies.pruned_count", len(prunable_deps_ids) - len(approved_ids))
             else:
                 logger.error(f"[{t.id}] Dependency pruner failed. Using a random subset of dependencies as a fallback.")
-                # Fallback: if the pruner fails, take a random sample to prevent context overflow
                 import random
-                fallback_deps = set(random.sample(list(prunable_deps_ids), self.max_dependencies_per_task))
+                # Ensure we don't try to sample more items than exist
+                sample_size = min(self.max_dependencies_per_task, len(prunable_deps_ids))
+                fallback_deps = set(random.sample(list(prunable_deps_ids), sample_size))
                 final_deps_to_use.update(fallback_deps)
         else:
-            # No pruning needed, use all prunable dependencies
             final_deps_to_use.update(prunable_deps_ids)
 
-        # --- END OF NEW LOGIC ---
-
-        # The rest of the function now uses the pruned `final_deps_to_use` set
+        # --- PROMPT BUILDING ---
         child_results = {
             self.registry.tasks[cid].desc: self.registry.tasks[cid].result
             for cid in t.children
             if self.registry.tasks[cid].status == "complete" and self.registry.tasks[cid].result
         }
 
-        # Use the pruned set, excluding children which are already handled
         pruned_dep_ids = final_deps_to_use - children_ids
         dep_results = {
             self.registry.tasks[did].desc: self.registry.tasks[did].result
@@ -1161,7 +1156,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         prompt_base_content = "".join(prompt_lines)
 
-        # ... the rest of the _run_task_execution method (MCP setup, executor loop, etc.) remains exactly the same ...
+        # --- EXECUTOR AND MCP SETUP ---
         task_specific_mcp_clients = []
         task_specific_tools = list(self._tools_for_agents)
 
@@ -1193,6 +1188,7 @@ class InteractiveDAGAgent(DAGAgent):
             mcp_servers=task_specific_mcp_clients,
         )
 
+        # --- EXECUTION AND RETRY LOOP ---
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts + 1
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
@@ -1262,7 +1258,11 @@ class InteractiveDAGAgent(DAGAgent):
                 continue
 
             await self._process_executor_output_for_verification(ctx, result)
-            if t.status in ["complete", "failed", "paused_by_human"]:
+
+            # --- CRITICAL FIX ---
+            # After handling verification, if the task was paused or has reached a terminal state,
+            # we must exit this execution loop to prevent re-running immediately.
+            if t.status in ["complete", "failed", "paused_by_human", "waiting_for_user_response"]:
                 return
 
     async def _process_executor_output_for_verification(
