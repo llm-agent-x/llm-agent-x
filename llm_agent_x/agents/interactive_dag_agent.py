@@ -1455,7 +1455,8 @@ class InteractiveDAGAgent(DAGAgent):
         self, ctx: TaskContext, result: str
     ):
         """
-        Overrides the base verification logic to implement a multi-stage, interactive failure analysis chain.
+        Overrides the base verification logic to implement a multi-stage, interactive failure analysis chain,
+        prioritizing human escalation before autonomous retries.
         """
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
@@ -1470,15 +1471,39 @@ class InteractiveDAGAgent(DAGAgent):
 
         t.fix_attempts += 1
 
-        # --- BEGIN INTERACTIVE FAILURE ANALYSIS CHAIN ---
+        # Are we still in the standard, pre-analysis retry phase?
+        if (t.fix_attempts < t.max_fix_attempts):
+            t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
+            logger.info(f"[{t.id}] Retrying execution (Attempt {t.fix_attempts + 1}). Feedback: {verify_task_result.reason[:50]}...")
+            self._broadcast_state_update(t)
+            return
 
-        # STAGE 1: Consult the Retry Analyst for a potential autonomous grace attempt.
-        if (
-            t.fix_attempts >= t.max_fix_attempts
-            and t.grace_attempts < self.max_grace_attempts
-        ):
-            logger.info(f"[{t.id}] Max autonomous attempts reached. Consulting retry analyst...")
-            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nDecide if an autonomous retry is viable."
+        # --- BEGIN FAILURE ANALYSIS CHAIN (triggered after max standard attempts) ---
+        logger.info(f"[{t.id}] Max standard attempts reached. Initiating failure analysis chain...")
+
+        # STEP A: Check for Information Need (First Priority)
+        logger.info(f"[{t.id}] (Step A) Consulting information gap detector...")
+        detector_prompt = f"Task History:\nTask: '{t.desc}'\nScores: {t.verification_scores}\nIs this failure fundamentally due to missing info that a human must provide?"
+        detector_res = await self.information_gap_detector.run(user_prompt=detector_prompt, message_history=t.last_llm_history)
+        info_decision = detector_res.output
+
+        if info_decision and info_decision.is_needed:
+            logger.info(f"[{t.id}] Information gap detected. Formulating question for operator...")
+            formulator_prompt = f"Context: The task '{t.desc}' has failed with scores {t.verification_scores}. A root cause analysis determined it's missing key information. Formulate the single, most critical question to ask the human."
+            question_res = await self.question_formulator.run(user_prompt=formulator_prompt, message_history=t.last_llm_history)
+
+            is_paused, _ = await self._handle_agent_output(
+                ctx=ctx, agent_res=question_res, expected_output_type=UserQuestion, agent_role_name="question_formulator"
+            )
+            if is_paused:
+                logger.info(f"[{t.id}] Escalation successful. Task is now 'waiting_for_user_response'.")
+                return # SUCCESSFUL EXIT: Task is paused awaiting human input.
+
+        # STEP B: Decide on Autonomous Retry (Second Priority)
+        # This code only runs if the information detector said 'is_needed: False'.
+        if t.grace_attempts < self.max_grace_attempts:
+            logger.info(f"[{t.id}] (Step B) Information gap ruled out. Consulting retry analyst for grace attempt...")
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nAn information gap was ruled out. Decide if one final autonomous grace attempt is viable."
             decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt, message_history=t.last_llm_history)
             decision = decision_res.output
 
@@ -1488,42 +1513,16 @@ class InteractiveDAGAgent(DAGAgent):
                 t.human_directive = decision.next_step_suggestion
                 logger.info(f"[{t.id}] Grace attempt granted by analyst. Next step: {decision.next_step_suggestion}")
                 self._broadcast_state_update(t)
-                return  # Exit the analysis chain and perform the grace attempt.
-            else:
-                logger.warning(f"[{t.id}] Retry analyst ruled out further autonomous attempts. Proceeding to Stage 2.")
+                return  # SUCCESSFUL EXIT: Perform the grace attempt.
 
-        # STAGE 2 & 3: Escalate to human if all autonomous options are exhausted.
-        if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
-            logger.info(f"[{t.id}] Consulting information gap detector...")
-            detector_prompt = f"Task History:\nTask: '{t.desc}'\nScores: {t.verification_scores}\nIs this failure fundamentally due to missing info?"
-            detector_res = await self.information_gap_detector.run(user_prompt=detector_prompt, message_history=t.last_llm_history)
-            info_decision = detector_res.output
-
-            if info_decision and info_decision.is_needed:
-                logger.info(f"[{t.id}] Information gap detected. Formulating question for operator...")
-                formulator_prompt = f"Context: The task '{t.desc}' has failed with scores {t.verification_scores}. A root cause analysis determined it's missing key information. Formulate the question to ask the human."
-                question_res = await self.question_formulator.run(user_prompt=formulator_prompt, message_history=t.last_llm_history)
-
-                is_paused, _ = await self._handle_agent_output(
-                    ctx=ctx, agent_res=question_res, expected_output_type=UserQuestion, agent_role_name="question_formulator"
-                )
-                if is_paused:
-                    logger.info(f"[{t.id}] Escalation successful. Task is now 'waiting_for_user_response'.")
-                    return
-
-        # FINAL OUTCOME: If we reach here, all recovery paths have been exhausted.
-        if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
-            error_msg = f"Exceeded max attempts for task '{t.id}'. All recovery options failed."
-            t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
-            t.status = "failed"
-            self._broadcast_state_update(t)
-            t.last_llm_history, t.agent_role_paused = None, None
-            raise Exception(error_msg)
-
-        # Default action for standard retries before the analyst is consulted.
-        t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
-        logger.info(f"[{t.id}] Retrying execution (Attempt {t.fix_attempts}). Feedback: {verify_task_result.reason[:50]}...")
+        # STEP C: Final Failure (Last Resort)
+        # This code only runs if Step A was False AND Step B was False.
+        error_msg = f"Exceeded max attempts for task '{t.id}'. All recovery options exhausted."
+        t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
+        t.status = "failed"
         self._broadcast_state_update(t)
+        t.last_llm_history, t.agent_role_paused = None, None
+        raise Exception(error_msg)
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
