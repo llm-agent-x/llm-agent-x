@@ -226,8 +226,9 @@ class InteractiveDAGAgent(DAGAgent):
         This does NOT use the agent's history, preventing context overflow.
         Agent's output type had better be a Pydantic model, or who knows what happens?
         """
-        t = ctx.task
-        logger.info(f"[{t.id}] Running stateless agent: {agent.__class__.__name__}")
+        t = ctx.task if ctx else None
+        if t:
+            logger.info(f"[{t.id}] Running stateless agent: {agent.__class__.__name__}")
 
         # Prepare the request parameters. Pydantic-AI needs the output schema defined as a tool.
         params = ModelRequestParameters()
@@ -263,8 +264,8 @@ class InteractiveDAGAgent(DAGAgent):
 
                 def usage(self):
                     return self._usage
-
-            self._add_llm_data_to_span(t.span, DummyResult(resp.usage), t)
+            if t:
+                self._add_llm_data_to_span(t.span, DummyResult(resp.usage), t)
 
             # Parse the response
             if output_is_model:
@@ -279,7 +280,10 @@ class InteractiveDAGAgent(DAGAgent):
                     return output
 
                 else:
-                    logger.error(f"[{t.id}] Stateless agent failed to produce structured output.")
+                    if t:
+                        logger.error(f"[{t.id}] Stateless agent failed to produce structured output.")
+                    else:
+                        logger.error(f"Stateless agent failed to produce structured output.")
                     return None
             else:
                 # For simple string output
@@ -287,7 +291,8 @@ class InteractiveDAGAgent(DAGAgent):
 
         except Exception as e:
             logger.error(f"[{t.id}] Exception in _run_stateless_agent: {e}", exc_info=True)
-            t.span.record_exception(e)
+            if t:
+                t.span.record_exception(e)
             return None
 
     def _inject_and_clear_user_response(self, prompt_parts: List[str], task: Task):
@@ -1016,25 +1021,43 @@ class InteractiveDAGAgent(DAGAgent):
         ]
         self._inject_and_clear_user_response(prompt_parts, t)
         if t.human_directive:
-            prompt_parts.append(f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
+            prompt_parts.append(
+                f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
             self._broadcast_state_update(t)
         full_prompt = "\n".join(prompt_parts)
 
-        # --- REFACTORED LOGIC ---
         initial_plan = await self._run_stateless_agent(self.initial_planner, full_prompt, ctx)
         if not initial_plan:
-            t.status = "failed"; self._broadcast_state_update(t)
-            logger.error(f"[{t.id}] Initial planner returned no plan."); return
+            t.status = "failed"
+            self._broadcast_state_update(t)
+            logger.error(f"[{t.id}] Initial planner returned no plan.")
+            return
 
+        plan = initial_plan
         if initial_plan.needs_subtasks and initial_plan.subtasks:
             fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
-            plan = await self._run_stateless_agent(self.cycle_breaker, fixer_prompt, ctx)
-            if not plan:
-                t.status = "failed"; self._broadcast_state_update(t)
-                logger.error(f"[{t.id}] Cycle breaker returned no plan."); return
-        else:
-            plan = initial_plan
+            fixed_plan = await self._run_stateless_agent(self.cycle_breaker, fixer_prompt, ctx)
+            if not fixed_plan:
+                t.status = "failed"
+                self._broadcast_state_update(t)
+                logger.error(f"[{t.id}] Cycle breaker returned no plan.")
+                return
+            plan = fixed_plan
+
+        # --- LOGIC RESTORED ---
+        # This is the critical section that was missing. It processes the final plan.
+        if not plan.needs_subtasks:
+            # If the planner decides no subtasks are needed, the task is complete.
+            t.status = "complete"
+            t.already_planned = True
+            self._broadcast_state_update(t)
+            t.last_llm_history = None
+            t.agent_role_paused = None
+            return
+
+        # If subtasks are needed, process them to add them to the graph.
+        await self._process_initial_planning_output(ctx, plan)
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -1335,9 +1358,11 @@ class InteractiveDAGAgent(DAGAgent):
                     # --- Stateless Agent Pattern ---
                     # Create a dummy TaskContext because _run_stateless_agent requires it
                     # for telemetry, even though this isn't a real, registered task.
-                    dummy_ctx = TaskContext(task_id="GLOBAL_RESOLVER", registry=self.registry)
-                    dummy_task = Task(id="GLOBAL_RESOLVER", desc="Resolving proposal conflicts")
-                    dummy_ctx.task = dummy_task  # Manually attach the task to the context.
+                    # dummy_ctx = TaskContext(task_id="GLOBAL_RESOLVER", registry=self.registry)
+                    # dummy_task = Task(id="GLOBAL_RESOLVER", desc="Resolving proposal conflicts")
+                    # dummy_ctx.task = dummy_task  # Manually attach the task to the context.
+
+                    dummy_ctx = None
 
                     # Call the stateless helper instead of the full Agent.run()
                     resolved_plan = await self._run_stateless_agent(self.conflict_resolver, resolver_prompt, dummy_ctx)
