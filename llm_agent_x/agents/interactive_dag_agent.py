@@ -16,9 +16,15 @@ from phoenix.trace.schemas import SpanAttributes
 from pydantic import BaseModel
 from pydantic_ai.agent import AgentRunResult, Agent, CallToolsNode, ModelRequestNode
 from pydantic_ai.mcp import MCPServerStreamableHTTP
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart, ModelResponse, ModelResponsePart, TextPart
+from pydantic_ai.messages import ToolCallPart, ToolReturnPart, ModelResponse, ModelResponsePart, TextPart, \
+    SystemPromptPart, UserPromptPart
 from pydantic_ai.result import FinalResult
 from pydantic_graph import End
+
+from pydantic_ai.direct import model_request
+from pydantic_ai.messages import ModelRequest
+from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.tools import ToolDefinition
 
 from llm_agent_x.agents.dag_agent import (
     DAGAgent,
@@ -211,6 +217,94 @@ class InteractiveDAGAgent(DAGAgent):
             "information_gap_detector": self.information_gap_detector,
             "question_formulator": self.question_formulator,
         }
+
+    async def _run_stateless_agent(
+            self, agent: Agent, user_prompt: str, ctx: TaskContext
+    ) -> Union[BaseModel, str, None]:
+        """
+        Runs a "one-shot" stateless request for decision-making agents.
+        This does NOT use the agent's history, preventing context overflow.
+        Agent's output type had better be a Pydantic model, or who knows what happens?
+        """
+        t = ctx.task
+        logger.info(f"[{t.id}] Running stateless agent: {agent.__class__.__name__}")
+
+        # Prepare the request parameters. Pydantic-AI needs the output schema defined as a tool.
+        params = ModelRequestParameters()
+        output_is_model = isinstance(agent.output_type, type) and issubclass(agent.output_type, BaseModel)
+        if output_is_model:
+            params.output_tools = [
+                ToolDefinition(
+                    name="output",
+                    description="The structured output response.",
+                    parameters_json_schema=agent.output_type.model_json_schema()
+                )
+            ]
+
+        messages = [
+            ModelRequest(parts=[
+                UserPromptPart(user_prompt),
+            ], instructions="\n\n".join(agent._system_prompts) + "\n\nUse the `output` tool."),
+        ]
+
+        try:
+            # Make the direct, stateless API call
+            resp = await model_request(
+                agent.model,
+                messages,
+                model_request_parameters=params
+            )
+
+            # Manually add telemetry data since we are not using Agent.run()
+            # We create a dummy object with a usage() method to satisfy _add_llm_data_to_span
+            class DummyResult:
+                def __init__(self, usage_data):
+                    self._usage = usage_data
+
+                def usage(self):
+                    return self._usage
+
+            self._add_llm_data_to_span(t.span, DummyResult(resp.usage), t)
+
+            # Parse the response
+            if output_is_model:
+
+                logger.info(f"One shot response: {resp.parts[0]}")
+
+                # For structured output, parse the tool call from the response
+                if resp.parts and resp.parts[0].tool_name == "output":
+                    args_as_dict = resp.parts[0].args_as_dict()
+                    output = agent.output_type(**args_as_dict)
+                    logger.info(f"One shot response (pydantic-ified): {output}")
+                    return output
+
+                else:
+                    logger.error(f"[{t.id}] Stateless agent failed to produce structured output.")
+                    return None
+            else:
+                # For simple string output
+                return resp.parts[0].content if resp.parts else None
+
+        except Exception as e:
+            logger.error(f"[{t.id}] Exception in _run_stateless_agent: {e}", exc_info=True)
+            t.span.record_exception(e)
+            return None
+
+    def _inject_and_clear_user_response(self, prompt_parts: List[str], task: Task):
+        """
+        Checks for a user response on the task, prepends it to the prompt parts,
+        and clears it to ensure it's only used once.
+        """
+        if task.user_response:
+            logger.info(f"Injecting user response into prompt for task [{task.id}]")
+            response_prompt = (
+                f"\n--- CRITICAL INFORMATION PROVIDED BY HUMAN OPERATOR ---\n"
+                f"{task.user_response}\n"
+                f"----------------------------------------------------------\n"
+            )
+            prompt_parts.insert(0, response_prompt)  # Prepend to the prompt
+            task.user_response = None  # Clear it after use
+            self._broadcast_state_update(task)  # Broadcast the cleared state
 
     def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
         """Adds LLM usage data to a span for a system-level operation without a task context."""
@@ -920,75 +1014,27 @@ class InteractiveDAGAgent(DAGAgent):
             f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
             self._get_notebook_tool_guidance(t, "initial_planner"),
         ]
-
+        self._inject_and_clear_user_response(prompt_parts, t)
         if t.human_directive:
-            prompt_parts.append(
-                f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n"
-            )
+            prompt_parts.append(f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
-            self._broadcast_state_update(t)  # ADDED: Broadcast cleared directive
-
+            self._broadcast_state_update(t)
         full_prompt = "\n".join(prompt_parts)
 
-        plan_res = await self.initial_planner.run(
-            user_prompt=full_prompt, message_history=t.last_llm_history
-        )
-        # _handle_agent_output no longer pauses for UserQuestion.
-        # If the LLM produces unexpected output, it will be treated as non-successful.
-        is_paused, initial_plan = await self._handle_agent_output(
-            ctx=ctx,
-            agent_res=plan_res,
-            expected_output_type=ExecutionPlan,
-            agent_role_name="initial_planner",
-        )
-        if initial_plan is None:  # Treat invalid/empty plan as a failure
-            t.status = "failed"
-            self._broadcast_state_update(t)
-            logger.error(
-                f"[{t.id}] Initial planner returned no plan or invalid output."
-            )
-            return
+        # --- REFACTORED LOGIC ---
+        initial_plan = await self._run_stateless_agent(self.initial_planner, full_prompt, ctx)
+        if not initial_plan:
+            t.status = "failed"; self._broadcast_state_update(t)
+            logger.error(f"[{t.id}] Initial planner returned no plan."); return
 
         if initial_plan.needs_subtasks and initial_plan.subtasks:
             fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
-            # Cycle breaker does not get notebook update guidance
-            fixed_plan_res = await self.cycle_breaker.run(
-                user_prompt=fixer_prompt, message_history=t.last_llm_history
-            )
-            # MODIFIED: is_paused_cb check removed here
-            is_paused_cb, plan = await self._handle_agent_output(
-                ctx=ctx,
-                agent_res=fixed_plan_res,
-                expected_output_type=ExecutionPlan,
-                agent_role_name="cycle_breaker",
-            )
-            if plan is None:  # Treat invalid/empty fixed plan as a failure
-                t.status = "failed"
-                self._broadcast_state_update(t)
-                logger.error(
-                    f"[{t.id}] Cycle breaker returned no plan or invalid output."
-                )
-                return
+            plan = await self._run_stateless_agent(self.cycle_breaker, fixer_prompt, ctx)
+            if not plan:
+                t.status = "failed"; self._broadcast_state_update(t)
+                logger.error(f"[{t.id}] Cycle breaker returned no plan."); return
         else:
             plan = initial_plan
-
-        if not plan.needs_subtasks:
-            t.status = "complete"
-            t.already_planned = True
-            self._broadcast_state_update(t)
-            t.last_llm_history = None
-            t.agent_role_paused = None
-            return
-
-        await self._process_initial_planning_output(ctx, plan)
-        # MODIFIED: Removed "waiting_for_user_response"
-        if t.status not in ["paused_by_human"]:
-            t.already_planned = True
-            t.status = "waiting_for_children" if t.children else "complete"
-            if t.status == "complete":
-                t.last_llm_history = None
-                t.agent_role_paused = None
-            self._broadcast_state_update(t)
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -1048,16 +1094,9 @@ class InteractiveDAGAgent(DAGAgent):
 
         full_prompt = "\n".join(prompt_parts)
 
-        proposals_res = await self.adaptive_decomposer.run(
-            user_prompt=full_prompt, message_history=t.last_llm_history
-        )
-        is_paused, proposals_response = await self._handle_agent_output(
-            ctx=ctx,
-            agent_res=proposals_res,
-            expected_output_type=AdaptiveDecomposerResponse,
-            agent_role_name="adaptive_decomposer",
-        )
-        if proposals_response is None:
+        proposals_response = await self._run_stateless_agent(self.adaptive_decomposer, full_prompt, ctx)
+
+        if not proposals_response:
             t.status = "failed"
             self._broadcast_state_update(t)
             logger.error(
@@ -1265,6 +1304,67 @@ class InteractiveDAGAgent(DAGAgent):
             if t.status in ["complete", "failed", "paused_by_human", "waiting_for_user_response"]:
                 return
 
+    async def _run_global_resolution(self):
+        """
+        System-level operation to evaluate all buffered task proposals, resolve conflicts
+        if the number of proposals exceeds the global limit, and commit the approved
+        tasks to the graph. This uses the new stateless agent pattern.
+        """
+        # A span is used for observability since this is not a real task.
+        with self.tracer.start_as_current_span("GlobalConflictResolution") as span:
+            logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
+            span.set_attribute("proposals.count", len(self.proposed_tasks_buffer))
+
+            # A try...finally block is critical to guarantee the buffer is always cleared,
+            # preventing an infinite loop of re-evaluating the same proposals.
+            try:
+                approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
+                parent_map = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
+
+                # Only engage the expensive conflict resolver if the proposal limit is exceeded.
+                if len(approved_proposals) > self.global_proposal_limit:
+                    logger.warning(
+                        f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver."
+                    )
+                    span.add_event("Conflict detected, engaging resolver.")
+
+                    prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
+                                   approved_proposals]
+                    resolver_prompt = f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
+
+                    # --- Stateless Agent Pattern ---
+                    # Create a dummy TaskContext because _run_stateless_agent requires it
+                    # for telemetry, even though this isn't a real, registered task.
+                    dummy_ctx = TaskContext(task_id="GLOBAL_RESOLVER", registry=self.registry)
+                    dummy_task = Task(id="GLOBAL_RESOLVER", desc="Resolving proposal conflicts")
+                    dummy_ctx.task = dummy_task  # Manually attach the task to the context.
+
+                    # Call the stateless helper instead of the full Agent.run()
+                    resolved_plan = await self._run_stateless_agent(self.conflict_resolver, resolver_prompt, dummy_ctx)
+                    # --- End of Pattern ---
+
+                    if resolved_plan and isinstance(resolved_plan, ProposalResolutionPlan):
+                        approved_proposals = resolved_plan.approved_tasks
+                        span.set_attribute("proposals.approved_count", len(approved_proposals))
+                        span.set_status(StatusCode.OK)
+                    else:
+                        # If the agent fails, fail safely by discarding all proposals for this cycle.
+                        logger.error(
+                            "Conflict resolver failed to return a valid plan. Discarding all proposals for this cycle."
+                        )
+                        approved_proposals = []
+                        span.set_status(trace.Status(StatusCode.ERROR, "Resolver returned invalid output"))
+
+                if approved_proposals:
+                    logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
+                    self._commit_proposals(approved_proposals, parent_map)
+                else:
+                    logger.info("No proposals were approved or committed in this cycle.")
+
+            finally:
+                # This is the most important part: always clear the buffer to prevent re-processing.
+                self.proposed_tasks_buffer = []
+
     async def _process_executor_output_for_verification(
         self, ctx: TaskContext, result: str
     ):
@@ -1274,6 +1374,11 @@ class InteractiveDAGAgent(DAGAgent):
         """
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
+
+        if not verify_task_result:
+            t.status = "failed"
+            self._broadcast_state_update(t)
+            return
 
         if verify_task_result.get_successful():
             t.result = result
@@ -1298,8 +1403,7 @@ class InteractiveDAGAgent(DAGAgent):
         # STEP A: Check for Information Need (First Priority)
         logger.info(f"[{t.id}] (Step A) Consulting information gap detector...")
         detector_prompt = f"Task History:\nTask: '{t.desc}'\nScores: {t.verification_scores}\nIs this failure fundamentally due to missing info that a human must provide?"
-        detector_res = await self.information_gap_detector.run(user_prompt=detector_prompt, message_history=t.last_llm_history)
-        info_decision = detector_res.output
+        info_decision = await self._run_stateless_agent(self.information_gap_detector, detector_prompt, ctx)
 
         if info_decision and info_decision.is_needed:
             logger.info(f"[{t.id}] Information gap detected. Formulating question for operator...")
@@ -1346,12 +1450,7 @@ class InteractiveDAGAgent(DAGAgent):
             user_prompt=ver_prompt, message_history=t.last_llm_history
         )
         # _handle_agent_output no longer pauses for UserQuestion.
-        is_paused, vout = await self._handle_agent_output(
-            ctx=TaskContext(t.id, self.registry),
-            agent_res=vres,
-            expected_output_type=verification,
-            agent_role_name="verifier",
-        )
+        vout = await self._run_stateless_agent(self.verifier, ver_prompt, TaskContext(t.id, self.registry))
         if vout is None:  # Treat invalid/empty verification as score 0 (worst)
             logger.error(
                 f"[{t.id}] Verifier returned no output or invalid output. Assigning score 0."
