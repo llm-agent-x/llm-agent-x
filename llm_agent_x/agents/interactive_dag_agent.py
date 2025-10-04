@@ -14,8 +14,11 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 from phoenix.trace.schemas import SpanAttributes
 from pydantic import BaseModel
-from pydantic_ai.agent import AgentRunResult, Agent
+from pydantic_ai.agent import AgentRunResult, Agent, CallToolsNode, ModelRequestNode
 from pydantic_ai.mcp import MCPServerStreamableHTTP
+from pydantic_ai.messages import ToolCallPart, ToolReturnPart, ModelResponse, ModelResponsePart, TextPart
+from pydantic_ai.result import FinalResult
+from pydantic_graph import End
 
 from llm_agent_x.agents.dag_agent import (
     DAGAgent,
@@ -257,9 +260,63 @@ class InteractiveDAGAgent(DAGAgent):
                 exc_info=False,
             )
 
+    def _format_stream_node(self, node: Any) -> Optional[Dict[str, Any]]:
+        """
+        Formats a Pydantic-AI stream node from agent.iter() into a UI-friendly dictionary.
+        """
 
+        # Helper function to truncate long strings for UI display
+        def truncate(s: Any, length: int = 250) -> str:
+            s_str = str(s)
+            return s_str if len(s_str) <= length else s_str[:length - 3] + "..."
 
-    # --- Override _handle_agent_output for Interactive DAG Agent (from dag_agent.py) ---
+        # NEW: Check for the high-level node that contains the model's response parts
+        if isinstance(node, CallToolsNode):
+            # A CallToolsNode contains the model's response. Iterate through its parts.
+            for part in node.model_response.parts:
+                # CHANGED: Check for the concrete TextPart class
+                if isinstance(part, TextPart):
+                    content = part.content.strip()
+                    # Your original logic to capture "thoughts" was good, we just apply it here.
+                    if content:
+                        return {"type": "thought", "content": truncate(content)}
+
+                # This check for ToolCallPart is now correctly placed
+                elif isinstance(part, ToolCallPart):
+                    return {
+                        "type": "tool_call",
+                        "tool_name": part.tool_name,
+                        "args": part.args_as_dict()
+                    }
+
+        # NEW: Tool results are found inside the *next* request sent to the model
+        elif isinstance(node, ModelRequestNode):
+            # Check if this request contains the result of a tool call
+            for part in node.request.parts:
+                # CHANGED: Use the correct class name `ToolResultPart`
+                if isinstance(part, ToolReturnPart):
+                    return {
+                        "type": "tool_result",
+                        "tool_name": part.tool_name,
+                        # The result content is in the `content` attribute
+                        "result": truncate(part.content)
+                    }
+
+        # NEW: Check for the `End` node which contains the `FinalResult`
+        elif isinstance(node, End):
+            # The `End` node signals the agent is done and is producing the final answer.
+            if isinstance(node.data, FinalResult):
+                # You can either signal synthesis is starting, or pass the final output.
+                # Passing the final output is often more useful.
+                return {
+                    "type": "final_answer",
+                    "content": node.data.output
+                }
+
+        # Return None for node types we don't want to display (like UserPromptNode)
+        return None
+
+        # --- Override _handle_agent_output for Interactive DAG Agent (from dag_agent.py) ---
     # This ensures consistency for auto-answering and simple type checks.
     # Note: the broadcast_callback is specific to InteractiveDAGAgent.
     async def _handle_agent_output(
@@ -1268,59 +1325,44 @@ class InteractiveDAGAgent(DAGAgent):
             did: self.registry.tasks[did].result
             for did in t.deps
             if self.registry.tasks[did].status == "complete"
-            and did not in child_results
+               and did not in child_results
         }
 
         prompt_lines = [f"Your task is: {t.desc}\n"]
         if child_results:
-            prompt_lines.append(
-                "\nSynthesize the results from your sub-tasks into a final answer:\n"
-            )
+            prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
             for cid, res in child_results.items():
-                prompt_lines.append(
-                    f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n"
-                )
+                prompt_lines.append(f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n")
         elif dep_results:
             prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
             for did, res in dep_results.items():
-                prompt_lines.append(
-                    f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n"
-                )
+                prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")
 
-        # FIXED: Use "".join to prevent extra newlines
         prompt_base_content = "".join(prompt_lines)
 
         task_specific_mcp_clients = []
         task_specific_tools = list(self._tools_for_agents)
 
+        # ... (MCP server setup logic remains exactly the same) ...
         if t.mcp_servers:
-            logger.info(
-                f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients."
-            )
+            logger.info(f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients.")
             for server_config in t.mcp_servers:
                 address = server_config.get("address")
                 server_type = server_config.get("type")
                 server_name = server_config.get("name", address)
                 if not address:
-                    logger.warning(
-                        f"Task [{t.id}]: MCP server config missing address. Skipping."
-                    )
+                    logger.warning(f"Task [{t.id}]: MCP server config missing address. Skipping.")
                     continue
                 try:
                     if server_type == "streamable_http":
                         client = MCPServerStreamableHTTP(address)
                         task_specific_mcp_clients.append(client)
-                        logger.info(
-                            f"[{t.id}]: Initialized StreamableHTTP MCP client for '{server_name}' at {address}"
-                        )
+                        logger.info(f"[{t.id}]: Initialized StreamableHTTP MCP client for '{server_name}' at {address}")
                     else:
                         logger.warning(
-                            f"[{t.id}]: Unknown MCP server type '{server_type}' for '{server_name}'. Skipping."
-                        )
+                            f"[{t.id}]: Unknown MCP server type '{server_type}' for '{server_name}'. Skipping.")
                 except Exception as e:
-                    logger.error(
-                        f"[{t.id}]: Failed to create MCP client for '{server_name}' at {address}: {e}"
-                    )
+                    logger.error(f"[{t.id}]: Failed to create MCP client for '{server_name}' at {address}: {e}")
 
         task_executor = Agent(
             model=self.base_llm_model,
@@ -1333,6 +1375,11 @@ class InteractiveDAGAgent(DAGAgent):
         while True:
             current_attempt = t.fix_attempts + t.grace_attempts + 1
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
+
+            # ** NEW: Clear the execution log for each new attempt **
+            t.execution_log = []
+            self._broadcast_state_update(t)
+
             current_prompt_parts = [
                 prompt_base_content,
                 f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
@@ -1346,37 +1393,60 @@ class InteractiveDAGAgent(DAGAgent):
                 t.human_directive = None
                 self._broadcast_state_update(t)
 
-            # FIXED: Use "".join to prevent extra newlines
             current_prompt = "".join(current_prompt_parts)
 
-            logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
-            exec_res = await task_executor.run(
-                user_prompt=current_prompt, message_history=t.last_llm_history
-            )
+            logger.info(f"[{t.id}] Attempt {current_attempt}: Streaming executor actions...")
 
-            is_paused, result = await self._handle_agent_output(
-                ctx=ctx,
-                agent_res=exec_res,
-                expected_output_type=str,
-                agent_role_name="executor",
-            )
+            # --- CORE CHANGE: Replace .run() with .iter() ---
+            exec_res = None
+            try:
+                async with task_executor.iter(user_prompt=current_prompt,
+                                              message_history=t.last_llm_history) as agent_run:
+                    async for node in agent_run:
+                        formatted_node = self._format_stream_node(node)
+                        if formatted_node:
+                            logger.info(f"   > Stream [{t.id}]: {formatted_node}")
+                            t.execution_log.append(formatted_node)
+                            self._broadcast_state_update(t)
+
+                # After the stream is complete, the result is on the agent_run object
+                exec_res = agent_run.result
+
+            except Exception as e:
+                logger.error(f"[{t.id}] Exception during agent stream: {e}", exc_info=True)
+                # Append an error to the log for the UI
+                t.execution_log.append({"type": "error", "content": f"An error occurred during execution: {e}"})
+                self._broadcast_state_update(t)
+                # We will let this fall through to the verification step, which will fail and trigger retry logic.
+                result = None
+
+            if exec_res:
+                is_paused, result = await self._handle_agent_output(
+                    ctx=ctx,
+                    agent_res=exec_res,
+                    expected_output_type=str,
+                    agent_role_name="executor",
+                )
+            else:
+                # Handle cases where the stream completes but yields no result
+                result = None
+
             if result is None:
-                t.human_directive = "Your last output was empty or invalid. Please re-evaluate and try again."
+                t.human_directive = "Your last execution attempt failed or produced no output. Please re-evaluate and try again."
                 t.fix_attempts += 1
                 logger.warning(
-                    f"[{t.id}] Executor (attempt {current_attempt}) returned no result. Triggering retry."
+                    f"[{t.id}] Executor stream (attempt {current_attempt}) produced no result. Triggering retry."
                 )
                 self._broadcast_state_update(t)
                 if (t.fix_attempts + t.grace_attempts) > (
-                    t.max_fix_attempts + self.max_grace_attempts
+                        t.max_fix_attempts + self.max_grace_attempts
                 ):
                     t.status = "failed"
                     self._broadcast_state_update(t)
-                    raise Exception(
-                        f"Exceeded max attempts for task '{t.id}' after empty/invalid executor result."
-                    )
+                    raise Exception(f"Exceeded max attempts for task '{t.id}' after empty executor result.")
                 continue
 
+            # The verification logic remains the same
             await self._process_executor_output_for_verification(ctx, result)
             if t.status in ["complete", "failed", "paused_by_human"]:
                 return

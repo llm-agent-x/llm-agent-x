@@ -151,6 +151,10 @@ class Task(BaseModel):
                                                              description="Stores the full message history of the last LLM interaction for resuming context.")
     executor_llm_history: Optional[List[Dict[str, Any]]] = Field(None,
                                                                   description="Stores the full message history of the last LLM interaction for the executor of this task.")
+
+    execution_log: List[Dict[str, Any]] = Field(default_factory=list,
+                                                description="A log of real-time execution steps (tool calls, thoughts) for the UI.")
+
     agent_role_paused: Optional[str] = Field(None,
                                              description="Stores the name of the agent role that paused for human input.")
 
