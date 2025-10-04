@@ -49,19 +49,22 @@ def get_rabbitmq_channel() -> BlockingChannel:
     connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
     return connection.channel()
 
+def get_rabbitmq_connection_and_channel():
+    """
+    Creates and returns a new RabbitMQ connection and channel.
+    This should be called for each request that needs to publish.
+    """
+    try:
+        connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
+        channel = connection.channel()
+        # Ensure the queue exists. This is an idempotent operation.
+        channel.queue_declare(queue=DIRECTIVES_QUEUE, durable=True)
+        return connection, channel
+    except pika.exceptions.AMQPConnectionError as e:
+        logger.error(f"Failed to connect to RabbitMQ: {e}")
+        return None, None
 
 DIRECTIVES_QUEUE = "directives_queue"
-
-# Initialize RabbitMQ connection safely
-rabbit_channel = None
-try:
-    rabbit_channel = get_rabbitmq_channel()
-    rabbit_channel.queue_declare(queue=DIRECTIVES_QUEUE, durable=True)
-    logger.info("RabbitMQ connection established successfully")
-except Exception as e:
-    logger.error(f"Failed to connect to RabbitMQ: {e}")
-    rabbit_channel = None
-
 
 # --- API Endpoints (Unchanged) ---
 @app.get("/api/tasks")
@@ -73,6 +76,7 @@ async def get_all_tasks():
 @app.post("/api/tasks")
 async def add_root_task(request: Request):
     logger.info("Received request to add root task.")
+    connection, channel = None, None
     try:
         body = await request.json()
         desc = body.get("desc")
@@ -91,63 +95,58 @@ async def add_root_task(request: Request):
             },
         }
 
-        # Check if RabbitMQ connection is available
-        if rabbit_channel is None:
-            logger.error("RabbitMQ connection not available")
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "status": "error",
-                    "message": "RabbitMQ connection not available",
-                },
-            )
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(status_code=503, content={"message": "Service unavailable: Cannot connect to message queue."})
 
-        # Try publishing to RabbitMQ safely
-        try:
-            rabbit_channel.basic_publish(
-                exchange="",
-                routing_key=DIRECTIVES_QUEUE,
-                body=json.dumps(message),
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
-                ),
-            )
-        except Exception:
-            logger.exception("Failed to publish to RabbitMQ")
-            return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": "Failed to enqueue task"},
-            )
-
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
         logger.info(f"Published new task directive to queue: {desc}")
         return {"status": "new task submitted"}
 
-    except Exception:
-        logger.exception("Error in add_root_task")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": "Internal server error"},
-        )
+    except Exception as e:
+        logger.exception(f"Error in add_root_task: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error"})
+    finally:
+        if connection and connection.is_open:
+            connection.close()
 
 
 @app.post("/api/tasks/{task_id}/directive")
 async def post_directive(task_id: str, request: Request):
-    directive = await request.json()
-    message = {
-        "task_id": task_id,
-        "command": directive.get("command"),
-        "payload": directive.get("payload"),
-    }
-    rabbit_channel.basic_publish(
-        exchange="",
-        routing_key=DIRECTIVES_QUEUE,
-        body=json.dumps(message),
-        properties=pika.BasicProperties(
-            delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
-        ),
-    )
-    logger.info(f"Published directive to queue: {message}")
-    return {"status": "directive sent"}
+    logger.info(f"Received directive for task {task_id}")
+    connection, channel = None, None
+    try:
+        directive = await request.json()
+        message = {
+            "task_id": task_id,
+            "command": directive.get("command"),
+            "payload": directive.get("payload"),
+        }
+
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(status_code=503, content={"message": "Service unavailable: Cannot connect to message queue."})
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
+        logger.info(f"Published directive to queue: {message}")
+        return {"status": "directive sent"}
+
+    except Exception as e:
+        logger.exception(f"Error in post_directive: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error"})
+    finally:
+        if connection and connection.is_open:
+            connection.close()
 
 
 # --- RabbitMQ Listener for State Updates (runs in background) ---
