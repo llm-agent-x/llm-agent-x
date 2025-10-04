@@ -481,12 +481,11 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _handle_directive(self, directive: dict):
         command = directive.get("command")
+        task_id = directive.get("task_id")
 
-        # The _handle_directive method *receives* directives from the queue.
-        # It does NOT publish them. The publisher connection is managed by `run()` and `_broadcast_state_update`.
-        # No publisher initialization is needed here.
-
+        # ADD_ROOT_TASK logic is separate and remains the same
         if command == "ADD_ROOT_TASK":
+            # ... (no changes here) ...
             payload = directive.get("payload", {})
             desc = payload.get("desc")
             if not desc:
@@ -509,14 +508,14 @@ class InteractiveDAGAgent(DAGAgent):
             self._broadcast_state_update(new_task)
             return
 
-        task_id = directive.get("task_id")
-        payload = directive.get("payload")
+        # All other directives require a task_id
         task = self.registry.tasks.get(task_id)
         if not task:
             logger.warning(f"Directive for unknown task {task_id} ignored.")
             return
 
         logger.info(f"Handling command '{command}' for task {task_id}")
+        payload = directive.get("payload")
 
         # Cancel in-flight task future if a directive changes its state
         if task_id in self.task_futures and not self.task_futures[task_id].done():
@@ -529,55 +528,40 @@ class InteractiveDAGAgent(DAGAgent):
         if command == "PAUSE":
             task.status = "paused_by_human"
         elif command == "RESUME":
-            task.status = "pending"
+            task.status = "pending"  # Simply set to pending, the loop will pick it up
         elif command == "TERMINATE":
             task.status = "failed"
             task.result = f"Terminated by operator: {payload}"
-            self._reset_task_and_dependents(task_id)
         elif command == "REDIRECT":
             task.status = "pending"
-            task.result = None
-            task.fix_attempts = 0
-            task.grace_attempts = 0
-            task.verification_scores = []
             task.human_directive = payload
-            task.user_response = None
-            task.current_question = None  # Task is no longer asking a question
-            task.last_llm_history = None
-            task.agent_role_paused = None
-            self._reset_task_and_dependents(task_id)
         elif command == "MANUAL_OVERRIDE":
             task.status = "complete"
             task.result = payload
-            task.human_directive = None
-            task.user_response = None
-            task.current_question = None
-            task.last_llm_history = None
-            task.agent_role_paused = None
-            self._reset_task_and_dependents(task_id)
         elif command == "ANSWER_QUESTION":
-            # This directive is still supported for human-initiated answers,
-            # but agents will no longer set 'waiting_for_user_response' or 'current_question'.
-            # If the UI sends it for a task not explicitly asking, it might be ignored or used as a hint.
-            if (
-                task.status == "waiting_for_user_response"
-            ):  # MODIFIED: Removed `and task.current_question`
-                task.user_response = payload
-                task.current_question = None
+            if task.status == "waiting_for_user_response":
+                logger.info(f"Task {task_id} received answer: {str(payload)[:50]}...")
+                # --- THIS IS THE KEY CHANGE ---
+                # Place the answer into the human_directive field.
+                task.human_directive = str(payload)
+                # Reset the task to be re-run by the main scheduler.
                 task.status = "pending"
-                logger.info(
-                    f"Task {task_id} received answer to question: {payload[:50]}..."
-                )
+                # Clear the question-related fields.
+                task.current_question = None
+                task.agent_role_paused = None
             else:
-                logger.warning(
-                    f"Task {task_id} not waiting for a question, ignoring ANSWER_QUESTION directive."
-                )
+                logger.warning(f"Task {task_id} not waiting for a question, ignoring ANSWER_QUESTION.")
 
-        if (
-            task.status != original_status
-            or command == "MANUAL_OVERRIDE"
-            or command == "ANSWER_QUESTION"
-        ):
+        # Consolidate state reset and broadcast logic
+        if command in ["TERMINATE", "REDIRECT", "MANUAL_OVERRIDE"]:
+             self._reset_task_and_dependents(task_id)
+             task.result = payload if command == "MANUAL_OVERRIDE" else task.result
+             task.human_directive = payload if command == "REDIRECT" else None
+             task.current_question = None
+             task.agent_role_paused = None
+             task.last_llm_history = None
+
+        if task.status != original_status or command in ["REDIRECT", "ANSWER_QUESTION", "MANUAL_OVERRIDE"]:
             self._broadcast_state_update(task)
 
     def _reset_task_and_dependents(self, task_id: str):
@@ -857,69 +841,36 @@ class InteractiveDAGAgent(DAGAgent):
             span.set_attribute("dag.task.id", t.id)
             span.set_attribute("dag.task.status", t.status)
 
-            # A task is paused_by_human (explicitly) or waiting_for_user_response (for an answer not yet provided)
-            # If t.user_response is NOT None, it means a response is available and we should process it.
-            if t.status == "paused_by_human":
-                logger.info(f"[{t.id}] Task is {t.status}, skipping execution for now.")
+            if t.status in ["paused_by_human", "waiting_for_user_response"]:
+                logger.info(f"[{t.id}] Task is {t.status}, skipping execution until directive received.")
                 return
 
             try:
                 otel_ctx_token = otel_context.attach(trace.set_span_in_context(span))
-
-                # Handle resumption from a human question (if a human manually set user_response)
-                # Agents no longer set status to "waiting_for_user_response"
-                if (
-                    t.status == "waiting_for_user_response"
-                    and t.user_response is not None
-                    and t.last_llm_history is not None
-                    and t.agent_role_paused is not None
-                ):
-                    logger.info(
-                        f"[{t.id}] Resuming {t.agent_role_paused} after human-provided response."
-                    )
-                    await self._resume_agent_from_question(ctx)
-                    # If after resuming, it's still waiting for user response (e.g., asked another question - this should no longer happen for agents), or failed/paused, return.
-                    # MODIFIED: Removed "waiting_for_user_response" from this check
-                    if t.status in ["failed", "paused_by_human", "complete"]:
-                        return
-                    # If it successfully processed the answer and is now 'pending', let the rest of _run_taskflow handle its transition.
-                    t.status = "pending"  # Explicitly set to pending so subsequent `elif` blocks can pick it up
 
                 def update_status_and_broadcast(new_status):
                     if t.status != new_status:
                         t.status = new_status
                         self._broadcast_state_update(t)
 
-                # The order here is important for task state transitions:
-                # 1. If it was waiting for children and they're done, process it.
-                # 2. If it needs initial planning and hasn't done it.
-                # 3. If it can request new subtasks (adaptive decomposition).
-                # 4. Otherwise, general execution.
-                # Note: The `if t.status == "pending" ...` condition earlier helps it get back into this flow.
-
-                if t.status == "waiting_for_children":
+                # Simplified, linear state progression
+                if t.status == 'waiting_for_children':
                     update_status_and_broadcast("running")
                     await self._run_task_execution(ctx)
                 elif t.needs_planning and not t.already_planned:
                     update_status_and_broadcast("planning")
                     await self._run_initial_planning(ctx)
-                    # Agents no longer ask questions, so no 'waiting_for_user_response' from agents
-                    # MODIFIED: Removed "waiting_for_user_response" from this check
-                    if t.status not in ["paused_by_human"]:
+                    if t.status not in ["paused_by_human", "waiting_for_user_response"]:
                         t.already_planned = True
                         update_status_and_broadcast(
                             "waiting_for_children" if t.children else "complete"
                         )
-                elif t.can_request_new_subtasks and t.status != "proposing":
+                elif t.can_request_new_subtasks and t.status != 'proposing':
                     update_status_and_broadcast("proposing")
                     await self._run_adaptive_decomposition(ctx)
-                    # Agents no longer ask questions, so no 'waiting_for_user_response' from agents
-                    # MODIFIED: Removed "waiting_for_user_response" from this check
-                    if t.status not in ["paused_by_human"]:
+                    if t.status not in ["paused_by_human", "waiting_for_user_response"]:
                         update_status_and_broadcast("waiting_for_children")
-                elif (
-                    t.status == "pending" or t.status == "running"
-                ):  # Catch-all for regular execution
+                elif t.status in ["pending", "running"]:
                     update_status_and_broadcast("running")
                     await self._run_task_execution(ctx)
                 else:
@@ -927,18 +878,16 @@ class InteractiveDAGAgent(DAGAgent):
                         f"[{t.id}] Task in unhandled status '{t.status}'. Skipping."
                     )
 
-                # MODIFIED: Removed "waiting_for_user_response" from this check
-                if t.status not in [
-                    "waiting_for_children",
-                    "failed",
-                    "paused_by_human",
-                ]:
+                # Final status check
+                if t.status not in ["waiting_for_children", "failed", "paused_by_human", "waiting_for_user_response"]:
                     update_status_and_broadcast("complete")
                     t.last_llm_history = None
                     t.agent_role_paused = None
+
             except asyncio.CancelledError:
                 logger.info(f"Task [{t.id}] asyncio future was cancelled.")
-                t.status = "paused_by_human"
+                if t.status not in ["waiting_for_user_response"]:  # Don't override pause from question
+                    t.status = "paused_by_human"
                 self._broadcast_state_update(t)
             except Exception as e:
                 span.record_exception(e)
@@ -952,232 +901,6 @@ class InteractiveDAGAgent(DAGAgent):
                 otel_context.detach(otel_ctx_token)
                 span.set_attribute("dag.task.status", t.status)
                 self._broadcast_state_update(t)
-
-    async def _resume_agent_from_question(self, ctx: TaskContext):
-        t = ctx.task
-        if not t.user_response or not t.last_llm_history or not t.agent_role_paused:
-            logger.error(
-                f"[{t.id}] Attempted to resume agent, but missing user_response, last_llm_history, or agent_role_paused. This should only be triggered by manual user input now."
-            )
-            t.status = "failed"
-            self._broadcast_state_update(t)
-            return
-
-        agent_instance = self._agent_role_map.get(t.agent_role_paused)
-        if not agent_instance:
-            logger.error(
-                f"[{t.id}] Unknown agent role '{t.agent_role_paused}' to resume."
-            )
-            t.status = "failed"
-            self._broadcast_state_update(t)
-            return
-
-        logger.info(
-            f"[{t.id}] Resuming '{t.agent_role_paused}' with human response: {t.user_response[:50]}..."
-        )
-
-        # Reconstruct the user_prompt for the agent, adding the notebook context and tool guidance
-        resumption_prompt_parts = [
-            f"Human response to your last 'context-gathering' requirement for Task {t.id}: {t.user_response}",
-            f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-            self._get_notebook_tool_guidance(t, t.agent_role_paused),  # Add guidance
-        ]
-
-        # If there was a human directive, it should be injected before resumption
-        if t.human_directive:
-            resumption_prompt_parts.insert(
-                0,  # Insert at the beginning
-                f"\n\n--- CRITICAL GUIDANCE FROM OPERATOR ---\n{t.human_directive}\n------------------------------\n",
-            )
-            t.human_directive = None
-            self._broadcast_state_update(t)  # ADDED: Broadcast cleared directive
-
-        full_resumption_prompt = "\n".join(resumption_prompt_parts)  # Join here
-
-        # The output_type for the agent is now always the non-UserQuestion type
-        expected_type_map = {
-            "initial_planner": ExecutionPlan,
-            "cycle_breaker": ExecutionPlan,
-            "adaptive_decomposer": AdaptiveDecomposerResponse,  # FIXED: Updated type
-            "conflict_resolver": ProposalResolutionPlan,
-            "executor": str,
-            "verifier": verification,
-            "retry_analyst": RetryDecision,
-        }
-        expected_output_for_resume = expected_type_map.get(
-            t.agent_role_paused, str
-        )  # Default to str if unknown
-
-        resume_res = await agent_instance.run(
-            user_prompt=full_resumption_prompt,  # Use the reconstructed prompt
-            message_history=t.last_llm_history,
-        )
-
-        t.user_response = None
-        t.current_question = None  # Clear question, it was answered
-
-        original_agent_role_paused = t.agent_role_paused
-
-        # Process the result of the resumed agent's run
-        is_paused, agent_output = await self._handle_agent_output(
-            ctx, resume_res, expected_output_for_resume, original_agent_role_paused
-        )
-
-        if (
-            is_paused
-        ):  # This should no longer be true as agents don't pause for questions, but check for safety.
-            logger.warning(
-                f"[{t.id}] Resumed agent unexpectedly attempted to pause again. This should not happen."
-            )
-            return
-
-        # Handle agent outputs based on role
-        if original_agent_role_paused == "initial_planner":
-            initial_plan = agent_output
-            if initial_plan:
-                # Cycle breaker does not get notebook update guidance
-                fixed_plan_res = await self.cycle_breaker.run(
-                    user_prompt=f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}",
-                    message_history=t.last_llm_history,
-                )
-                # MODIFIED: Removed "is_paused_cb" check here as agents won't pause for questions
-                is_paused_cb, plan = await self._handle_agent_output(
-                    ctx=ctx,
-                    agent_res=fixed_plan_res,
-                    expected_output_type=ExecutionPlan,
-                    agent_role_name="cycle_breaker",
-                )
-                # MODIFIED: Simplified logic as is_paused_cb should be False
-                if plan:
-                    await self._process_initial_planning_output(ctx, plan)
-                    # MODIFIED: Removed "waiting_for_user_response"
-                    if ctx.task.status not in ["paused_by_human"]:
-                        ctx.task.already_planned = True
-                        ctx.task.status = (
-                            "waiting_for_children" if ctx.task.children else "complete"
-                        )
-                        if ctx.task.status == "complete":
-                            ctx.task.last_llm_history = None
-                            ctx.task.agent_role_paused = None
-                        self._broadcast_state_update(ctx.task)
-                else:  # If initial plan is None after resumption, it's a failure
-                    ctx.task.status = "failed"
-                    self._broadcast_state_update(ctx.task)
-
-        elif original_agent_role_paused == "cycle_breaker":
-            fixed_plan = agent_output
-            if fixed_plan:
-                await self._process_initial_planning_output(ctx, fixed_plan)
-                # MODIFIED: Removed "waiting_for_user_response"
-                if ctx.task.status not in ["paused_by_human"]:
-                    ctx.task.already_planned = True
-                    ctx.task.status = (
-                        "waiting_for_children" if ctx.task.children else "complete"
-                    )
-                    if ctx.task.status == "complete":
-                        ctx.task.last_llm_history = None
-                        ctx.task.agent_role_paused = None
-                    self._broadcast_state_update(ctx.task)
-            else:
-                ctx.task.status = "failed"
-                self._broadcast_state_update(ctx.task)
-
-        elif original_agent_role_paused == "adaptive_decomposer":
-            proposals_response = agent_output  # FIXED: Use a more descriptive name
-            if proposals_response:
-                if proposals_response.tasks:  # FIXED: Check for .tasks attribute
-                    logger.info(
-                        f"Task [{t.id}] (resumed) proposing {len(proposals_response.tasks)} new sub-tasks."
-                    )
-                    for sub in proposals_response.tasks:
-                        self.proposed_tasks_buffer.append((sub, t.id))
-                if (
-                    proposals_response.dep_requests
-                ):  # FIXED: Check for .dep_requests attribute
-                    logger.info(
-                        f"Task [{t.id}] (resumed) requesting results from {len(proposals_response.dep_requests)} new dependencies."
-                    )
-                    for dep in proposals_response.dep_requests:
-                        self.proposed_task_dependencies_buffer.append((dep, t.id))
-            if ctx.task.status not in ["paused_by_human"]:
-                ctx.task.status = "waiting_for_children"
-                self._broadcast_state_update(ctx.task)
-
-        elif original_agent_role_paused == "conflict_resolver":
-            resolved_plan = agent_output
-            if resolved_plan:
-                logger.info(
-                    f"Global resolver for {ctx.task.id} (resumed) approved {len(resolved_plan.approved_tasks)} sub-tasks."
-                )
-                ctx.task.status = "pending"
-                self._broadcast_state_update(ctx.task)
-            else:
-                logger.warning(
-                    f"Global resolver for {ctx.task.id} resumed but returned no plan. Check agent behavior. Marking as failed."
-                )
-                ctx.task.status = "failed"
-                self._broadcast_state_update(ctx.task)
-
-        elif original_agent_role_paused == "executor":
-            result = agent_output
-            if result:
-                await self._process_executor_output_for_verification(ctx, result)
-            else:
-                # Treat empty/invalid output from executor as failed attempt
-                ctx.task.fix_attempts += 1
-                ctx.task.human_directive = f"Your last answer was empty or invalid. Please re-evaluate and try again."
-                logger.info(
-                    f"[{ctx.task.id}] Executor (resumed) returned no result. Retrying."
-                )
-                self._broadcast_state_update(
-                    ctx.task
-                )  # ADDED: Broadcast directive/status
-                # The task remains 'running' or 'pending' to trigger the retry loop.
-                if (ctx.task.fix_attempts + ctx.task.grace_attempts) > (
-                    ctx.task.max_fix_attempts + self.max_grace_attempts
-                ):
-                    ctx.task.status = "failed"
-                    self._broadcast_state_update(ctx.task)
-                    raise Exception(
-                        f"Exceeded max attempts for task '{ctx.task.id}' after empty/invalid result."
-                    )
-
-        elif original_agent_role_paused == "verifier":
-            vout = agent_output
-            if vout:
-                ctx.task.status = "pending"  # Verifier result is processed, task can resume its main loop
-                self._broadcast_state_update(ctx.task)
-                # The _process_executor_output_for_verification method is where verification results are used to decide next steps.
-                # Since verifier only runs _after_ executor, this case only happens if verifier itself was paused.
-                # This should now propagate the verification outcome to the executor's retry loop.
-            else:
-                ctx.task.status = "failed"
-                self._broadcast_state_update(ctx.task)
-
-        elif original_agent_role_paused == "retry_analyst":
-            decision = agent_output
-            if decision:
-                ctx.task.status = "pending"
-                self._broadcast_state_update(ctx.task)
-                # The decision will influence subsequent executor runs via t.human_directive.
-            else:
-                ctx.task.status = "failed"
-                self._broadcast_state_update(ctx.task)
-
-        else:
-            logger.warning(
-                f"[{t.id}] Resumption for role '{original_agent_role_paused}' completed, but specific processing logic is missing. Setting to pending."
-            )
-            # MODIFIED: Removed "waiting_for_user_response"
-            if ctx.task.status not in ["paused_by_human"]:
-                ctx.task.status = "pending"
-                self._broadcast_state_update(ctx.task)
-
-        # Clear agent-related pause context fields if not paused by human or waiting for explicit user directive again
-        # MODIFIED: Removed "waiting_for_user_response"
-        if ctx.task.status not in ["paused_by_human"]:
-            t.agent_role_paused = None
-            t.last_llm_history = None
 
     async def _run_initial_planning(self, ctx: TaskContext):
         t = ctx.task
