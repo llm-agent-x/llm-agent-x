@@ -12,6 +12,7 @@ from typing import List, Tuple, Union, Dict, Any, Optional, Callable
 import pika
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
+from phoenix.trace.schemas import SpanAttributes
 from pydantic import BaseModel
 from pydantic_ai.agent import AgentRunResult, Agent
 from pydantic_ai.mcp import MCPServerStreamableHTTP
@@ -33,6 +34,11 @@ from llm_agent_x.agents.dag_agent import (
 from dotenv import load_dotenv
 
 from opentelemetry import trace, context as otel_context
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.trace import Tracer, Span, StatusCode
+from openinference.semconv.trace import SpanAttributes
 
 load_dotenv(".env", override=True)
 logging.basicConfig(
@@ -145,6 +151,14 @@ class InteractiveDAGAgent(DAGAgent):
             "retry_analyst": self.retry_analyst,
         }
 
+    def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
+        """Adds LLM usage data to a span for a system-level operation without a task context."""
+        if not span or not agent_res: return
+        usage = agent_res.usage()
+        # We don't track cost here as there is no task to assign it to.
+        # This is a trade-off for keeping the system logic clean.
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, getattr(usage, "request_tokens", 0))
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
     def _create_notebook_tool(
         self, registry: TaskRegistry, broadcast_callback: Callable
     ):
@@ -216,6 +230,8 @@ class InteractiveDAGAgent(DAGAgent):
                 f"Failed to broadcast state update for task {task.id}: {e}",
                 exc_info=False,
             )
+
+
 
     # --- Override _handle_agent_output for Interactive DAG Agent (from dag_agent.py) ---
     # This ensures consistency for auto-answering and simple type checks.
@@ -674,29 +690,7 @@ class InteractiveDAGAgent(DAGAgent):
                                         t.agent_role_paused = None
 
                     if self.proposed_tasks_buffer:
-                        global_resolver_ctx_id = "GLOBAL_RESOLVER"
-                        if global_resolver_ctx_id not in self.registry.tasks:
-                            self.registry.add_task(
-                                Task(
-                                    id=global_resolver_ctx_id,
-                                    desc="Internal task for global conflict resolution.",
-                                    status="pending",
-                                )
-                            )
-                        global_resolver_task = self.registry.tasks[
-                            global_resolver_ctx_id
-                        ]
-
-                        # MODIFIED: Removed specific check for global resolver waiting for user response.
-                        # Since agents won't ask questions, this state won't be set by agents.
-                        # If a user manually answers a question for it, the _handle_directive will set it to pending.
-                        # We only run global resolution if not actively waiting for an answer.
-                        if global_resolver_task.status != "waiting_for_user_response":
-                            await self._run_global_resolution()
-                        else:
-                            logger.debug(
-                                f"Global resolver for {global_resolver_ctx_id} is in 'waiting_for_user_response' status, skipping global resolution for now."
-                            )
+                        await self._run_global_resolution()
 
                     await asyncio.sleep(0.05)
         finally:

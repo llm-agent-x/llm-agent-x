@@ -300,6 +300,15 @@ class DAGAgent:
             "executor": self.executor, "verifier": self.verifier, "retry_analyst": self.retry_analyst,
         }
 
+    def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
+        """Adds LLM usage data to a span for a system-level operation without a task context."""
+        if not span or not agent_res: return
+        usage = agent_res.usage()
+        # We don't track cost here as there is no task to assign it to.
+        # This is a trade-off for keeping the system logic clean.
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, getattr(usage, "request_tokens", 0))
+        span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
+
     def _add_llm_data_to_span(self, span: Span, agent_res: AgentRunResult, task: Task):
         if not span or not agent_res: return
         usage, cost = agent_res.usage(), get_cost(agent_res.usage())
@@ -418,40 +427,53 @@ class DAGAgent:
                 if self.proposed_tasks_buffer: await self._run_global_resolution()
 
     async def _run_global_resolution(self):
-        logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
-        approved_proposals, parent_map = [p[0] for p in self.proposed_tasks_buffer], {p[0].local_id: p[1] for p in
-                                                                                      self.proposed_tasks_buffer}
-        if len(approved_proposals) > self.global_proposal_limit:
-            logger.warning(
-                f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver.")
-            prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
-                           approved_proposals]
-            global_resolver_task_id = "GLOBAL_RESOLVER"
-            if global_resolver_task_id not in self.registry.tasks:
-                self.registry.add_task(
-                    Task(id=global_resolver_task_id, desc="Internal task for global conflict resolution.",
-                         status="pending"))
-            global_resolver_task = self.registry.tasks[global_resolver_task_id]
-            global_resolver_ctx = TaskContext(global_resolver_task_id, self.registry)
-            resolver_res = await self.conflict_resolver.run(
-                user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}")
+        # This is now a standalone system operation, not a task.
+        with self.tracer.start_as_current_span("GlobalConflictResolution") as span:
+            logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
+            span.set_attribute("proposals.count", len(self.proposed_tasks_buffer))
 
-            logger.info(f"GLOBAL RESOLUTION: {resolver_res}")
-            is_paused, resolved_plan = await self._handle_agent_output(ctx=global_resolver_ctx, agent_res=resolver_res,
-                                                                       expected_output_type=ProposalResolutionPlan,
-                                                                       agent_role_name="conflict_resolver")
-            if is_paused:
-                logger.warning(
-                    f"Conflict resolver paused. Discarding current proposals; they will be regenerated later.")
-                self.proposed_tasks_buffer = [];
-                return
-            if resolved_plan is None and global_resolver_task.status == "waiting_for_user_response":
-                logger.warning("Conflict resolver paused, no plan resolved yet.");
-                return
-            approved_proposals = resolved_plan.approved_tasks
-        logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
-        self._commit_proposals(approved_proposals, parent_map);
-        self.proposed_tasks_buffer = []
+            # Use a try...finally block to guarantee the buffer is cleared
+            try:
+                approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
+                parent_map = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
+
+                if len(approved_proposals) > self.global_proposal_limit:
+                    logger.warning(
+                        f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver."
+                    )
+                    span.add_event("Conflict detected, engaging resolver.")
+                    prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
+                                   approved_proposals]
+
+                    # Directly call the agent without a task context
+                    resolver_res = await self.conflict_resolver.run(
+                        user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
+                    )
+
+                    # Manually handle telemetry and output
+                    self._add_llm_data_to_system_span(span, resolver_res)
+
+                    resolved_plan = resolver_res.output
+                    if resolved_plan and isinstance(resolved_plan, ProposalResolutionPlan):
+                        approved_proposals = resolved_plan.approved_tasks
+                        span.set_attribute("proposals.approved_count", len(approved_proposals))
+                        span.set_status(StatusCode.OK)
+                    else:
+                        # If the agent returns None or an invalid type, fail safely
+                        logger.error(
+                            "Conflict resolver failed to return a valid plan. Discarding all proposals for this cycle.")
+                        approved_proposals = []
+                        span.set_status(trace.Status(StatusCode.ERROR, "Resolver returned invalid output"))
+
+                if approved_proposals:
+                    logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
+                    self._commit_proposals(approved_proposals, parent_map)
+                else:
+                    logger.info("No proposals were approved or committed in this cycle.")
+
+            finally:
+                # This is critical to prevent infinite loops
+                self.proposed_tasks_buffer = []
 
     def _commit_proposals(self, approved_proposals: List[ProposedSubtask], proposal_to_parent_map: Dict[str, str]):
         local_to_global_id_map = {}
