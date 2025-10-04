@@ -28,7 +28,7 @@ from llm_agent_x.agents.dag_agent import (
     RetryDecision,
     UserQuestion,
     ProposalResolutionPlan,
-    AdaptiveDecomposerResponse,
+    AdaptiveDecomposerResponse, InformationNeedDecision,
 )
 
 from dotenv import load_dotenv
@@ -131,14 +131,38 @@ class InteractiveDAGAgent(DAGAgent):
         self.retry_analyst = Agent(
             model=llm_model,
             system_prompt=(
-                "You are a meticulous quality assurance analyst. Your job is to decide if a failing task is worth retrying. "
-                "You will be given the task's original goal and a history of its verification scores. "
-                "If the scores are generally increasing and approaching the success threshold of 6, it is worth retrying. "
-                "If scores are stagnant or decreasing, it is not. "
-                "Crucially, you must provide a concrete and actionable 'next_step_suggestion'."
+                "You are a meticulous quality assurance analyst. Your ONLY job is to decide if another AUTONOMOUS attempt on a failing task is likely to succeed. "
+                "Review the task and its verification score history (a score > 5 is a success). "
+                "If scores are improving, recommend a retry with a concrete suggestion. "
+                "If the task is stagnant or worsening, you MUST recommend giving up. "
+                "You cannot ask for help or external information. Your decision is final for the autonomous phase."
             ),
             output_type=RetryDecision,
-            tools=self._tools_for_agents,  # Use the internal tools list
+            tools=self._tools_for_agents,
+        )
+
+        self.information_gap_detector = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a root cause analyst. A task has failed repeatedly, and an autonomous retry has been ruled out. "
+                "Your SOLE job is to determine if the failure is due to a critical, unresolvable lack of information. "
+                "Is it IMPOSSIBLE for the agent to proceed without external human input? Be extremely critical. "
+                "If the agent *could* make a reasonable assumption or use a hypothetical example, then new information is NOT needed."
+            ),
+            output_type=InformationNeedDecision,
+            tools=[],
+        )
+
+        self.question_formulator = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are an expert communicator. A task is blocked waiting for critical human input. "
+                "Your SOLE purpose is to formulate the SINGLE most critical, concise, and clear question for the human operator to unblock the task. "
+                "Review the entire task history and context to identify the one piece of missing information. "
+                "Do not add any preamble. Just ask the question."
+            ),
+            output_type=UserQuestion,
+            tools=[],
         )
 
         self._agent_role_map = {
@@ -149,6 +173,8 @@ class InteractiveDAGAgent(DAGAgent):
             "executor": self.executor,
             "verifier": self.verifier,
             "retry_analyst": self.retry_analyst,
+            "information_gap_detector": self.information_gap_detector,
+            "question_formulator": self.question_formulator,
         }
 
     def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
@@ -1358,72 +1384,76 @@ class InteractiveDAGAgent(DAGAgent):
     async def _process_executor_output_for_verification(
         self, ctx: TaskContext, result: str
     ):
-        """Helper to handle verification and retry logic after executor runs."""
+        """
+        Overrides the base verification logic to implement a multi-stage, interactive failure analysis chain.
+        """
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
+
         if verify_task_result.get_successful():
             t.result = result
             logger.info(f"COMPLETED [{t.id}]")
             t.status = "complete"
             self._broadcast_state_update(t)
-            t.last_llm_history = None
-            t.agent_role_paused = None
+            t.last_llm_history, t.agent_role_paused = None, None
             return
 
         t.fix_attempts += 1
+
+        # --- BEGIN INTERACTIVE FAILURE ANALYSIS CHAIN ---
+
+        # STAGE 1: Consult the Retry Analyst for a potential autonomous grace attempt.
         if (
             t.fix_attempts >= t.max_fix_attempts
             and t.grace_attempts < self.max_grace_attempts
         ):
-            analyst_prompt = (
-                f"Task: '{t.desc}'\nScores: {t.verification_scores}\n"
-                f"Score > 5 is a success. Should we retry?"
-            )
-            # Retry analyst does not get notebook update guidance
-            decision_res = await self.retry_analyst.run(
-                user_prompt=analyst_prompt, message_history=t.last_llm_history
-            )
-            # _handle_agent_output no longer pauses for UserQuestion.
-            is_paused, decision = await self._handle_agent_output(
-                ctx=ctx,
-                agent_res=decision_res,
-                expected_output_type=RetryDecision,
-                agent_role_name="retry_analyst",
-            )
-            if decision is None:  # Treat invalid/empty decision as a failure
-                t.status = "failed"
-                self._broadcast_state_update(t)
-                logger.error(
-                    f"[{t.id}] Retry analyst returned no decision or invalid output."
-                )
-                return
+            logger.info(f"[{t.id}] Max autonomous attempts reached. Consulting retry analyst...")
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nDecide if an autonomous retry is viable."
+            decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt, message_history=t.last_llm_history)
+            decision = decision_res.output
 
-            if decision.should_retry:
+            if decision and decision.should_retry:
                 t.span.add_event("Grace attempt granted", {"reason": decision.reason})
                 t.grace_attempts += 1
                 t.human_directive = decision.next_step_suggestion
-                logger.info(
-                    f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}"
-                )
-                self._broadcast_state_update(t)  # ADDED: Broadcast directive/status
-                return
+                logger.info(f"[{t.id}] Grace attempt granted by analyst. Next step: {decision.next_step_suggestion}")
+                self._broadcast_state_update(t)
+                return  # Exit the analysis chain and perform the grace attempt.
+            else:
+                logger.warning(f"[{t.id}] Retry analyst ruled out further autonomous attempts. Proceeding to Stage 2.")
 
-        if (t.fix_attempts + t.grace_attempts) >= (
-            t.max_fix_attempts + self.max_grace_attempts
-        ):
-            error_msg = f"Exceeded max attempts for task '{t.id}'"
+        # STAGE 2 & 3: Escalate to human if all autonomous options are exhausted.
+        if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
+            logger.info(f"[{t.id}] Consulting information gap detector...")
+            detector_prompt = f"Task History:\nTask: '{t.desc}'\nScores: {t.verification_scores}\nIs this failure fundamentally due to missing info?"
+            detector_res = await self.information_gap_detector.run(user_prompt=detector_prompt, message_history=t.last_llm_history)
+            info_decision = detector_res.output
+
+            if info_decision and info_decision.is_needed:
+                logger.info(f"[{t.id}] Information gap detected. Formulating question for operator...")
+                formulator_prompt = f"Context: The task '{t.desc}' has failed with scores {t.verification_scores}. A root cause analysis determined it's missing key information. Formulate the question to ask the human."
+                question_res = await self.question_formulator.run(user_prompt=formulator_prompt, message_history=t.last_llm_history)
+
+                is_paused, _ = await self._handle_agent_output(
+                    ctx=ctx, agent_res=question_res, expected_output_type=UserQuestion, agent_role_name="question_formulator"
+                )
+                if is_paused:
+                    logger.info(f"[{t.id}] Escalation successful. Task is now 'waiting_for_user_response'.")
+                    return
+
+        # FINAL OUTCOME: If we reach here, all recovery paths have been exhausted.
+        if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
+            error_msg = f"Exceeded max attempts for task '{t.id}'. All recovery options failed."
             t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
             t.status = "failed"
             self._broadcast_state_update(t)
-            t.last_llm_history = None
-            t.agent_role_paused = None
+            t.last_llm_history, t.agent_role_paused = None, None
             raise Exception(error_msg)
 
+        # Default action for standard retries before the analyst is consulted.
         t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
-        logger.info(
-            f"[{t.id}] Retrying execution. Feedback: {verify_task_result.reason[:50]}..."
-        )
-        self._broadcast_state_update(t)  # ADDED: Broadcast directive/status
+        logger.info(f"[{t.id}] Retrying execution (Attempt {t.fix_attempts}). Feedback: {verify_task_result.reason[:50]}...")
+        self._broadcast_state_update(t)
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."

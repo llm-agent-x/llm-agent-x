@@ -50,6 +50,10 @@ class RetryDecision(BaseModel):
     next_step_suggestion: str = Field(
         description="A specific, actionable suggestion for the next attempt to improve the result.")
 
+class InformationNeedDecision(BaseModel):
+    """The decision on whether a task's failure is due to a critical lack of information."""
+    is_needed: bool = Field(description="Set to true ONLY if the task is fundamentally impossible to complete without specific external information from a human.")
+    reason: str = Field(description="A brief explanation for the decision, justifying why the information gap is or is not the root cause.")
 
 class UserQuestion(BaseModel):
     """
@@ -285,13 +289,12 @@ class DAGAgent:
         self.retry_analyst = Agent(
             model=llm_model,
             system_prompt=(
-                "You are a meticulous quality assurance analyst. Your job is to decide if a failing task is worth retrying. "
+                "You are a meticulous quality assurance analyst. Your job is to decide if a failing task is worth retrying based on its progress. "
                 "You will be given the task's original goal and a history of its verification scores. "
-                "If the scores are generally increasing and approaching the success threshold of 6, it is worth retrying. "
-                "If scores are stagnant or decreasing, it is not. "
-                "Crucially, you must provide a concrete and actionable 'next_step_suggestion'."
+                "If the scores are generally increasing, it is worth retrying. If scores are stagnant or decreasing, it is not. "
+                "You must provide a concrete and actionable 'next_step_suggestion' for the next autonomous attempt."
             ),
-            output_type=RetryDecision,
+            output_type=RetryDecision,  # It ONLY outputs a RetryDecision
             tools=self._tools_for_agents,
         )
         self._agent_role_map = {
@@ -700,26 +703,33 @@ class DAGAgent:
             t.status = "complete"
             t.last_llm_history, t.agent_role_paused = None, None;
             return
+
         t.fix_attempts += 1
+
+        # Consult the analyst only when max standard attempts are reached.
         if t.fix_attempts >= t.max_fix_attempts and t.grace_attempts < self.max_grace_attempts:
-            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nScore > 5 is a success. Should we retry?"
-            decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt, message_history=t.last_llm_history)
-            is_paused, decision = await self._handle_agent_output(ctx=ctx, agent_res=decision_res,
-                                                                  expected_output_type=RetryDecision,
-                                                                  agent_role_name="retry_analyst")
-            if is_paused: return
-            if decision.should_retry:
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nScore > 5 is a success. Should we retry autonomously?"
+            decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt)
+
+            # Here, we don't need the complex _handle_agent_output since this agent can't ask questions.
+            decision = decision_res.output
+
+            if decision and decision.should_retry:
                 t.span.add_event("Grace attempt granted", {"reason": decision.reason});
                 t.grace_attempts += 1
                 t.human_directive = decision.next_step_suggestion
                 logger.info(f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}");
-                return
+                return  # Return to the execution loop for the grace attempt.
+
+        # Final failure condition if grace attempt is denied or not applicable.
         if (t.fix_attempts + t.grace_attempts) >= (t.max_fix_attempts + self.max_grace_attempts):
             error_msg = f"Exceeded max attempts for task '{t.id}'";
             t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
             t.status = "failed";
             t.last_llm_history, t.agent_role_paused = None, None;
             raise Exception(error_msg)
+
+        # Default action for standard retries.
         t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
         logger.info(f"[{t.id}] Retrying execution. Feedback: {verify_task_result.reason[:50]}...")
 
