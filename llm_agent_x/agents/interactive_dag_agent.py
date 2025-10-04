@@ -31,7 +31,7 @@ from llm_agent_x.agents.dag_agent import (
     RetryDecision,
     UserQuestion,
     ProposalResolutionPlan,
-    AdaptiveDecomposerResponse, InformationNeedDecision,
+    AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
 )
 
 from dotenv import load_dotenv
@@ -57,7 +57,13 @@ class InteractiveDAGAgent(DAGAgent):
         self._init_args = args
         self._init_kwargs = kwargs
         kwargs.pop("min_question_priority", None)
+
+        self.max_total_tasks = kwargs.pop("max_total_tasks", 25)
+        self.max_dependencies_per_task = kwargs.pop("max_dependencies_per_task", 7)
+
+
         super().__init__(*args, **kwargs)
+
         self.directives_queue = asyncio.Queue()
         self._publisher_connection: Optional[pika.BlockingConnection] = None
         self._publish_channel: Optional[
@@ -106,12 +112,36 @@ class InteractiveDAGAgent(DAGAgent):
             output_type=AdaptiveDecomposerResponse,  # MODIFIED: Removed Union[..., UserQuestion]
             tools=self._tools_for_agents,  # Use the internal tools list
         )
+
+        self.dependency_pruner = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a ruthless focus expert. A task is about to run but has too many input dependencies, making it difficult to focus. "
+                "You will be given the main task's objective and a list of available dependencies. "
+                f"Your SOLE job is to select the most critical dependencies that are absolutely essential, up to a maximum of {self.max_dependencies_per_task}. "
+                "Return ONLY the IDs of the approved dependencies."
+            ),
+            output_type=DependencySelection,
+            tools=[],
+        )
+
         self.conflict_resolver = Agent(
             model=llm_model,
             system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
             output_type=ProposalResolutionPlan,
             tools=self._tools_for_agents,  # Use the internal tools list
             retries=3,
+        )
+
+        self.graph_pruner = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a ruthless project manager responsible for keeping a project on budget. The total number of tasks has exceeded the limit. "
+                "You will be given a list of all PENDING tasks. Your sole job is to identify and select the LEAST critical, most redundant, or lowest-impact "
+                "tasks for removal. You must provide a clear reason for each pruning decision."
+            ),
+            output_type=PruningDecision,
+            tools=[],
         )
 
         self.executor_system_prompt = (
@@ -173,6 +203,8 @@ class InteractiveDAGAgent(DAGAgent):
             "cycle_breaker": self.cycle_breaker,
             "adaptive_decomposer": self.adaptive_decomposer,
             "conflict_resolver": self.conflict_resolver,
+            "graph_pruner": self.graph_pruner,
+            "dependency_pruner": self.dependency_pruner,
             "executor": self.executor,
             "verifier": self.verifier,
             "retry_analyst": self.retry_analyst,
@@ -1316,34 +1348,82 @@ class InteractiveDAGAgent(DAGAgent):
         t = ctx.task
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
+        # --- NEW DEPENDENCY PRUNING LOGIC ---
+        # Children are core to synthesis and are non-negotiable.
+        # Pruning applies to other, contextual dependencies.
+        children_ids = set(t.children)
+        prunable_deps_ids = t.deps - children_ids
+        final_deps_to_use = children_ids.copy()  # Start with all children
+
+        if len(prunable_deps_ids) > self.max_dependencies_per_task:
+            logger.warning(
+                f"Task [{t.id}] has {len(prunable_deps_ids)} prunable dependencies, exceeding limit of {self.max_dependencies_per_task}. Initiating selection..."
+            )
+            t.span.add_event("DependencyPruningTriggered", {"dependency_count": len(prunable_deps_ids)})
+
+            pruning_candidates_prompt = "\n".join(
+                [f"- ID: {dep_id}, Description: {self.registry.tasks[dep_id].desc}" for dep_id in prunable_deps_ids]
+            )
+
+            pruner_prompt = (
+                f"Your main objective is: '{t.desc}'\n\n"
+                f"From the following list of available data dependencies, you must select ONLY the most critical ones "
+                f"to achieve this objective. You cannot select more than {self.max_dependencies_per_task}.\n\n"
+                f"Available Dependencies:\n{pruning_candidates_prompt}"
+            )
+
+            pruner_res = await self.dependency_pruner.run(user_prompt=pruner_prompt)
+            selection = pruner_res.output
+
+            if selection and selection.approved_dependency_ids:
+                approved_ids = set(selection.approved_dependency_ids)
+                final_deps_to_use.update(approved_ids)
+                logger.info(
+                    f"Pruned dependencies down to {len(approved_ids)} for this run. Reasoning: {selection.reasoning}")
+                t.span.set_attribute("dependencies.pruned_count", len(prunable_deps_ids) - len(approved_ids))
+            else:
+                logger.error(f"[{t.id}] Dependency pruner failed. Using a random subset of dependencies as a fallback.")
+                # Fallback: if the pruner fails, take a random sample to prevent context overflow
+                import random
+                fallback_deps = set(random.sample(list(prunable_deps_ids), self.max_dependencies_per_task))
+                final_deps_to_use.update(fallback_deps)
+        else:
+            # No pruning needed, use all prunable dependencies
+            final_deps_to_use.update(prunable_deps_ids)
+
+        # --- END OF NEW LOGIC ---
+
+        # The rest of the function now uses the pruned `final_deps_to_use` set
         child_results = {
-            cid: self.registry.tasks[cid].result
+            self.registry.tasks[cid].desc: self.registry.tasks[cid].result
             for cid in t.children
-            if self.registry.tasks[cid].status == "complete"
+            if self.registry.tasks[cid].status == "complete" and self.registry.tasks[cid].result
         }
+
+        # Use the pruned set, excluding children which are already handled
+        pruned_dep_ids = final_deps_to_use - children_ids
         dep_results = {
-            did: self.registry.tasks[did].result
-            for did in t.deps
-            if self.registry.tasks[did].status == "complete"
-               and did not in child_results
+            self.registry.tasks[did].desc: self.registry.tasks[did].result
+            for did in pruned_dep_ids
+            if self.registry.tasks[did].status == "complete" and self.registry.tasks[did].result
         }
 
         prompt_lines = [f"Your task is: {t.desc}\n"]
         if child_results:
             prompt_lines.append("\nSynthesize the results from your sub-tasks into a final answer:\n")
-            for cid, res in child_results.items():
-                prompt_lines.append(f"- From sub-task '{self.registry.tasks[cid].desc}':\n{res}\n\n")
-        elif dep_results:
-            prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
-            for did, res in dep_results.items():
-                prompt_lines.append(f"- From dependency '{self.registry.tasks[did].desc}':\n{res}\n\n")
+            for desc, res in child_results.items():
+                prompt_lines.append(f"- From sub-task '{desc}':\n{res}\n\n")
+        if dep_results:
+            prompt_lines.append("\nUse data from the following critical dependencies to inform your answer:\n")
+            for desc, res in dep_results.items():
+                prompt_lines.append(f"- From dependency '{desc}':\n{res}\n\n")
 
         prompt_base_content = "".join(prompt_lines)
 
+        # ... the rest of the _run_task_execution method (MCP setup, executor loop, etc.) remains exactly the same ...
         task_specific_mcp_clients = []
         task_specific_tools = list(self._tools_for_agents)
 
-        # ... (MCP server setup logic remains exactly the same) ...
         if t.mcp_servers:
             logger.info(f"Task [{t.id}] has {len(t.mcp_servers)} MCP servers. Initializing clients.")
             for server_config in t.mcp_servers:
@@ -1376,7 +1456,6 @@ class InteractiveDAGAgent(DAGAgent):
             current_attempt = t.fix_attempts + t.grace_attempts + 1
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
 
-            # ** NEW: Clear the execution log for each new attempt **
             t.execution_log = []
             self._broadcast_state_update(t)
 
@@ -1397,7 +1476,6 @@ class InteractiveDAGAgent(DAGAgent):
 
             logger.info(f"[{t.id}] Attempt {current_attempt}: Streaming executor actions...")
 
-            # --- CORE CHANGE: Replace .run() with .iter() ---
             exec_res = None
             try:
                 async with task_executor.iter(user_prompt=current_prompt,
@@ -1409,15 +1487,12 @@ class InteractiveDAGAgent(DAGAgent):
                             t.execution_log.append(formatted_node)
                             self._broadcast_state_update(t)
 
-                # After the stream is complete, the result is on the agent_run object
                 exec_res = agent_run.result
 
             except Exception as e:
                 logger.error(f"[{t.id}] Exception during agent stream: {e}", exc_info=True)
-                # Append an error to the log for the UI
                 t.execution_log.append({"type": "error", "content": f"An error occurred during execution: {e}"})
                 self._broadcast_state_update(t)
-                # We will let this fall through to the verification step, which will fail and trigger retry logic.
                 result = None
 
             if exec_res:
@@ -1428,7 +1503,6 @@ class InteractiveDAGAgent(DAGAgent):
                     agent_role_name="executor",
                 )
             else:
-                # Handle cases where the stream completes but yields no result
                 result = None
 
             if result is None:
@@ -1446,7 +1520,6 @@ class InteractiveDAGAgent(DAGAgent):
                     raise Exception(f"Exceeded max attempts for task '{t.id}' after empty executor result.")
                 continue
 
-            # The verification logic remains the same
             await self._process_executor_output_for_verification(ctx, result)
             if t.status in ["complete", "failed", "paused_by_human"]:
                 return

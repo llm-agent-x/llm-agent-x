@@ -55,6 +55,15 @@ class InformationNeedDecision(BaseModel):
     is_needed: bool = Field(description="Set to true ONLY if the task is fundamentally impossible to complete without specific external information from a human.")
     reason: str = Field(description="A brief explanation for the decision, justifying why the information gap is or is not the root cause.")
 
+class TaskToPrune(BaseModel):
+    """A task that is a candidate for pruning."""
+    task_id: str = Field(description="The unique ID of the task to be pruned.")
+    reason: str = Field(description="A brief justification for why this task is the least critical.")
+
+class PruningDecision(BaseModel):
+    """The final decision on which tasks to prune from the graph."""
+    tasks_to_prune: List[TaskToPrune] = Field(description="A list of tasks that have been selected for removal.")
+
 class UserQuestion(BaseModel):
     """
     A specific output type for agents to ask clarifying questions to the human operator.
@@ -73,6 +82,10 @@ class Dependency(BaseModel):
     reason: str
     local_id: str
 
+class DependencySelection(BaseModel):
+    """The decision on which dependencies are most critical for a task."""
+    reasoning: str = Field(description="A brief explanation of the selection strategy.")
+    approved_dependency_ids: List[str] = Field(description="A list of the most critical dependency task IDs to use.")
 
 class NewSubtask(BaseModel):
     local_id: str
