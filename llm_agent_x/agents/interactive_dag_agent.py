@@ -97,7 +97,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
+            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks, but you should try to design tasks so that they are as self-contained as possible, since the people who do them can't talk to each other. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
             output_type=ExecutionPlan,  # MODIFIED: Removed Union[..., UserQuestion]
             tools=self._tools_for_agents,  # Use the internal tools list
         )
@@ -233,7 +233,13 @@ class InteractiveDAGAgent(DAGAgent):
         # Prepare the request parameters. Pydantic-AI needs the output schema defined as a tool.
         params = ModelRequestParameters()
         output_is_model = isinstance(agent.output_type, type) and issubclass(agent.output_type, BaseModel)
+
+        # --- MODIFICATION START ---
+        # Build a comprehensive instruction list
+        all_instructions = list(agent._system_prompts)
+
         if output_is_model:
+            # This part remains the same: it configures the API call for tool use.
             params.output_tools = [
                 ToolDefinition(
                     name="output",
@@ -242,11 +248,26 @@ class InteractiveDAGAgent(DAGAgent):
                 )
             ]
 
+            # NEW: Explicitly add the JSON schema to the prompt instructions for the LLM.
+            # This is the crucial step to prevent field name hallucination.
+            schema_instruction = (
+                f"\n\n--- OUTPUT FORMAT ---\n"
+                f"You MUST respond using the 'output' tool with a JSON object that strictly adheres to the following JSON Schema:\n"
+                f"```json\n{json.dumps(agent.output_type.model_json_schema(), indent=2)}\n```"
+            )
+            all_instructions.append(schema_instruction)
+
+        # The final instruction to use the tool remains.
+        all_instructions.append("\n\nUse the `output` tool.")
+
         messages = [
             ModelRequest(parts=[
                 UserPromptPart(user_prompt),
-            ], instructions="\n\n".join(agent._system_prompts) + "\n\nUse the `output` tool."),
+            # Use the newly constructed, comprehensive instructions.
+            ], instructions="\n\n".join(all_instructions)),
         ]
+        # --- MODIFICATION END ---
+
 
         try:
             # Make the direct, stateless API call
