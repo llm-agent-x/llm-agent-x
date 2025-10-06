@@ -525,6 +525,79 @@ class InteractiveDAGAgent(DAGAgent):
         # Default behavior for all non-pausing scenarios.
         return False, actual_output
 
+    async def _prune_task_graph_if_needed(self):
+        """
+        Checks if the total number of tasks exceeds the configured limit. If so,
+        it invokes the graph_pruner agent to select and remove the least
+        critical pending tasks until the graph is within constraints.
+        """
+        # 1. Trigger Condition: Only run if the task count exceeds the maximum.
+        if len(self.registry.tasks) <= self.max_total_tasks:
+            return
+
+        logger.warning(
+            f"Graph size ({len(self.registry.tasks)}) exceeds limit ({self.max_total_tasks}). Initiating pruning."
+        )
+
+        with self.tracer.start_as_current_span("GraphPruning") as span:
+            # 2. Candidate Selection: Only non-root, pending tasks are eligible for pruning.
+            pending_tasks = [t for t in self.registry.tasks.values() if t.status == "pending" and t.parent is not None]
+
+            if not pending_tasks:
+                logger.info("Pruning needed, but no eligible pending tasks were found to remove. Skipping this cycle.")
+                return
+
+            span.set_attribute("graph.tasks.total", len(self.registry.tasks))
+            span.set_attribute("graph.tasks.pruning_candidates", len(pending_tasks))
+
+            # 3. Prompt Engineering: Give the pruner a clear list of candidates and a goal.
+            pruning_candidates_prompt = "\n".join(
+                [f"- ID: {t.id}, Description: {t.desc}" for t in pending_tasks]
+            )
+            pruner_prompt = (
+                f"The project currently has {len(self.registry.tasks)} tasks, but the maximum allowed is {self.max_total_tasks}. "
+                f"You must reduce the project's scope. From the following list of PENDING tasks, identify and select "
+                f"the least critical, most redundant, or lowest-impact tasks for removal.\n\n"
+                f"CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
+            )
+
+            # 4. Agent Invocation: Use the robust stateless helper to get a decision.
+            # We pass `None` for the context because this is a system-level operation.
+            pruning_decision = await self._run_stateless_agent(self.graph_pruner, pruner_prompt, None)
+
+            # 5. Graceful Failure: If the agent fails, log it and exit without crashing.
+            if not pruning_decision or not pruning_decision.tasks_to_prune:
+                logger.error(
+                    "Graph pruner failed to return a valid pruning decision. No tasks will be removed this cycle.")
+                span.set_status(trace.Status(StatusCode.ERROR, "Pruner returned invalid or empty output"))
+                return
+
+            # 6. State Manipulation: Execute the pruning decision.
+            pruned_ids = set()
+            for task_to_prune in pruning_decision.tasks_to_prune:
+                task_id = task_to_prune.task_id
+                if task_id in self.registry.tasks:
+                    task = self.registry.tasks[task_id]
+                    logger.info(f"Pruning task [{task_id}] '{task.desc[:50]}...'. Reason: {task_to_prune.reason}")
+
+                    # Remove from parent's children list to maintain DAG integrity.
+                    if task.parent and task.parent in self.registry.tasks:
+                        parent = self.registry.tasks[task.parent]
+                        if task_id in parent.children:
+                            parent.children.remove(task_id)
+                            self._broadcast_state_update(parent)
+
+                    # Mark task as failed for a clean final state, then delete.
+                    task.status = "failed"
+                    task.result = "Pruned by project manager to reduce graph size."
+                    self._broadcast_state_update(task)
+                    del self.registry.tasks[task_id]
+                    pruned_ids.add(task_id)
+
+            span.set_attribute("graph.tasks.pruned_count", len(pruned_ids))
+            logger.info(
+                f"Pruning complete. Removed {len(pruned_ids)} tasks. New graph size: {len(self.registry.tasks)}")
+
     def _listen_for_directives_target(self):
         """
         Target function for the consumer thread. It runs in a separate thread.
@@ -762,6 +835,8 @@ class InteractiveDAGAgent(DAGAgent):
             with self.tracer.start_as_current_span("InteractiveDAGAgent.run"):
                 while True:
                     # Process any directives received from the consumer thread
+                    await self._prune_task_graph_if_needed()
+
                     while not self.directives_queue.empty():
                         directive = await self.directives_queue.get()
                         await self._handle_directive(directive)
@@ -789,7 +864,7 @@ class InteractiveDAGAgent(DAGAgent):
                     for tid in all_task_ids - non_executable_tasks:
                         task = self.registry.tasks[tid]
                         if any(
-                            self.registry.tasks.get(d, {}).status == "failed"
+                            d not in self.registry.tasks or self.registry.tasks[d].status != "failed"
                             for d in task.deps
                         ):
                             if task.status != "failed":
@@ -1027,13 +1102,10 @@ class InteractiveDAGAgent(DAGAgent):
         logger.info(f"[{t.id}] Running initial planning for: {t.desc}")
 
         completed_tasks = [
-            tk
-            for tk in self.registry.tasks.values()
-            if tk.status == "complete" and tk.id != t.id
+            tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id
         ]
-        context_str = "\n".join(
-            f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks
-        )
+        context_str = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
+
         prompt_parts = [
             f"Objective: {t.desc}",
             f"\n\nAvailable completed data sources:\n{context_str}",
@@ -1046,11 +1118,25 @@ class InteractiveDAGAgent(DAGAgent):
                 f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
             self._broadcast_state_update(t)
+
         full_prompt = "\n".join(prompt_parts)
 
-        initial_plan = await self._run_stateless_agent(self.initial_planner, full_prompt, ctx)
+        # --- FIX: Revert to stateful agent.run() for context-aware planning ---
+        plan_res = await self.initial_planner.run(
+            user_prompt=full_prompt, message_history=t.last_llm_history
+        )
+        is_paused, initial_plan = await self._handle_agent_output(
+            ctx=ctx,
+            agent_res=plan_res,
+            expected_output_type=ExecutionPlan,
+            agent_role_name="initial_planner",
+        )
+        # --- End of Fix ---
+
+        if is_paused: return  # This should not happen, but is a safeguard
         if not initial_plan:
             t.status = "failed"
+            t.result = "Initial planner failed to produce a valid plan."
             self._broadcast_state_update(t)
             logger.error(f"[{t.id}] Initial planner returned no plan.")
             return
@@ -1058,26 +1144,21 @@ class InteractiveDAGAgent(DAGAgent):
         plan = initial_plan
         if initial_plan.needs_subtasks and initial_plan.subtasks:
             fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
+            # Cycle breaker is a simple decision, so stateless is appropriate here
             fixed_plan = await self._run_stateless_agent(self.cycle_breaker, fixer_prompt, ctx)
             if not fixed_plan:
                 t.status = "failed"
+                t.result = "Cycle breaker failed to produce a valid plan."
                 self._broadcast_state_update(t)
                 logger.error(f"[{t.id}] Cycle breaker returned no plan.")
                 return
             plan = fixed_plan
 
-        # --- LOGIC RESTORED ---
-        # This is the critical section that was missing. It processes the final plan.
         if not plan.needs_subtasks:
-            # If the planner decides no subtasks are needed, the task is complete.
             t.status = "complete"
             t.already_planned = True
-            self._broadcast_state_update(t)
-            t.last_llm_history = None
-            t.agent_role_paused = None
             return
 
-        # If subtasks are needed, process them to add them to the graph.
         await self._process_initial_planning_output(ctx, plan)
 
     async def _process_initial_planning_output(
@@ -1118,65 +1199,65 @@ class InteractiveDAGAgent(DAGAgent):
         t = ctx.task
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
         available_tasks = str(
-            [
-                {"id": task.id, "desc": task.desc}
-                for task in self.registry.tasks.values()
-            ]
+            [{"id": task.id, "desc": task.desc} for task in self.registry.tasks.values()]
         )
+
         prompt_parts = [
             f"Task: {t.desc}",
-            f"\n\nResults from dependencies:\n{t.dep_results}",
+            f"\n\nResults from dependencies:\n{json.dumps(t.dep_results, indent=2)}",
             f"\n\n--- Available tasks to request results from: {available_tasks}",
+            self._get_notebook_tool_guidance(t, "adaptive_decomposer"),
         ]
-
+        self._inject_and_clear_user_response(prompt_parts, t)
         if t.human_directive:
             prompt_parts.append(
-                f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n"
-            )
+                f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
             t.human_directive = None
             self._broadcast_state_update(t)
 
         full_prompt = "\n".join(prompt_parts)
 
-        proposals_response = await self._run_stateless_agent(self.adaptive_decomposer, full_prompt, ctx)
+        # --- FIX: Revert to stateful agent.run() for context-aware decomposition ---
+        proposals_res = await self.adaptive_decomposer.run(
+            user_prompt=full_prompt, message_history=t.last_llm_history
+        )
+        is_paused, proposals_response = await self._handle_agent_output(
+            ctx=ctx,
+            agent_res=proposals_res,
+            expected_output_type=AdaptiveDecomposerResponse,
+            agent_role_name="adaptive_decomposer",
+        )
+        # --- End of Fix ---
 
+        if is_paused: return
         if not proposals_response:
-            t.status = "failed"
-            self._broadcast_state_update(t)
-            logger.error(
-                f"[{t.id}] Adaptive decomposer returned no proposals or invalid output."
-            )
+            # If the decomposer has nothing to add, it's not a failure, it just means we can proceed.
+            logger.info(f"[{t.id}] Adaptive decomposer proposed no new tasks. Proceeding to execution.")
+            t.status = "waiting_for_children"  # Or running, if no children
             return
 
         if proposals_response.tasks:
-            # FIXED: Get length from the .tasks attribute
-            logger.info(
-                f"Task [{t.id}] proposing {len(proposals_response.tasks)} new sub-tasks."
-            )
-            # FIXED: Iterate over the .tasks attribute
+            logger.info(f"Task [{t.id}] proposing {len(proposals_response.tasks)} new sub-tasks.")
             for sub in proposals_response.tasks:
                 self.proposed_tasks_buffer.append((sub, t.id))
 
         if proposals_response.dep_requests:
             logger.info(
-                f"Task [{t.id}] requesting results from {len(proposals_response.dep_requests)} new dependencies."
-            )
+                f"Task [{t.id}] requesting results from {len(proposals_response.dep_requests)} new dependencies.")
             for dep in proposals_response.dep_requests:
                 self.proposed_task_dependencies_buffer.append((dep, t.id))
-
-        if t.status not in ["paused_by_human"]:
-            t.status = "waiting_for_children"
-            self._broadcast_state_update(t)
 
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
-        # --- DEPENDENCY PRUNING LOGIC ---
+        # >>> FIX 2: RESTORE THE DEPENDENCY PRUNING LOGIC <<<
+        # This entire block was missing from the execution flow.
         children_ids = set(t.children)
         prunable_deps_ids = t.deps - children_ids
         final_deps_to_use = children_ids.copy()
 
+        # Check if the number of other dependencies exceeds the configured limit.
         if len(prunable_deps_ids) > self.max_dependencies_per_task:
             logger.warning(
                 f"Task [{t.id}] has {len(prunable_deps_ids)} prunable dependencies, exceeding limit of {self.max_dependencies_per_task}. Initiating selection..."
@@ -1194,26 +1275,27 @@ class InteractiveDAGAgent(DAGAgent):
                 f"Available Dependencies:\n{pruning_candidates_prompt}"
             )
 
-            pruner_res = await self.dependency_pruner.run(user_prompt=pruner_prompt)
-            selection = pruner_res.output
+            # Use the stateless agent for a robust, one-shot decision.
+            selection = await self._run_stateless_agent(self.dependency_pruner, pruner_prompt, ctx)
 
             if selection and selection.approved_dependency_ids:
                 approved_ids = set(selection.approved_dependency_ids)
                 final_deps_to_use.update(approved_ids)
-                logger.info(
-                    f"Pruned dependencies down to {len(approved_ids)} for this run. Reasoning: {selection.reasoning}")
+                logger.info(f"Pruned dependencies down to {len(approved_ids)} for this run. Reasoning: {selection.reasoning}")
                 t.span.set_attribute("dependencies.pruned_count", len(prunable_deps_ids) - len(approved_ids))
             else:
                 logger.error(f"[{t.id}] Dependency pruner failed. Using a random subset of dependencies as a fallback.")
                 import random
-                # Ensure we don't try to sample more items than exist
                 sample_size = min(self.max_dependencies_per_task, len(prunable_deps_ids))
                 fallback_deps = set(random.sample(list(prunable_deps_ids), sample_size))
                 final_deps_to_use.update(fallback_deps)
         else:
+            # If within limits, use all dependencies.
             final_deps_to_use.update(prunable_deps_ids)
+        # --- END OF RESTORED LOGIC ---
 
-        # --- PROMPT BUILDING ---
+
+        # The rest of the function now correctly uses the pruned `final_deps_to_use` set
         child_results = {
             self.registry.tasks[cid].desc: self.registry.tasks[cid].result
             for cid in t.children
@@ -1412,17 +1494,19 @@ class InteractiveDAGAgent(DAGAgent):
                 self.proposed_tasks_buffer = []
 
     async def _process_executor_output_for_verification(
-        self, ctx: TaskContext, result: str
+            self, ctx: TaskContext, result: str
     ):
         """
-        Overrides the base verification logic to implement a multi-stage, interactive failure analysis chain,
-        prioritizing human escalation before autonomous retries.
+        Implements the multi-stage failure analysis chain using the robust
+        stateless agent pattern for all decision-making steps.
         """
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
 
         if not verify_task_result:
+            # Handle cases where the verifier itself failed
             t.status = "failed"
+            t.result = "Verification agent failed to produce a valid assessment."
             self._broadcast_state_update(t)
             return
 
@@ -1435,18 +1519,19 @@ class InteractiveDAGAgent(DAGAgent):
             return
 
         t.fix_attempts += 1
+        self._broadcast_state_update(t)
 
-        # Are we still in the standard, pre-analysis retry phase?
-        if (t.fix_attempts < t.max_fix_attempts):
+        if t.fix_attempts < t.max_fix_attempts:
             t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
-            logger.info(f"[{t.id}] Retrying execution (Attempt {t.fix_attempts + 1}). Feedback: {verify_task_result.reason[:50]}...")
+            logger.info(
+                f"[{t.id}] Retrying execution (Attempt {t.fix_attempts + 1}). Feedback: {verify_task_result.reason[:50]}...")
             self._broadcast_state_update(t)
             return
 
-        # --- BEGIN FAILURE ANALYSIS CHAIN (triggered after max standard attempts) ---
+        # --- BEGIN FAILURE ANALYSIS CHAIN ---
         logger.info(f"[{t.id}] Max standard attempts reached. Initiating failure analysis chain...")
 
-        # STEP A: Check for Information Need (First Priority)
+        # STEP A: Check for Information Need using the stateless helper
         logger.info(f"[{t.id}] (Step A) Consulting information gap detector...")
         detector_prompt = f"Task History:\nTask: '{t.desc}'\nScores: {t.verification_scores}\nIs this failure fundamentally due to missing info that a human must provide?"
         info_decision = await self._run_stateless_agent(self.information_gap_detector, detector_prompt, ctx)
@@ -1454,22 +1539,30 @@ class InteractiveDAGAgent(DAGAgent):
         if info_decision and info_decision.is_needed:
             logger.info(f"[{t.id}] Information gap detected. Formulating question for operator...")
             formulator_prompt = f"Context: The task '{t.desc}' has failed with scores {t.verification_scores}. A root cause analysis determined it's missing key information. Formulate the single, most critical question to ask the human."
-            question_res = await self.question_formulator.run(user_prompt=formulator_prompt, message_history=t.last_llm_history)
 
-            is_paused, _ = await self._handle_agent_output(
-                ctx=ctx, agent_res=question_res, expected_output_type=UserQuestion, agent_role_name="question_formulator"
-            )
-            if is_paused:
-                logger.info(f"[{t.id}] Escalation successful. Task is now 'waiting_for_user_response'.")
-                return # SUCCESSFUL EXIT: Task is paused awaiting human input.
+            # --- CRITICAL FIX: Use the robust stateless agent pattern here as well ---
+            question_output = await self._run_stateless_agent(self.question_formulator, formulator_prompt, ctx)
 
-        # STEP B: Decide on Autonomous Retry (Second Priority)
-        # This code only runs if the information detector said 'is_needed: False'.
+            # Now, directly check the output type. We no longer need _handle_agent_output for this.
+            if isinstance(question_output, UserQuestion):
+                logger.info(f"[{t.id}] Escalation successful. Task pausing for user response.")
+                t.current_question = question_output
+                t.agent_role_paused = "question_formulator"
+                t.status = "waiting_for_user_response"
+                self._broadcast_state_update(t)
+                return  # SUCCESSFUL EXIT: Task is now correctly paused.
+            else:
+                logger.error(
+                    f"[{t.id}] Question Formulator failed to produce a valid question. Proceeding to next step.")
+
+        # STEP B: Decide on Autonomous Retry
         if t.grace_attempts < self.max_grace_attempts:
-            logger.info(f"[{t.id}] (Step B) Information gap ruled out. Consulting retry analyst for grace attempt...")
-            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nAn information gap was ruled out. Decide if one final autonomous grace attempt is viable."
-            decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt, message_history=t.last_llm_history)
-            decision = decision_res.output
+            logger.info(
+                f"[{t.id}] (Step B) Information gap ruled out or question formulation failed. Consulting retry analyst...")
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\n\n{str(t.executor_llm_history)}\n\nAn information gap was ruled out. Decide if one final autonomous grace attempt is viable."
+
+            # Use stateless agent for consistency
+            decision = await self._run_stateless_agent(self.retry_analyst, analyst_prompt, ctx)
 
             if decision and decision.should_retry:
                 t.span.add_event("Grace attempt granted", {"reason": decision.reason})
@@ -1479,14 +1572,15 @@ class InteractiveDAGAgent(DAGAgent):
                 self._broadcast_state_update(t)
                 return  # SUCCESSFUL EXIT: Perform the grace attempt.
 
-        # STEP C: Final Failure (Last Resort)
-        # This code only runs if Step A was False AND Step B was False.
+        # STEP C: Final Failure
         error_msg = f"Exceeded max attempts for task '{t.id}'. All recovery options exhausted."
         t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
         t.status = "failed"
+        t.result = "Failed after multiple attempts and analysis. Recovery options exhausted."
         self._broadcast_state_update(t)
         t.last_llm_history, t.agent_role_paused = None, None
-        raise Exception(error_msg)
+        # We don't need to raise an exception here anymore, just set the final state.
+        logger.error(f"[{t.id}] {error_msg}")
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
