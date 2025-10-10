@@ -38,7 +38,7 @@ from llm_agent_x.agents.dag_agent import (
     UserQuestion,
     ProposalResolutionPlan,
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
-    TaskForMerging, MergedTask, MergingDecision,
+    TaskForMerging, MergedTask, MergingDecision, NewSubtask,
 )
 
 from dotenv import load_dotenv
@@ -49,6 +49,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
+
+from llm_agent_x.backend.extract_json_from_text import extract_json
 
 load_dotenv(".env", override=True)
 logging.basicConfig(
@@ -309,18 +311,29 @@ class InteractiveDAGAgent(DAGAgent):
                 logger.info(f"One shot response: {resp.parts[0]}")
 
                 # For structured output, parse the tool call from the response
-                if resp.parts and resp.parts[0].tool_name == "output":
-                    args_as_dict = resp.parts[0].args_as_dict()
-                    output = agent.output_type(**args_as_dict)
-                    logger.info(f"One shot response (pydantic-ified): {output}")
-                    return output
-
-                else:
-                    if t:
-                        logger.error(f"[{t.id}] Stateless agent failed to produce structured output.")
+                if hasattr(resp.parts[0], "tool_name"):
+                    if resp.parts and resp.parts[0].tool_name == "output":
+                        args_as_dict = resp.parts[0].args_as_dict()
+                        output = agent.output_type(**args_as_dict)
+                        logger.info(f"One shot response (pydantic-ified): {output}")
+                        return output
                     else:
-                        logger.error(f"Stateless agent failed to produce structured output.")
-                    return None
+                        if t:
+                            logger.error(f"[{t.id}] Stateless agent failed to produce structured output.")
+                        else:
+                            logger.error(f"Stateless agent failed to produce structured output.")
+                        return None
+                else:
+                    # Attempt to get a JSON object out of response text, then convert to the specified pydantic model
+                    # Response may not be pure JSON, may be wrapped in text
+                    response_text = resp.parts[0].content
+                    json_ = extract_json(response_text)
+                    if json_:
+                        output = agent.output_type(**json_)
+                        logger.info(f"One shot response (json): {output}")
+                        return output
+
+
             else:
                 # For simple string output
                 return resp.parts[0].content if resp.parts else None
@@ -1211,7 +1224,6 @@ class InteractiveDAGAgent(DAGAgent):
 
         full_prompt = "\n".join(prompt_parts)
 
-        # --- FIX: Revert to stateful agent.run() for context-aware planning ---
         plan_res = await self.initial_planner.run(
             user_prompt=full_prompt, message_history=t.last_llm_history
         )
@@ -1221,9 +1233,8 @@ class InteractiveDAGAgent(DAGAgent):
             expected_output_type=ExecutionPlan,
             agent_role_name="initial_planner",
         )
-        # --- End of Fix ---
 
-        if is_paused: return  # This should not happen, but is a safeguard
+        if is_paused: return
         if not initial_plan:
             t.status = "failed"
             t.result = "Initial planner failed to produce a valid plan."
@@ -1232,9 +1243,9 @@ class InteractiveDAGAgent(DAGAgent):
             return
 
         plan = initial_plan
+        # 1. Cycle Breaker
         if initial_plan.needs_subtasks and initial_plan.subtasks:
             fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
-            # Cycle breaker is a simple decision, so stateless is appropriate here
             fixed_plan = await self._run_stateless_agent(self.cycle_breaker, fixer_prompt, ctx)
             if not fixed_plan:
                 t.status = "failed"
@@ -1244,6 +1255,7 @@ class InteractiveDAGAgent(DAGAgent):
                 return
             plan = fixed_plan
 
+        # 2. Task Merger
         if plan.needs_subtasks and plan.subtasks:
             logger.info(f"[{t.id}] Running task merger to consolidate plan.")
             tasks_for_merging = [
@@ -1257,48 +1269,55 @@ class InteractiveDAGAgent(DAGAgent):
             merging_decision = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
 
             if merging_decision:
-                # Reconstruct the ExecutionPlan from the merger's decision
-                new_subtasks = []
+                reconstructed_subtasks = []
                 original_subtasks_map = {st.local_id: st for st in plan.subtasks}
+
+                merged_and_kept_ids = {task.new_local_id for task in merging_decision.merged_tasks} | set(
+                    merging_decision.kept_task_ids)
 
                 # Add the newly merged tasks
                 for merged in merging_decision.merged_tasks:
-                    # Find all dependencies of the subsumed tasks and merge them, removing internal links
-                    all_deps = set()
+                    # --- START OF FIX ---
+                    # Use a dictionary to ensure unique dependencies based on local_id
+                    unique_deps = {}
                     for subsumed_id in merged.subsumed_task_ids:
-                        for dep in original_subtasks_map[subsumed_id].deps:
-                            # Only add dependencies that are external to the merged group
-                            if dep.local_id not in merged.subsumed_task_ids:
-                                all_deps.add(dep)
+                        if subsumed_id in original_subtasks_map:
+                            for dep in original_subtasks_map[subsumed_id].deps:
+                                if dep.local_id not in merged.subsumed_task_ids and dep.local_id in merged_and_kept_ids:
+                                    # If not already present, add the Dependency object
+                                    if dep.local_id not in unique_deps:
+                                        unique_deps[dep.local_id] = dep
 
-                    new_subtasks.append(
-                        Task(
-                            id=merged.new_local_id,
+                    reconstructed_subtasks.append(
+                        NewSubtask(
+                            local_id=merged.new_local_id,
                             desc=merged.new_desc,
-                            deps=list(all_deps),
-                            # A merged task is likely complex enough for further decomposition
+                            deps=list(unique_deps.values()),  # Convert back to a list
                             can_request_new_subtasks=True
                         )
                     )
+                    # --- END OF FIX ---
 
                 # Add back the tasks that were kept
                 for kept_id in merging_decision.kept_task_ids:
                     if kept_id in original_subtasks_map:
-                        new_subtasks.append(original_subtasks_map[kept_id])
+                        original_task = original_subtasks_map[kept_id]
+                        valid_deps = [dep for dep in original_task.deps if dep.local_id in merged_and_kept_ids]
+                        original_task.deps = valid_deps
+                        reconstructed_subtasks.append(original_task)
 
-                plan.subtasks = new_subtasks
+                plan.subtasks = reconstructed_subtasks
                 logger.info(f"[{t.id}] Plan consolidated. New subtask count: {len(plan.subtasks)}")
             else:
-                logger.warning(
-                    f"[{t.id}] Task merger failed to produce a valid decision. Proceeding with unmerged plan.")
+                logger.warning(f"[{t.id}] Task merger failed. Proceeding with unmerged plan.")
 
         t.already_planned = True
+
         if plan.needs_subtasks and plan.subtasks:
-            # If subtasks were created, process them and then the parent will wait.
             await self._process_initial_planning_output(ctx, plan)
             t.status = "waiting_for_children"
         else:
-            logger.info(f"[{t.id}] Initial planning complete. No subtasks needed. Proceeding to execution.")
+            logger.info(f"[{t.id}] Planning complete. No subtasks needed. Proceeding to execution.")
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -1320,11 +1339,11 @@ class InteractiveDAGAgent(DAGAgent):
             self.registry.add_task(new_task)
             t.children.append(new_task.id)
             self.registry.add_dependency(t.id, new_task.id)
-            local_to_global_id_map[sub.id] = new_task.id
+            local_to_global_id_map[sub.local_id] = new_task.id
             self._broadcast_state_update(new_task)
 
         for sub in plan.subtasks:
-            new_global_id = local_to_global_id_map.get(sub.id)
+            new_global_id = local_to_global_id_map.get(sub.local_id)
             if not new_global_id:
                 continue
             for dep in sub.deps:
@@ -1723,22 +1742,30 @@ class InteractiveDAGAgent(DAGAgent):
             t.last_llm_history, t.agent_role_paused = None, None
             return
 
-    async def _verify_task(self, t: Task, candidate_result: str) -> verification:
-        ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
-        # Verifier does not get notebook update guidance
+    async def _verify_task(self, t: Task, candidate_result: str) -> Optional[verification]:
+        prompt_parts = [
+            f"Your job is to verify if the 'Candidate Result' accurately and completely addresses the 'Original Task'.",
+            f"\n--- Original Task ---\n{t.desc}"
+        ]
 
-        vres = await self.verifier.run(
-            user_prompt=ver_prompt, message_history=t.last_llm_history
-        )
-        # _handle_agent_output no longer pauses for UserQuestion.
+        if t.human_directive:
+            prompt_parts.append(f"\n--- Operator's Corrective Directive ---\n{t.human_directive}")
+        if t.user_response:
+            prompt_parts.append(f"\n--- Operator's Answer to a Question ---\n{t.user_response}")
+
+        prompt_parts.append(f"\n--- Candidate Result ---\n{candidate_result}")
+        prompt_parts.append(
+            "\n\nDoes the result, considering any operator directives, fully and accurately complete the task? Be strict.")
+
+        ver_prompt = "\n".join(prompt_parts)
+
         vout = await self._run_stateless_agent(self.verifier, ver_prompt, TaskContext(t.id, self.registry))
-        if vout is None:  # Treat invalid/empty verification as score 0 (worst)
-            logger.error(
-                f"[{t.id}] Verifier returned no output or invalid output. Assigning score 0."
-            )
+
+        if not isinstance(vout, verification):
+            logger.error(f"[{t.id}] Verifier returned an invalid type or None. Assigning score 0.")
             return verification(
-                reason="Verifier returned no valid output.",
-                message_for_user="Verification failed due to internal error.",
+                reason="Verifier agent failed to produce a valid 'verification' model output.",
+                message_for_user="Verification failed due to an internal agent error.",
                 score=0,
             )
 
