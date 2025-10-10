@@ -121,6 +121,22 @@ class AdaptiveDecomposerResponse(BaseModel):
     dep_requests: List[str] = Field(default_factory=list,
                                     description="A list of IDs of EXISTING tasks whose results are needed as new dependencies for the current task.")
 
+class TaskForMerging(BaseModel):
+    """Represents a single task in a plan being evaluated for merging."""
+    local_id: str
+    desc: str
+    deps: List[str] = Field(description="List of local_ids this task depends on.")
+
+class MergedTask(BaseModel):
+    """Represents a new, consolidated task that replaces one or more original tasks."""
+    new_local_id: str = Field(description="A new, descriptive local ID for the merged task (e.g., 'plan_and_book_venue').")
+    new_desc: str = Field(description="A new, comprehensive description for the merged task.")
+    subsumed_task_ids: List[str] = Field(description="A list of the original local_ids that this new task replaces.")
+
+class MergingDecision(BaseModel):
+    """The plan for merging overly granular or redundant tasks."""
+    merged_tasks: List[MergedTask] = Field(description="A list of new tasks that consolidate others.")
+    kept_task_ids: List[str] = Field(description="A list of local_ids for tasks that were NOT merged and should be kept as-is.")
 
 class ProposalResolutionPlan(BaseModel):
     """The final, pruned list of approved sub-tasks."""
@@ -132,7 +148,7 @@ class Task(BaseModel):
     id: str
     desc: str
     deps: Set[str] = Field(default_factory=set)
-    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, paused_by_human, waiting_for_user_response
+    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, paused_by_human, waiting_for_user_response
     result: Optional[str] = None
     cost: float = 0.0
     parent: Optional[str] = None

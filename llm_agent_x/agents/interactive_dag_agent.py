@@ -38,6 +38,7 @@ from llm_agent_x.agents.dag_agent import (
     UserQuestion,
     ProposalResolutionPlan,
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
+    TaskForMerging, MergedTask, MergingDecision,
 )
 
 from dotenv import load_dotenv
@@ -112,6 +113,19 @@ class InteractiveDAGAgent(DAGAgent):
             output_type=ExecutionPlan,
             tools=self._tools_for_agents,  # Use the internal tools list
         )
+
+        self.task_merger = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are an efficiency expert. Your job is to analyze a list of proposed sub-tasks and identify opportunities for consolidation. "
+                "Merge tasks that are too granular or represent sequential steps of a single action (e.g., 'Research venues' and 'Book venue' should be one task: 'Research and book a venue'). "
+                "You MUST provide a new description for each merged task. "
+                "Ensure you also list all original tasks that were NOT merged and should be kept."
+            ),
+            output_type=MergingDecision,
+            tools=[],
+        )
+
         self.adaptive_decomposer = Agent(
             model=llm_model,
             system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
@@ -207,6 +221,7 @@ class InteractiveDAGAgent(DAGAgent):
         self._agent_role_map = {
             "initial_planner": self.initial_planner,
             "cycle_breaker": self.cycle_breaker,
+            "task_merger": self.task_merger,
             "adaptive_decomposer": self.adaptive_decomposer,
             "conflict_resolver": self.conflict_resolver,
             "graph_pruner": self.graph_pruner,
@@ -547,13 +562,25 @@ class InteractiveDAGAgent(DAGAgent):
                 logger.info("Pruning needed, but no eligible pending tasks were found to remove. Skipping this cycle.")
                 return
 
+            downstream_dependents: Dict[str, List[str]] = {
+                task.id: [] for task in self.registry.tasks.values()
+            }
+
+            for task in self.registry.tasks.values():
+                for dep_id in task.deps:
+                    if dep_id in downstream_dependents:
+                        downstream_dependents[dep_id].append(task.id)
+
             span.set_attribute("graph.tasks.total", len(self.registry.tasks))
             span.set_attribute("graph.tasks.pruning_candidates", len(pending_tasks))
 
             # 3. Prompt Engineering: Give the pruner a clear list of candidates and a goal.
-            pruning_candidates_prompt = "\n".join(
-                [f"- ID: {t.id}, Description: {t.desc}" for t in pending_tasks]
-            )
+            pruning_candidates_prompt = "\n".join([
+                (f"- ID: {t.id}, Description: {t.desc}, "
+                 f"Dependencies: {list(t.deps)}, "
+                 f"Required by: {downstream_dependents.get(t.id, [])}")
+                for t in pending_tasks
+            ])
             pruner_prompt = (
                 f"The project currently has {len(self.registry.tasks)} tasks, but the maximum allowed is {self.max_total_tasks}. "
                 f"You must reduce the project's scope. From the following list of PENDING tasks, identify and select "
@@ -563,90 +590,109 @@ class InteractiveDAGAgent(DAGAgent):
 
             # 4. Agent Invocation: Use the robust stateless helper to get a decision.
             # We pass `None` for the context because this is a system-level operation.
-            pruning_decision = await self._run_stateless_agent(self.graph_pruner, pruner_prompt, None)
+            pruning_decision = await self._run_stateless_agent(self.graph_pruner, pruner_prompt, ctx=None)
 
-            # 5. Graceful Failure: If the agent fails, log it and exit without crashing.
             if not pruning_decision or not pruning_decision.tasks_to_prune:
-                logger.error(
-                    "Graph pruner failed to return a valid pruning decision. No tasks will be removed this cycle.")
-                span.set_status(trace.Status(StatusCode.ERROR, "Pruner returned invalid or empty output"))
+                logger.error("Graph pruner failed to return a valid decision. No tasks removed.")
+                span.set_status(trace.Status(StatusCode.ERROR, "Pruner returned invalid output"))
                 return
 
-            # 6. State Manipulation: Execute the pruning decision.
             pruned_ids = set()
             for task_to_prune in pruning_decision.tasks_to_prune:
-                task_id = task_to_prune.task_id
-                if task_id in self.registry.tasks:
-                    task = self.registry.tasks[task_id]
-                    logger.info(f"Pruning task [{task_id}] '{task.desc[:50]}...'. Reason: {task_to_prune.reason}")
+                await self._prune_specific_task(
+                    task_id=task_to_prune.task_id,
+                    reason=f"Pruned by project manager to reduce graph size: {task_to_prune.reason}",
+                    new_status="cancelled"  # Use the new status
+                )
+                pruned_ids.add(task_to_prune.task_id)
 
-                    # Remove from parent's children list to maintain DAG integrity.
-                    if task.parent and task.parent in self.registry.tasks:
-                        parent = self.registry.tasks[task.parent]
-                        if task_id in parent.children:
-                            parent.children.remove(task_id)
-                            self._broadcast_state_update(parent)
-
-                    # Mark task as failed for a clean final state, then delete.
-                    task.status = "failed"
-                    task.result = "Pruned by project manager to reduce graph size."
-                    self._broadcast_state_update(task)
-                    del self.registry.tasks[task_id]
-                    pruned_ids.add(task_id)
+            # --- NEW: Trigger cascade to find and prune orphans ---
+            await self._prune_orphaned_tasks()
 
             span.set_attribute("graph.tasks.pruned_count", len(pruned_ids))
             logger.info(
                 f"Pruning complete. Removed {len(pruned_ids)} tasks. New graph size: {len(self.registry.tasks)}")
 
-    async def _prune_specific_task(self, task_id: str, reason: str):
+    async def _prune_orphaned_tasks(self):
         """
-        Completely removes a specific task from the registry based on a CANCEL directive.
-        It recursively removes children, cleans up parent references, and removes
-        the task from downstream dependencies to prevent DAG stalling.
+        Identifies and prunes any tasks that have no downstream dependents (orphans),
+        excluding completed tasks and the root task. This is a cleanup utility.
+        """
+        logger.info("Running orphan task cleanup...")
+        while True:
+            all_task_ids = set(self.registry.tasks.keys())
+
+            # 1. Build a set of all tasks that are listed as a dependency by at least one other task.
+            tasks_with_dependents = set()
+            for task in self.registry.tasks.values():
+                tasks_with_dependents.update(task.deps)
+
+            # 2. Identify orphans: tasks that are NOT in the set from step 1.
+            # We also exclude completed tasks and root tasks (tasks without a parent).
+            orphaned_ids = [
+                task_id for task_id in all_task_ids
+                if task_id not in tasks_with_dependents
+                   and self.registry.tasks[task_id].status != "complete"
+                   and self.registry.tasks[task_id].parent is not None
+            ]
+
+            # 3. If no orphans are found, the cleanup is done.
+            if not orphaned_ids:
+                logger.info("No orphaned tasks found.")
+                break
+
+            # 4. Prune the found orphans and loop again, as pruning them might create new orphans.
+            logger.warning(f"Found {len(orphaned_ids)} orphaned tasks to prune: {orphaned_ids}")
+            for orphan_id in orphaned_ids:
+                await self._prune_specific_task(
+                    task_id=orphan_id,
+                    reason="Orphaned: No other tasks depend on this task.",
+                    new_status="cancelled"
+                )
+
+    async def _prune_specific_task(self, task_id: str, reason: str, new_status: str = "cancelled"):
+        """
+        Safely removes a task from the registry and cleans up all references to it.
+        Now uses a 'cancelled' status by default for a clearer UI representation.
         """
         if task_id not in self.registry.tasks:
             logger.warning(f"Attempted to prune non-existent task: {task_id}")
             return
 
         task = self.registry.tasks[task_id]
-        logger.info(f"Initiating pruning of task [{task_id}]. Reason: {reason}")
+        logger.info(f"Initiating pruning of task [{task_id}] with status '{new_status}'. Reason: {reason}")
 
-        # 1. Recursively prune children first to avoid leaving orphans.
-        # Create a copy of the list as we will be modifying the registry.
+        # 1. Recursively prune children first
         children_to_prune = list(task.children)
         for child_id in children_to_prune:
-            await self._prune_specific_task(child_id, reason=f"Cascading cancellation from parent {task_id}")
+            await self._prune_specific_task(child_id, f"Cascading cancellation from parent {task_id}", new_status)
 
-        # 2. Remove this task from its parent's children list.
+        # 2. Remove from parent's children list
         if task.parent and task.parent in self.registry.tasks:
             parent = self.registry.tasks[task.parent]
             if task_id in parent.children:
                 parent.children.remove(task_id)
-                # If parent was 'waiting_for_children' and has no more, it might need state update in main loop
                 self._broadcast_state_update(parent)
 
-        # 3. Remove this task from the dependencies of downstream tasks.
-        # This is crucial to stop other tasks from waiting forever for this cancelled task.
-        for other_task_id, other_task in self.registry.tasks.items():
+        # 3. Remove from downstream dependencies
+        for other_task in self.registry.tasks.values():
             if task_id in other_task.deps:
                 other_task.deps.remove(task_id)
-                logger.info(f"Removed cancelled task [{task_id}] from dependencies of [{other_task_id}].")
+                logger.info(f"Removed cancelled task [{task_id}] from dependencies of [{other_task.id}].")
                 self._broadcast_state_update(other_task)
 
-        # 4. Cancel any in-flight asyncio execution.
+        # 4. Cancel any in-flight asyncio execution
         if task_id in self.task_futures:
-            fname = self.task_futures[task_id].get_name()
-            logger.info(f"Cancelling in-flight future '{fname}' for task [{task_id}].")
             self.task_futures[task_id].cancel()
-            # Do not delete from task_futures here; let the main loop handle the CancelledError cleanup.
 
-        # 5. Send a final update to UI indicating it's gone (using 'failed' as proxy for cancelled if needed)
-        task.status = "failed"
+        # 5. Send a final update to UI with the new status
+        task.status = new_status
         task.result = f"❌ CANCELLED: {reason}"
         self._broadcast_state_update(task)
 
-        # 6. Finally, remove from registry.
-        del self.registry.tasks[task_id]
+        # 6. Finally, remove from registry and inflight set
+        if task_id in self.registry.tasks:
+            del self.registry.tasks[task_id]
         if task_id in self.inflight:
             self.inflight.discard(task_id)
 
@@ -759,6 +805,7 @@ class InteractiveDAGAgent(DAGAgent):
         if command == "CANCEL":
             payload = directive.get("payload", "Cancelled by operator.")
             await self._prune_specific_task(task_id, reason=payload)
+            await self._prune_orphaned_tasks()
             return  # Task is deleted, stop processing.
         # ----------------------------
 
@@ -1197,12 +1244,61 @@ class InteractiveDAGAgent(DAGAgent):
                 return
             plan = fixed_plan
 
-        if not plan.needs_subtasks:
-            t.status = "complete"
-            t.already_planned = True
-            return
+        if plan.needs_subtasks and plan.subtasks:
+            logger.info(f"[{t.id}] Running task merger to consolidate plan.")
+            tasks_for_merging = [
+                TaskForMerging(local_id=st.local_id, desc=st.desc, deps=[d.local_id for d in st.deps])
+                for st in plan.subtasks
+            ]
+            merger_prompt = (
+                "Analyze the following list of tasks. Consolidate any that are too granular or sequential.\n\n"
+                f"{json.dumps([m.model_dump() for m in tasks_for_merging], indent=2)}"
+            )
+            merging_decision = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
 
-        await self._process_initial_planning_output(ctx, plan)
+            if merging_decision:
+                # Reconstruct the ExecutionPlan from the merger's decision
+                new_subtasks = []
+                original_subtasks_map = {st.local_id: st for st in plan.subtasks}
+
+                # Add the newly merged tasks
+                for merged in merging_decision.merged_tasks:
+                    # Find all dependencies of the subsumed tasks and merge them, removing internal links
+                    all_deps = set()
+                    for subsumed_id in merged.subsumed_task_ids:
+                        for dep in original_subtasks_map[subsumed_id].deps:
+                            # Only add dependencies that are external to the merged group
+                            if dep.local_id not in merged.subsumed_task_ids:
+                                all_deps.add(dep)
+
+                    new_subtasks.append(
+                        Task(
+                            id=merged.new_local_id,
+                            desc=merged.new_desc,
+                            deps=list(all_deps),
+                            # A merged task is likely complex enough for further decomposition
+                            can_request_new_subtasks=True
+                        )
+                    )
+
+                # Add back the tasks that were kept
+                for kept_id in merging_decision.kept_task_ids:
+                    if kept_id in original_subtasks_map:
+                        new_subtasks.append(original_subtasks_map[kept_id])
+
+                plan.subtasks = new_subtasks
+                logger.info(f"[{t.id}] Plan consolidated. New subtask count: {len(plan.subtasks)}")
+            else:
+                logger.warning(
+                    f"[{t.id}] Task merger failed to produce a valid decision. Proceeding with unmerged plan.")
+
+        t.already_planned = True
+        if plan.needs_subtasks and plan.subtasks:
+            # If subtasks were created, process them and then the parent will wait.
+            await self._process_initial_planning_output(ctx, plan)
+            t.status = "waiting_for_children"
+        else:
+            logger.info(f"[{t.id}] Initial planning complete. No subtasks needed. Proceeding to execution.")
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -1224,11 +1320,11 @@ class InteractiveDAGAgent(DAGAgent):
             self.registry.add_task(new_task)
             t.children.append(new_task.id)
             self.registry.add_dependency(t.id, new_task.id)
-            local_to_global_id_map[sub.local_id] = new_task.id
+            local_to_global_id_map[sub.id] = new_task.id
             self._broadcast_state_update(new_task)
 
         for sub in plan.subtasks:
-            new_global_id = local_to_global_id_map.get(sub.local_id)
+            new_global_id = local_to_global_id_map.get(sub.id)
             if not new_global_id:
                 continue
             for dep in sub.deps:
