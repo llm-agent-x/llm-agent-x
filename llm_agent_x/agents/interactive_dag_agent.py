@@ -1617,7 +1617,9 @@ class InteractiveDAGAgent(DAGAgent):
                     logger.warning(
                         f"Proposal buffer ({len(approved_proposals)}) exceeds proposal limit ({self.global_proposal_limit}). Engaging resolver."
                     )
-                    # ... (rest of conflict resolver logic is the same) ...
+                    prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
+                                   approved_proposals]
+                    resolver_prompt = f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
 
                     resolved_plan = await self._run_stateless_agent(self.conflict_resolver, resolver_prompt, ctx=None)
 
@@ -1627,25 +1629,35 @@ class InteractiveDAGAgent(DAGAgent):
                         logger.error("Conflict resolver failed. Discarding all proposals for this cycle.")
                         approved_proposals = []
 
-                # --- START OF FIX ---
                 # Step 2: Check if space is needed and trigger a coordinated prune.
                 num_to_commit = len(approved_proposals)
                 if num_to_commit > 0:
-                    # Call the pruner, telling it how much space we need.
-                    # It will only run if (current_size + num_to_commit) > max_total_tasks.
                     await self._prune_task_graph_if_needed(required_space=num_to_commit)
 
-                    # After pruning, re-check if there's enough space.
                     if (len(self.registry.tasks) + num_to_commit) > self.max_total_tasks:
                         logger.error(
                             f"Pruning did not create enough space for {num_to_commit} new tasks. "
                             "Discarding proposals for this cycle to prevent graph overgrowth."
                         )
-                        approved_proposals = []  # Prevent commit
+                        approved_proposals = []
                         span.set_status(trace.Status(StatusCode.ERROR, "Pruning failed to create sufficient space"))
+
+                # --- START OF FIX ---
+                # Step 3: Filter out proposals whose parent tasks may have been pruned.
+                final_proposals_to_commit = []
+                if approved_proposals:
+                    for proposal in approved_proposals:
+                        parent_id = parent_map.get(proposal.local_id)
+                        if parent_id and parent_id in self.registry.tasks:
+                            final_proposals_to_commit.append(proposal)
+                        else:
+                            logger.warning(
+                                f"Discarding proposal '{proposal.desc[:50]}...' because its parent task '{parent_id}' was pruned."
+                            )
+                    approved_proposals = final_proposals_to_commit
                 # --- END OF FIX ---
 
-                # Step 3: Commit the final list of proposals.
+                # Step 4: Commit the final, filtered list of proposals.
                 if approved_proposals:
                     logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
                     self._commit_proposals(approved_proposals, parent_map)
