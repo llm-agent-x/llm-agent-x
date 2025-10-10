@@ -831,6 +831,44 @@ class InteractiveDAGAgent(DAGAgent):
         if broadcast_needed or task.status != original_status:
             self._broadcast_state_update(task)
 
+    def _reset_downstream_tasks(self, task_id: str):
+        """
+        Recursively reset all downstream tasks (dependents) of the given task.
+
+        Args:
+            task_id: The ID of the task whose downstream tasks should be reset
+        """
+        logger.info(f"Resetting downstream tasks of {task_id}")
+
+        # Find all tasks that depend on this task
+        downstream_tasks = []
+        for tid, task_data in self.state.tasks.items():
+            if task_id in task_data.get("dependencies", []):
+                downstream_tasks.append(tid)
+
+        # Reset each downstream task and its own downstream tasks recursively
+        for downstream_id in downstream_tasks:
+            logger.info(f"Resetting downstream task {downstream_id}")
+
+            # Reset the downstream task's state
+            if downstream_id in self.state.tasks:
+                self.state.tasks[downstream_id]["status"] = "pending"
+                self.state.tasks[downstream_id]["output"] = None
+                self.state.tasks[downstream_id]["error"] = None
+                self.state.tasks[downstream_id]["verification_status"] = None
+                self.state.tasks[downstream_id]["verification_feedback"] = None
+
+                # Broadcast the state update
+                self._broadcast_state_update(
+                    update_type="task_reset",
+                    task_id=downstream_id,
+                    details={"reason": f"dependency {task_id} was reset"}
+                )
+
+            # Recursively reset tasks that depend on this downstream task
+            self._reset_downstream_tasks(downstream_id)
+
+
     def _reset_task_and_dependents(self, task_id: str):
         """Implements cascading state invalidation."""
         q = deque([task_id])
@@ -908,169 +946,113 @@ class InteractiveDAGAgent(DAGAgent):
         try:
             with self.tracer.start_as_current_span("InteractiveDAGAgent.run"):
                 while True:
-                    # Process any directives received from the consumer thread
                     await self._prune_task_graph_if_needed()
 
                     while not self.directives_queue.empty():
                         directive = await self.directives_queue.get()
                         await self._handle_directive(directive)
 
+                    # --- START OF THE FIX ---
+                    # Check for cascading failures from upstream dependencies.
+                    for task in list(self.registry.tasks.values()):
+                        if task.status == "failed":
+                            continue
+
+                        # Correctly check the status of each dependency task object.
+                        # This generator expression yields True for each failed dependency.
+                        failed_deps_exist = (
+                            dep_task.status == "failed"
+                            for dep_id in task.deps
+                            if (dep_task := self.registry.tasks.get(dep_id)) is not None
+                        )
+
+                        if any(failed_deps_exist):
+                            task.status = "failed"
+                            task.result = "Upstream dependency failed."
+                            self._broadcast_state_update(task)
+                            task.last_llm_history = None
+                            task.agent_role_paused = None
+                    # --- END OF THE FIX ---
+
                     all_task_ids = set(self.registry.tasks.keys())
                     executable_statuses = {
-                        "pending",
-                        "running",
-                        "planning",
-                        "proposing",
-                        "waiting_for_children",
+                        "pending", "running", "planning", "proposing", "waiting_for_children",
                     }
-                    # Include 'waiting_for_user_response' for scheduling purposes when a user_response is present
-                    # This only happens if a human explicitly answered a question via a directive.
                     non_executable_tasks = {
-                        t.id
-                        for t in self.registry.tasks.values()
+                        t.id for t in self.registry.tasks.values()
                         if t.status not in executable_statuses
-                        and not (
-                            t.status == "waiting_for_user_response"
-                            and t.user_response is not None
-                        )
+                           and not (t.status == "waiting_for_user_response" and t.user_response is not None)
                     }
 
-                    for tid in all_task_ids - non_executable_tasks:
-                        task = self.registry.tasks[tid]
-                        if any(
-                            d not in self.registry.tasks or self.registry.tasks[d].status != "failed"
-                            for d in task.deps
-                        ):
-                            if task.status != "failed":
-                                task.status, task.result = (
-                                    "failed",
-                                    "Upstream dependency failed.",
-                                )
-                                self._broadcast_state_update(task)
-                                task.last_llm_history = None
-                                task.agent_role_paused = None
-
-                    pending_tasks_for_scheduling = {
-                        t.id
-                        for t in self.registry.tasks.values()
-                        if t.status in executable_statuses
-                        or (
-                            t.status == "waiting_for_user_response"
-                            and t.user_response is not None
-                        )
-                    }
+                    pending_tasks_for_scheduling = all_task_ids - non_executable_tasks
 
                     ready_to_run_ids = set()
                     for tid in pending_tasks_for_scheduling:
-                        task = self.registry.tasks[tid]
-                        # Condition 1: Task is waiting for user response, but a response is present (human-provided)
-                        if (
-                            task.status == "waiting_for_user_response"
-                            and task.user_response is not None
-                            and task.last_llm_history is not None
-                            and task.agent_role_paused is not None
-                        ):
+                        task = self.registry.tasks.get(tid)
+                        if not task: continue
+
+                        if task.status == "waiting_for_user_response" and task.user_response is not None:
                             ready_to_run_ids.add(tid)
-                        # Condition 2: Task is pending AND all dependencies are complete (ready for initial run or next step after planning)
+
                         elif task.status == "pending" and all(
-                            self.registry.tasks.get(d, {}).status == "complete"
-                            for d in task.deps
+                                (dep_task := self.registry.tasks.get(d)) is not None and dep_task.status == "complete"
+                                for d in task.deps
                         ):
                             ready_to_run_ids.add(tid)
-                        # Condition 3: Parent task waiting for children, and all children are complete/failed
+
                         elif task.status == "waiting_for_children" and all(
-                            self.registry.tasks[c].status in ["complete", "failed"]
-                            for c in task.children
-                        ):
-                            if any(
-                                self.registry.tasks[c].status == "failed"
+                                (child_task := self.registry.tasks.get(c)) is not None and child_task.status in [
+                                    "complete", "failed"]
                                 for c in task.children
-                            ):
-                                task.status, task.result = (
-                                    "failed",
-                                    "A child task failed, cannot synthesize.",
-                                )
-                                self._broadcast_state_update(task)
-                                task.last_llm_history = None
-                                task.agent_role_paused = None
-                            else:
+                        ):
+                            if not any((child_task := self.registry.tasks.get(
+                                    c)) is not None and child_task.status == "failed" for c in task.children):
                                 ready_to_run_ids.add(tid)
-                                task.status = "pending"  # Transition to pending for execution/synthesis
+                                task.status = "pending"
                                 self._broadcast_state_update(task)
 
-                    ready = [
-                        tid for tid in ready_to_run_ids if tid not in self.inflight
-                    ]
+                    ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
 
-                    # Check for graceful shutdown conditions.
-                    # The loop continues if there's work for agents, or if the consumer thread is still active
-                    # (meaning more directives could arrive).
                     has_pending_interaction = any(
-                        t.status == "waiting_for_user_response"
-                        and t.user_response is None
+                        t.status == "waiting_for_user_response" and t.user_response is None
                         for t in self.registry.tasks.values()
                     )
-                    if (
-                        not ready
-                        and not self.inflight
-                        and not has_pending_interaction
-                        and self.directives_queue.empty()
-                    ):  # Check internal queue for directives processed in this loop
 
-                        # If no internal work or pending interaction, check if external input is still possible.
-                        if (
-                            self._shutdown_event.is_set()
-                            or not self._consumer_thread.is_alive()
-                        ):
-                            # Consumer thread is either signaled to stop, or already dead.
-                            # So no new directives will come in. It's safe to shut down.
-                            logger.info(
-                                "Interactive DAG execution complete (no pending, no inflight, no user interaction, no directives, consumer thread inactive/stopping)."
-                            )
+                    if (
+                            not ready and not self.inflight and not has_pending_interaction and self.directives_queue.empty()):
+                        if (self._shutdown_event.is_set() or not self._consumer_thread.is_alive()):
+                            logger.info("Interactive DAG execution complete.")
                             break
                         else:
-                            # Agent is idle, but consumer thread is still alive and waiting for external directives.
-                            # So, we should continue looping and waiting.
-                            logger.debug(
-                                "Agent idle, but consumer thread active. Waiting for directives..."
-                            )
+                            logger.debug("Agent idle, but consumer thread active. Waiting for directives...")
 
                     for tid in ready:
-                        self.inflight.add(tid)
-                        self.task_futures[tid] = asyncio.create_task(
-                            self._run_taskflow(tid)
-                        )
-                        self._broadcast_state_update(self.registry.tasks[tid])
+                        if tid in self.registry.tasks:
+                            self.inflight.add(tid)
+                            self.task_futures[tid] = asyncio.create_task(self._run_taskflow(tid))
+                            self._broadcast_state_update(self.registry.tasks[tid])
 
                     if self.task_futures:
-                        done, pending_futures = await asyncio.wait(
+                        done, _ = await asyncio.wait(
                             list(self.task_futures.values()),
                             timeout=0.1,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         for fut in done:
-                            tid = next(
-                                (
-                                    tid
-                                    for tid, f in self.task_futures.items()
-                                    if f == fut
-                                ),
-                                None,
-                            )
+                            tid = next((tid for tid, f in self.task_futures.items() if f == fut), None)
                             if tid:
                                 self.inflight.discard(tid)
                                 del self.task_futures[tid]
                                 try:
                                     fut.result()
                                 except asyncio.CancelledError:
-                                    logger.info(
-                                        f"Task [{tid}] was cancelled by operator or system."
-                                    )
+                                    logger.info(f"Task [{tid}] was cancelled by operator or system.")
                                 except Exception as e:
-                                    logger.error(f"Task [{tid}] future failed: {e}")
+                                    logger.error(f"Task [{tid}] future failed: {e}", exc_info=True)
                                     t = self.registry.tasks.get(tid)
                                     if t and t.status != "failed":
                                         t.status = "failed"
+                                        t.result = f"Execution failed: {e}"
                                         self._broadcast_state_update(t)
                                         t.last_llm_history = None
                                         t.agent_role_paused = None
@@ -1081,26 +1063,13 @@ class InteractiveDAGAgent(DAGAgent):
                     await asyncio.sleep(0.05)
         finally:
             logger.info(
-                "Agent run loop is shutting down. Signaling consumer thread to stop and closing publisher connection."
-            )
-
-            # Signal consumer thread to stop
+                "Agent run loop is shutting down. Signaling consumer thread to stop and closing publisher connection.")
             self._shutdown_event.set()
             if self._consumer_thread and self._consumer_thread.is_alive():
-                self._consumer_thread.join(
-                    timeout=5
-                )  # Wait for consumer to finish gracefully
-                if self._consumer_thread.is_alive():
-                    logger.warning(
-                        "Consumer thread did not shut down gracefully after 5 seconds."
-                    )
-
-            # Close publisher connection
+                self._consumer_thread.join(timeout=5)
             if self._publisher_connection and self._publisher_connection.is_open:
                 logger.info("Closing publisher RabbitMQ connection.")
                 self._publisher_connection.close()
-            self._publisher_connection = None
-            self._publish_channel = None
 
     async def _run_taskflow(self, tid: str):
         ctx = TaskContext(tid, self.registry)
@@ -1111,7 +1080,7 @@ class InteractiveDAGAgent(DAGAgent):
             span.set_attribute("dag.task.status", t.status)
 
             if t.status in ["paused_by_human", "waiting_for_user_response"]:
-                logger.info(f"[{t.id}] Task is {t.status}, skipping execution until directive received.")
+                # logger.info(f"[{t.id}] Task is {t.status}, skipping execution until directive received.")
                 return
 
             try:
@@ -1458,6 +1427,7 @@ class InteractiveDAGAgent(DAGAgent):
                                               message_history=t.last_llm_history) as agent_run:
                     async for node in agent_run:
                         formatted_node = self._format_stream_node(node)
+
                         if formatted_node:
                             logger.info(f"   > Stream [{t.id}]: {formatted_node}")
                             t.execution_log.append(formatted_node)
