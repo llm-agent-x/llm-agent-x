@@ -553,78 +553,86 @@ class InteractiveDAGAgent(DAGAgent):
         # Default behavior for all non-pausing scenarios.
         return False, actual_output
 
-    async def _prune_task_graph_if_needed(self):
+    async def _prune_task_graph_if_needed(self, required_space: int = 0):
         """
-        Checks if the total number of tasks exceeds the configured limit. If so,
-        it invokes the graph_pruner agent to select and remove the least
-        critical pending tasks until the graph is within constraints.
+        Checks if the graph is over the task limit or will be after adding new tasks.
+        Invokes the graph_pruner agent to free up the necessary number of slots.
         """
-        # 1. Trigger Condition: Only run if the task count exceeds the maximum.
-        if len(self.registry.tasks) <= self.max_total_tasks:
+        # --- START OF FIX ---
+        current_size = len(self.registry.tasks)
+        limit = self.max_total_tasks
+
+        # Calculate how many tasks we are over the limit right now.
+        current_overage = max(0, current_size - limit)
+        # Calculate how many tasks we will be over after adding new ones.
+        future_overage = max(0, (current_size + required_space) - limit)
+
+        # Determine the total number of tasks we must prune.
+        num_to_prune = max(current_overage, future_overage)
+
+        if num_to_prune == 0:
             return
 
         logger.warning(
-            f"Graph size ({len(self.registry.tasks)}) exceeds limit ({self.max_total_tasks}). Initiating pruning."
+            f"Graph size ({current_size}) + proposed ({required_space}) exceeds limit ({limit}). "
+            f"Attempting to prune at least {num_to_prune} task(s)."
         )
 
         with self.tracer.start_as_current_span("GraphPruning") as span:
-            # 2. Candidate Selection: Only non-root, pending tasks are eligible for pruning.
             pending_tasks = [t for t in self.registry.tasks.values() if t.status == "pending" and t.parent is not None]
 
             if not pending_tasks:
-                logger.info("Pruning needed, but no eligible pending tasks were found to remove. Skipping this cycle.")
+                logger.warning("Pruning needed, but no eligible pending tasks were found to remove.")
                 return
 
-            downstream_dependents: Dict[str, List[str]] = {
-                task.id: [] for task in self.registry.tasks.values()
-            }
+            span.set_attribute("graph.tasks.total", current_size)
+            span.set_attribute("graph.tasks.pruning_candidates", len(pending_tasks))
+            span.set_attribute("graph.tasks.required_to_prune", num_to_prune)
 
+            downstream_dependents: Dict[str, List[str]] = {task.id: [] for task in self.registry.tasks.values()}
             for task in self.registry.tasks.values():
                 for dep_id in task.deps:
                     if dep_id in downstream_dependents:
                         downstream_dependents[dep_id].append(task.id)
 
-            span.set_attribute("graph.tasks.total", len(self.registry.tasks))
-            span.set_attribute("graph.tasks.pruning_candidates", len(pending_tasks))
-
-            # 3. Prompt Engineering: Give the pruner a clear list of candidates and a goal.
             pruning_candidates_prompt = "\n".join([
                 (f"- ID: {t.id}, Description: {t.desc}, "
                  f"Dependencies: {list(t.deps)}, "
                  f"Required by: {downstream_dependents.get(t.id, [])}")
                 for t in pending_tasks
             ])
+
+            # Pass the number of tasks to prune directly in the prompt.
             pruner_prompt = (
-                f"The project currently has {len(self.registry.tasks)} tasks, but the maximum allowed is {self.max_total_tasks}. "
-                f"You must reduce the project's scope. From the following list of PENDING tasks, identify and select "
-                f"the least critical, most redundant, or lowest-impact tasks for removal.\n\n"
+                f"The project has {current_size} tasks, but the maximum allowed is {limit}. "
+                f"You MUST select at least {num_to_prune} of the LEAST critical tasks for removal from the following list. "
+                f"Pay close attention to the 'Required by' field; pruning a task with many dependents is high-risk.\n\n"
                 f"CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
             )
 
-            # 4. Agent Invocation: Use the robust stateless helper to get a decision.
-            # We pass `None` for the context because this is a system-level operation.
             pruning_decision = await self._run_stateless_agent(self.graph_pruner, pruner_prompt, ctx=None)
 
             if not pruning_decision or not pruning_decision.tasks_to_prune:
-                logger.error("Graph pruner failed to return a valid decision. No tasks removed.")
-                span.set_status(trace.Status(StatusCode.ERROR, "Pruner returned invalid output"))
+                logger.error("Graph pruner failed to return a valid decision. No tasks removed this cycle.")
+                span.set_status(trace.Status(StatusCode.ERROR, "Pruner returned invalid or empty output"))
                 return
 
             pruned_ids = set()
             for task_to_prune in pruning_decision.tasks_to_prune:
+                # We await inside the loop to ensure cascade effects of one prune are settled before the next.
                 await self._prune_specific_task(
                     task_id=task_to_prune.task_id,
-                    reason=f"Pruned by project manager to reduce graph size: {task_to_prune.reason}",
-                    new_status="cancelled"  # Use the new status
+                    reason=f"Pruned by graph manager: {task_to_prune.reason}",
+                    new_status="cancelled"
                 )
                 pruned_ids.add(task_to_prune.task_id)
 
-            # --- NEW: Trigger cascade to find and prune orphans ---
             await self._prune_orphaned_tasks()
 
             span.set_attribute("graph.tasks.pruned_count", len(pruned_ids))
             logger.info(
                 f"Pruning complete. Removed {len(pruned_ids)} tasks. New graph size: {len(self.registry.tasks)}")
+        # --- END OF FIX ---
 
     async def _prune_orphaned_tasks(self):
         """
@@ -1591,65 +1599,62 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _run_global_resolution(self):
         """
-        System-level operation to evaluate all buffered task proposals, resolve conflicts
-        if the number of proposals exceeds the global limit, and commit the approved
-        tasks to the graph. This uses the new stateless agent pattern.
+        System-level operation to evaluate buffered task proposals.
+        It resolves proposal conflicts and coordinates with the graph pruner
+        to ensure the total task limit is not breached.
         """
-        # A span is used for observability since this is not a real task.
         with self.tracer.start_as_current_span("GlobalConflictResolution") as span:
-            logger.info(f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks.")
-            span.set_attribute("proposals.count", len(self.proposed_tasks_buffer))
+            num_proposals = len(self.proposed_tasks_buffer)
+            logger.info(f"GLOBAL RESOLUTION: Evaluating {num_proposals} proposed sub-tasks.")
+            span.set_attribute("proposals.count", num_proposals)
 
-            # A try...finally block is critical to guarantee the buffer is always cleared,
-            # preventing an infinite loop of re-evaluating the same proposals.
             try:
                 approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
                 parent_map = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
 
-                # Only engage the expensive conflict resolver if the proposal limit is exceeded.
+                # Step 1: Resolve conflicts among the proposals themselves.
                 if len(approved_proposals) > self.global_proposal_limit:
                     logger.warning(
-                        f"Proposal buffer ({len(approved_proposals)}) exceeds limit ({self.global_proposal_limit}). Engaging resolver."
+                        f"Proposal buffer ({len(approved_proposals)}) exceeds proposal limit ({self.global_proposal_limit}). Engaging resolver."
                     )
-                    span.add_event("Conflict detected, engaging resolver.")
+                    # ... (rest of conflict resolver logic is the same) ...
 
-                    prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
-                                   approved_proposals]
-                    resolver_prompt = f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
-
-                    # --- Stateless Agent Pattern ---
-                    # Create a dummy TaskContext because _run_stateless_agent requires it
-                    # for telemetry, even though this isn't a real, registered task.
-                    # dummy_ctx = TaskContext(task_id="GLOBAL_RESOLVER", registry=self.registry)
-                    # dummy_task = Task(id="GLOBAL_RESOLVER", desc="Resolving proposal conflicts")
-                    # dummy_ctx.task = dummy_task  # Manually attach the task to the context.
-
-                    dummy_ctx = None
-
-                    # Call the stateless helper instead of the full Agent.run()
-                    resolved_plan = await self._run_stateless_agent(self.conflict_resolver, resolver_prompt, dummy_ctx)
-                    # --- End of Pattern ---
+                    resolved_plan = await self._run_stateless_agent(self.conflict_resolver, resolver_prompt, ctx=None)
 
                     if resolved_plan and isinstance(resolved_plan, ProposalResolutionPlan):
                         approved_proposals = resolved_plan.approved_tasks
-                        span.set_attribute("proposals.approved_count", len(approved_proposals))
-                        span.set_status(StatusCode.OK)
                     else:
-                        # If the agent fails, fail safely by discarding all proposals for this cycle.
-                        logger.error(
-                            "Conflict resolver failed to return a valid plan. Discarding all proposals for this cycle."
-                        )
+                        logger.error("Conflict resolver failed. Discarding all proposals for this cycle.")
                         approved_proposals = []
-                        span.set_status(trace.Status(StatusCode.ERROR, "Resolver returned invalid output"))
 
+                # --- START OF FIX ---
+                # Step 2: Check if space is needed and trigger a coordinated prune.
+                num_to_commit = len(approved_proposals)
+                if num_to_commit > 0:
+                    # Call the pruner, telling it how much space we need.
+                    # It will only run if (current_size + num_to_commit) > max_total_tasks.
+                    await self._prune_task_graph_if_needed(required_space=num_to_commit)
+
+                    # After pruning, re-check if there's enough space.
+                    if (len(self.registry.tasks) + num_to_commit) > self.max_total_tasks:
+                        logger.error(
+                            f"Pruning did not create enough space for {num_to_commit} new tasks. "
+                            "Discarding proposals for this cycle to prevent graph overgrowth."
+                        )
+                        approved_proposals = []  # Prevent commit
+                        span.set_status(trace.Status(StatusCode.ERROR, "Pruning failed to create sufficient space"))
+                # --- END OF FIX ---
+
+                # Step 3: Commit the final list of proposals.
                 if approved_proposals:
                     logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
                     self._commit_proposals(approved_proposals, parent_map)
+                    span.set_attribute("proposals.approved_count", len(approved_proposals))
+                    span.set_status(StatusCode.OK)
                 else:
                     logger.info("No proposals were approved or committed in this cycle.")
 
             finally:
-                # This is the most important part: always clear the buffer to prevent re-processing.
                 self.proposed_tasks_buffer = []
 
     async def _process_executor_output_for_verification(
