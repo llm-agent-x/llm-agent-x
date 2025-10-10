@@ -598,6 +598,61 @@ class InteractiveDAGAgent(DAGAgent):
             logger.info(
                 f"Pruning complete. Removed {len(pruned_ids)} tasks. New graph size: {len(self.registry.tasks)}")
 
+    async def _prune_specific_task(self, task_id: str, reason: str):
+        """
+        Completely removes a specific task from the registry based on a CANCEL directive.
+        It recursively removes children, cleans up parent references, and removes
+        the task from downstream dependencies to prevent DAG stalling.
+        """
+        if task_id not in self.registry.tasks:
+            logger.warning(f"Attempted to prune non-existent task: {task_id}")
+            return
+
+        task = self.registry.tasks[task_id]
+        logger.info(f"Initiating pruning of task [{task_id}]. Reason: {reason}")
+
+        # 1. Recursively prune children first to avoid leaving orphans.
+        # Create a copy of the list as we will be modifying the registry.
+        children_to_prune = list(task.children)
+        for child_id in children_to_prune:
+            await self._prune_specific_task(child_id, reason=f"Cascading cancellation from parent {task_id}")
+
+        # 2. Remove this task from its parent's children list.
+        if task.parent and task.parent in self.registry.tasks:
+            parent = self.registry.tasks[task.parent]
+            if task_id in parent.children:
+                parent.children.remove(task_id)
+                # If parent was 'waiting_for_children' and has no more, it might need state update in main loop
+                self._broadcast_state_update(parent)
+
+        # 3. Remove this task from the dependencies of downstream tasks.
+        # This is crucial to stop other tasks from waiting forever for this cancelled task.
+        for other_task_id, other_task in self.registry.tasks.items():
+            if task_id in other_task.deps:
+                other_task.deps.remove(task_id)
+                logger.info(f"Removed cancelled task [{task_id}] from dependencies of [{other_task_id}].")
+                self._broadcast_state_update(other_task)
+
+        # 4. Cancel any in-flight asyncio execution.
+        if task_id in self.task_futures:
+            fname = self.task_futures[task_id].get_name()
+            logger.info(f"Cancelling in-flight future '{fname}' for task [{task_id}].")
+            self.task_futures[task_id].cancel()
+            # Do not delete from task_futures here; let the main loop handle the CancelledError cleanup.
+
+        # 5. Send a final update to UI indicating it's gone (using 'failed' as proxy for cancelled if needed)
+        task.status = "failed"
+        task.result = f"❌ CANCELLED: {reason}"
+        self._broadcast_state_update(task)
+
+        # 6. Finally, remove from registry.
+        del self.registry.tasks[task_id]
+        if task_id in self.inflight:
+            self.inflight.discard(task_id)
+
+        logger.info(f"Task [{task_id}] completely pruned from registry.")
+
+
     def _listen_for_directives_target(self):
         """
         Target function for the consumer thread. It runs in a separate thread.
@@ -676,9 +731,8 @@ class InteractiveDAGAgent(DAGAgent):
         command = directive.get("command")
         task_id = directive.get("task_id")
 
-        # ADD_ROOT_TASK logic is separate and remains the same
+        # ADD_ROOT_TASK logic remains the same...
         if command == "ADD_ROOT_TASK":
-            # ... (no changes here) ...
             payload = directive.get("payload", {})
             desc = payload.get("desc")
             if not desc:
@@ -701,10 +755,17 @@ class InteractiveDAGAgent(DAGAgent):
             self._broadcast_state_update(new_task)
             return
 
-        # All other directives require a task_id
+        # --- NEW LOGIC FOR CANCEL ---
+        if command == "CANCEL":
+            payload = directive.get("payload", "Cancelled by operator.")
+            await self._prune_specific_task(task_id, reason=payload)
+            return  # Task is deleted, stop processing.
+        # ----------------------------
+
+        # All other directives require the task to exist
         task = self.registry.tasks.get(task_id)
         if not task:
-            logger.warning(f"Directive for unknown task {task_id} ignored.")
+            logger.warning(f"Directive '{command}' for unknown task {task_id} ignored.")
             return
 
         logger.info(f"Handling command '{command}' for task {task_id}")
@@ -718,43 +779,56 @@ class InteractiveDAGAgent(DAGAgent):
             )
 
         original_status = task.status
+        broadcast_needed = False
+        reset_dependents = False
+
         if command == "PAUSE":
             task.status = "paused_by_human"
+            broadcast_needed = True
         elif command == "RESUME":
-            task.status = "pending"  # Simply set to pending, the loop will pick it up
+            if task.status == "paused_by_human":
+                task.status = "pending"
+                broadcast_needed = True
         elif command == "TERMINATE":
             task.status = "failed"
             task.result = f"Terminated by operator: {payload}"
+            reset_dependents = True
+            broadcast_needed = True
         elif command == "REDIRECT":
-            task.status = "pending"
             task.human_directive = payload
+            task.status = "pending"
+            reset_dependents = True
+            broadcast_needed = True
         elif command == "MANUAL_OVERRIDE":
             task.status = "complete"
             task.result = payload
+            reset_dependents = True
+            broadcast_needed = True
         elif command == "ANSWER_QUESTION":
             if task.status == "waiting_for_user_response":
                 logger.info(f"Task {task_id} received answer: {str(payload)[:50]}...")
-                # --- THIS IS THE KEY CHANGE ---
-                # Place the answer into the human_directive field.
-                task.human_directive = str(payload)
-                # Reset the task to be re-run by the main scheduler.
-                task.status = "pending"
-                # Clear the question-related fields.
+                task.user_response = str(payload)
+                # Do NOT change status to pending here. Let main loop pick it up based on user_response presence.
+                # Just clear the question flags.
                 task.current_question = None
                 task.agent_role_paused = None
+                broadcast_needed = True
             else:
                 logger.warning(f"Task {task_id} not waiting for a question, ignoring ANSWER_QUESTION.")
 
-        # Consolidate state reset and broadcast logic
-        if command in ["TERMINATE", "REDIRECT", "MANUAL_OVERRIDE"]:
-             self._reset_task_and_dependents(task_id)
-             task.result = payload if command == "MANUAL_OVERRIDE" else task.result
-             task.human_directive = payload if command == "REDIRECT" else None
-             task.current_question = None
-             task.agent_role_paused = None
+        # Handle state resets for Redirect/Override to ensure fresh execution
+        if command in ["REDIRECT", "MANUAL_OVERRIDE"]:
+             # Clear execution history to force fresh thinking based on new input/result
+             task.fix_attempts = 0
+             task.grace_attempts = 0
+             task.verification_scores = []
              task.last_llm_history = None
+             task.execution_log = []
 
-        if task.status != original_status or command in ["REDIRECT", "ANSWER_QUESTION", "MANUAL_OVERRIDE"]:
+        if reset_dependents:
+             self._reset_downstream_tasks(task_id)
+
+        if broadcast_needed or task.status != original_status:
             self._broadcast_state_update(task)
 
     def _reset_task_and_dependents(self, task_id: str):
