@@ -902,7 +902,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         # Find all tasks that depend on this task
         downstream_tasks = []
-        for tid, task_data in self.state.tasks.items():
+        for tid, task_data in self.registry.tasks.items():
             if task_id in task_data.get("dependencies", []):
                 downstream_tasks.append(tid)
 
