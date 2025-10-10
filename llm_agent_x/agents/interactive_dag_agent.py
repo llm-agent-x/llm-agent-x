@@ -1494,11 +1494,12 @@ class InteractiveDAGAgent(DAGAgent):
                 self.proposed_tasks_buffer = []
 
     async def _process_executor_output_for_verification(
-            self, ctx: TaskContext, result: str
+        self, ctx: TaskContext, result: str
     ):
         """
-        Implements the multi-stage failure analysis chain using the robust
-        stateless agent pattern for all decision-making steps.
+        Implements the multi-stage failure analysis chain.
+        MODIFIED: If all autonomous attempts (standard + grace) are exhausted,
+        it will ALWAYS escalate to the user with a question instead of failing.
         """
         t = ctx.task
         verify_task_result = await self._verify_task(t, result)
@@ -1518,6 +1519,7 @@ class InteractiveDAGAgent(DAGAgent):
             t.last_llm_history, t.agent_role_paused = None, None
             return
 
+        # --- Standard Retry Logic (Unchanged) ---
         t.fix_attempts += 1
         self._broadcast_state_update(t)
 
@@ -1528,40 +1530,12 @@ class InteractiveDAGAgent(DAGAgent):
             self._broadcast_state_update(t)
             return
 
-        # --- BEGIN FAILURE ANALYSIS CHAIN ---
-        logger.info(f"[{t.id}] Max standard attempts reached. Initiating failure analysis chain...")
-
-        # STEP A: Check for Information Need using the stateless helper
-        logger.info(f"[{t.id}] (Step A) Consulting information gap detector...")
-        detector_prompt = f"Task History:\nTask: '{t.desc}'\nScores: {t.verification_scores}\nIs this failure fundamentally due to missing info that a human must provide?"
-        info_decision = await self._run_stateless_agent(self.information_gap_detector, detector_prompt, ctx)
-
-        if info_decision and info_decision.is_needed:
-            logger.info(f"[{t.id}] Information gap detected. Formulating question for operator...")
-            formulator_prompt = f"Context: The task '{t.desc}' has failed with scores {t.verification_scores}. A root cause analysis determined it's missing key information. Formulate the single, most critical question to ask the human."
-
-            # --- CRITICAL FIX: Use the robust stateless agent pattern here as well ---
-            question_output = await self._run_stateless_agent(self.question_formulator, formulator_prompt, ctx)
-
-            # Now, directly check the output type. We no longer need _handle_agent_output for this.
-            if isinstance(question_output, UserQuestion):
-                logger.info(f"[{t.id}] Escalation successful. Task pausing for user response.")
-                t.current_question = question_output
-                t.agent_role_paused = "question_formulator"
-                t.status = "waiting_for_user_response"
-                self._broadcast_state_update(t)
-                return  # SUCCESSFUL EXIT: Task is now correctly paused.
-            else:
-                logger.error(
-                    f"[{t.id}] Question Formulator failed to produce a valid question. Proceeding to next step.")
-
-        # STEP B: Decide on Autonomous Retry
+        # --- Grace Attempt Logic (Unchanged) ---
         if t.grace_attempts < self.max_grace_attempts:
             logger.info(
-                f"[{t.id}] (Step B) Information gap ruled out or question formulation failed. Consulting retry analyst...")
-            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\n\n{str(t.executor_llm_history)}\n\nAn information gap was ruled out. Decide if one final autonomous grace attempt is viable."
+                f"[{t.id}] Max standard attempts reached. Consulting retry analyst for a grace attempt...")
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\n\n{str(t.executor_llm_history)}\n\nDecide if one final autonomous grace attempt is viable."
 
-            # Use stateless agent for consistency
             decision = await self._run_stateless_agent(self.retry_analyst, analyst_prompt, ctx)
 
             if decision and decision.should_retry:
@@ -1570,17 +1544,44 @@ class InteractiveDAGAgent(DAGAgent):
                 t.human_directive = decision.next_step_suggestion
                 logger.info(f"[{t.id}] Grace attempt granted by analyst. Next step: {decision.next_step_suggestion}")
                 self._broadcast_state_update(t)
-                return  # SUCCESSFUL EXIT: Perform the grace attempt.
+                return  # Exit to perform the grace attempt.
 
-        # STEP C: Final Failure
-        error_msg = f"Exceeded max attempts for task '{t.id}'. All recovery options exhausted."
-        t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
-        t.status = "failed"
-        t.result = "Failed after multiple attempts and analysis. Recovery options exhausted."
-        self._broadcast_state_update(t)
-        t.last_llm_history, t.agent_role_paused = None, None
-        # We don't need to raise an exception here anymore, just set the final state.
-        logger.error(f"[{t.id}] {error_msg}")
+        # --- NEW: MANDATORY ESCALATION TO HUMAN ---
+        # This code is now the final step, reached only when all autonomous attempts are exhausted.
+        # It replaces the previous logic that would mark the task as failed.
+        logger.warning(
+            f"[{t.id}] All autonomous attempts exhausted. Escalating to human operator for guidance."
+        )
+        t.span.add_event("AllAutonomousAttemptsExhausted", {"reason": "Escalating to human."})
+
+        # Formulate the question for the user.
+        formulator_prompt = (
+            f"Context: The task '{t.desc}' has failed after multiple autonomous attempts with these verification scores: {t.verification_scores}. "
+            f"The final reason for failure was: '{verify_task_result.reason}'.\n\n"
+            f"Your job is to formulate the SINGLE most critical, concise, and clear question for the human operator that will unblock this task. "
+            f"Do not add any preamble. Just ask the question."
+        )
+
+        question_output = await self._run_stateless_agent(self.question_formulator, formulator_prompt, ctx)
+
+        if isinstance(question_output, UserQuestion):
+            # Successfully formulated a question, now pause the task.
+            logger.info(f"[{t.id}] Escalation successful. Task pausing for user response.")
+            t.current_question = question_output
+            t.agent_role_paused = "question_formulator"
+            t.status = "waiting_for_user_response"
+            self._broadcast_state_update(t)
+            return
+        else:
+            # This is the new TRUE failure condition: the agent couldn't even formulate a question.
+            error_msg = "All recovery options exhausted, and failed to formulate a question for the operator."
+            logger.error(f"[{t.id}] {error_msg}")
+            t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
+            t.status = "failed"
+            t.result = error_msg
+            self._broadcast_state_update(t)
+            t.last_llm_history, t.agent_role_paused = None, None
+            return
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
