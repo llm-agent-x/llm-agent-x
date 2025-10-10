@@ -158,9 +158,14 @@ class InteractiveDAGAgent(DAGAgent):
         self.graph_pruner = Agent(
             model=llm_model,
             system_prompt=(
-                "You are a ruthless project manager responsible for keeping a project on budget. The total number of tasks has exceeded the limit. "
-                "You will be given a list of all PENDING tasks. Your sole job is to identify and select the LEAST critical, most redundant, or lowest-impact "
-                "tasks for removal. You must provide a clear reason for each pruning decision."
+                "You are a strategic and prudent project manager responsible for keeping a project on budget and on track. "
+                "The total number of tasks has exceeded the allowed limit. Your job is to carefully select tasks for removal to make space. "
+                "You must provide a clear reason for each pruning decision. "
+                "\n\nFollow this decision hierarchy strictly:"
+                "\n1. First, identify tasks that are clearly redundant or have been made obsolete by the completion of other tasks."
+                "\n2. Second, identify low-impact, 'nice-to-have' tasks that are not critical for the main objective."
+                "\n3. **Critically, AVOID pruning foundational parent tasks that have many children or downstream dependents.** Pruning a parent task will cancel all its sub-tasks, which is highly destructive. Only do this as an absolute last resort if no other options exist."
+                "\nYour goal is to surgically remove tasks with the minimum possible impact on the overall project."
             ),
             output_type=PruningDecision,
             tools=[],
@@ -579,7 +584,12 @@ class InteractiveDAGAgent(DAGAgent):
         )
 
         with self.tracer.start_as_current_span("GraphPruning") as span:
-            pending_tasks = [t for t in self.registry.tasks.values() if t.status == "pending" and t.parent is not None]
+
+            prunable_statuses = {"pending", "planning", "proposing", "waiting_for_children", "running"}
+            pending_tasks = [
+                t for t in self.registry.tasks.values()
+                if t.status in prunable_statuses and t.parent is not None
+            ]
 
             if not pending_tasks:
                 logger.warning("Pruning needed, but no eligible pending tasks were found to remove.")
@@ -1147,7 +1157,7 @@ class InteractiveDAGAgent(DAGAgent):
             span.set_attribute("dag.task.id", t.id)
             span.set_attribute("dag.task.status", t.status)
 
-            if t.status in ["paused_by_human", "waiting_for_user_response"]:
+            if t.status == "paused_by_human" or (t.status == "waiting_for_user_response" and t.user_response is None):
                 # logger.info(f"[{t.id}] Task is {t.status}, skipping execution until directive received.")
                 return
 
@@ -1158,6 +1168,15 @@ class InteractiveDAGAgent(DAGAgent):
                     if t.status != new_status:
                         t.status = new_status
                         self._broadcast_state_update(t)
+
+                if t.status == "waiting_for_user_response" and t.user_response is not None:
+                    logger.info(f"[{t.id}] Resuming task with user response.")
+                    if t.agent_role_paused == "initial_planner":
+                        update_status_and_broadcast("planning")
+                    elif t.agent_role_paused == "adaptive_decomposer":
+                        update_status_and_broadcast("proposing")
+                    else:  # Covers 'executor' and 'question_formulator' which resume execution
+                        update_status_and_broadcast("running")
 
                 # Simplified, linear state progression
                 if t.status == 'waiting_for_children':
@@ -1271,7 +1290,7 @@ class InteractiveDAGAgent(DAGAgent):
                 for st in plan.subtasks
             ]
             merger_prompt = (
-                "Analyze the following list of tasks. Consolidate any that are too granular or sequential.\n\n"
+                "Analyze the following list of tasks. Consolidate any that are too granular or sequential. If you see tasks that are multiple steps, then combine them. Think of it this way: each task goes to one person, and they can't talk to each other, and they all do their things at once.\n\n"
                 f"{json.dumps([m.model_dump() for m in tasks_for_merging], indent=2)}"
             )
             merging_decision = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)

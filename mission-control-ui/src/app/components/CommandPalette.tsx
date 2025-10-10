@@ -117,6 +117,9 @@ export const CommandPalette = ({ taskId, taskStatus, currentQuestion }: { taskId
           <button onClick={() => handleCommand('TERMINATE', 'Operator intervention')} className="flex items-center justify-center gap-2 p-2 bg-red-600 hover:bg-red-700 rounded-md text-sm transition-colors disabled:bg-zinc-600" disabled={['complete', 'failed'].includes(taskStatus)}>
             <X size={16} /> Terminate
           </button>
+          <button onClick={() => handleCommand('CANCEL', 'Operator intervention')} className="flex items-center justify-center gap-2 p-2 bg-zinc-400 hover:bg-zinc-500 rounded-md text-sm transition-colors disabled:bg-zinc-600" disabled={['complete', 'failed', "cancelled"].includes(taskStatus)}>
+            <X size={16} /> Cancel
+          </button>
         </div>
       )}
 
