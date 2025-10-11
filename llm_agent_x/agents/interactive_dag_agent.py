@@ -38,7 +38,7 @@ from llm_agent_x.agents.dag_agent import (
     UserQuestion,
     ProposalResolutionPlan,
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
-    TaskForMerging, MergedTask, MergingDecision, NewSubtask,
+    TaskForMerging, MergedTask, MergingDecision, NewSubtask, ContextualAnswer,
 )
 
 from dotenv import load_dotenv
@@ -225,6 +225,17 @@ class InteractiveDAGAgent(DAGAgent):
             tools=[],
         )
 
+        self.internal_context_researcher = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are an expert internal researcher. Your SOLE job is to determine if the answer to a given 'Question' "
+                "exists within the 'Provided Context' of previously completed tasks. "
+                "You must not use external knowledge. If the answer is present, extract it. If not, state that it is missing."
+            ),
+            output_type=ContextualAnswer,
+            tools=[],
+        )
+
         self._agent_role_map = {
             "initial_planner": self.initial_planner,
             "cycle_breaker": self.cycle_breaker,
@@ -238,6 +249,7 @@ class InteractiveDAGAgent(DAGAgent):
             "retry_analyst": self.retry_analyst,
             "information_gap_detector": self.information_gap_detector,
             "question_formulator": self.question_formulator,
+            "internal_context_researcher": self.internal_context_researcher,
         }
 
     async def _run_stateless_agent(

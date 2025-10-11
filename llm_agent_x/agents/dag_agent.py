@@ -142,6 +142,14 @@ class ProposalResolutionPlan(BaseModel):
     """The final, pruned list of approved sub-tasks."""
     approved_tasks: List[ProposedSubtask]
 
+class ContextualAnswer(BaseModel):
+    """The result of searching internal task history for an answer."""
+    is_found: bool = Field(description="True if a definitive answer was found in the provided context.")
+    answer: Optional[str] = Field(None, description="The answer found in the context, if any.")
+    source_task_id: Optional[str] = Field(None, description="The ID of the task that contained the answer.")
+    reasoning: str = Field(description="A brief explanation of why the context is or is not sufficient to answer the question.")
+
+
 
 # The main Task model, enhanced for the new architecture
 class Task(BaseModel):
@@ -149,6 +157,8 @@ class Task(BaseModel):
     desc: str
     deps: Set[str] = Field(default_factory=set)
     status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, paused_by_human, waiting_for_user_response
+    is_critical: bool = Field(False,
+                              description="If True, this task cannot be automatically pruned by the graph manager.")
     result: Optional[str] = None
     cost: float = 0.0
     parent: Optional[str] = None
