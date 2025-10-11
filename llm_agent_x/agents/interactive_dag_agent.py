@@ -588,17 +588,15 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _prune_task_graph_if_needed(self, required_space: int = 0):
         """
-        Checks if the graph is over the task limit or will be after adding new tasks.
-        Invokes the graph_pruner agent to free up the necessary number of slots.
-        Prioritizes pruning safe "leaf" tasks before considering more destructive options.
+        UPDATED: Checks if the graph is over the limit and prunes tasks.
+        This version enforces a strict hierarchy: it will ONLY present safe "leaf" tasks
+        to the LLM if they exist. Risky parent tasks are only considered as a last resort.
+        It also validates the LLM's response to ensure it only selected valid candidates.
         """
         current_size = len(self.registry.tasks)
         limit = self.max_total_tasks
 
-        current_overage = max(0, current_size - limit)
-        future_overage = max(0, (current_size + required_space) - limit)
-
-        num_to_prune = max(current_overage, future_overage)
+        num_to_prune = max(0, (current_size + required_space) - limit)
 
         if num_to_prune == 0:
             return
@@ -609,24 +607,22 @@ class InteractiveDAGAgent(DAGAgent):
         )
 
         with self.tracer.start_as_current_span("GraphPruning") as span:
-            prunable_statuses = {"pending", "planning"}
+            # All tasks that are not active or finished are eligible candidates.
+            prunable_statuses = {"pending", "paused_by_human", "waiting_for_user_response", "failed", "cancelled"}
             all_eligible_tasks = [
                 t for t in self.registry.tasks.values()
-                if t.status in prunable_statuses and t.parent is not None
+                if t.status in prunable_statuses and t.parent is not None  # Never prune a root task
             ]
 
-            if not all_eligible_tasks:
-                logger.warning("Pruning needed, but no eligible in-progress tasks were found to remove.")
-                return
-
-            downstream_dependents: Dict[str, List[str]] = {task.id: [] for task in self.registry.tasks.values()}
+            # Build a map of which tasks depend on which other tasks.
+            downstream_dependents: Dict[str, List[str]] = {t.id: [] for t in self.registry.tasks.values()}
             for task in self.registry.tasks.values():
                 for dep_id in task.deps:
                     if dep_id in downstream_dependents:
                         downstream_dependents[dep_id].append(task.id)
 
-            # --- START OF FIX ---
-            # Tier 1: Identify "leaf" nodes among eligible tasks (tasks that no other task depends on)
+            # --- NEW STRICT HIERARCHY LOGIC ---
+            # Tier 1: Prioritize "leaf" nodes among eligible tasks (tasks that no other task depends on).
             safe_candidates = [
                 task for task in all_eligible_tasks
                 if not downstream_dependents.get(task.id)
@@ -636,23 +632,22 @@ class InteractiveDAGAgent(DAGAgent):
             pruner_prompt = ""
 
             if safe_candidates:
-                logger.info(f"Found {len(safe_candidates)} safe leaf-node tasks to consider for pruning.")
+                logger.info(
+                    f"Found {len(safe_candidates)} safe leaf-node tasks to consider for pruning. LLM will only see these.")
                 pruning_candidates = safe_candidates
                 pruning_candidates_prompt = "\n".join([
-                    (f"- ID: {t.id}, Status: {t.status}, Description: {t.desc}")
+                    f"- ID: {t.id}, Status: {t.status}, Description: {t.desc}"
                     for t in pruning_candidates
                 ])
                 pruner_prompt = (
-                    f"The project has too many tasks. You MUST select at least {num_to_prune} of the LEAST critical tasks for removal from the "
-                    f"following pre-filtered list of tasks that are safe to remove without causing cascading failures.\n\n"
+                    f"The project has too many tasks. You MUST select at least {num_to_prune} of the LEAST critical tasks for removal "
+                    f"from the following list of SAFE candidates.\n\n"
                     f"SAFE CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
                 )
             else:
-                # Tier 2: Fallback to the risky method if no safe candidates exist
+                # Tier 2: Fallback to risky pruning only if no safe options exist.
                 logger.warning(
-                    "No safe leaf-node tasks found for pruning. Falling back to considering all in-progress tasks. "
-                    "This is risky and may cause cascading cancellations."
-                )
+                    "No safe leaf-node tasks found for pruning. Falling back to considering all eligible tasks. This is risky.")
                 pruning_candidates = all_eligible_tasks
                 pruning_candidates_prompt = "\n".join([
                     (f"- ID: {t.id}, Status: {t.status}, Description: {t.desc}, "
@@ -660,24 +655,37 @@ class InteractiveDAGAgent(DAGAgent):
                     for t in pruning_candidates
                 ])
                 pruner_prompt = (
-                    f"The project has too many tasks and no safe 'leaf' tasks could be found to prune. "
+                    f"The project has too many tasks and NO safe 'leaf' tasks could be found. "
                     f"You MUST select at least {num_to_prune} of the LEAST critical tasks for removal from the following list. "
-                    f"Be extremely careful: Pruning a task that is 'Required by' other tasks will cause a destructive cascade. "
-                    f"Avoid this unless absolutely necessary.\n\n"
-                    f"CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
+                    f"Prioritize tasks that are required by the fewest other tasks.\n\n"
+                    f"RISKY CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
                 )
-            # --- END OF FIX ---
 
-            span.set_attribute("graph.tasks.total", current_size)
-            span.set_attribute("graph.tasks.pruning_candidates", len(pruning_candidates))
-            span.set_attribute("graph.tasks.required_to_prune", num_to_prune)
+            if not pruning_candidates:
+                logger.error(
+                    "Pruning required, but no eligible tasks (safe or risky) were found. Cannot proceed with pruning.")
+                return
+
+            # This set will be used to validate the LLM's response.
+            valid_candidate_ids = {t.id for t in pruning_candidates}
 
             pruning_decision = await self._run_stateless_agent(self.graph_pruner, pruner_prompt, ctx=None)
 
             if not pruning_decision or not pruning_decision.tasks_to_prune:
-                logger.error("Graph pruner failed to return a valid decision. No tasks removed this cycle.")
+                logger.error("Graph pruner failed to return a valid decision. No tasks removed.")
                 span.set_status(trace.Status(StatusCode.ERROR, "Pruner returned invalid or empty output"))
                 return
+
+            # --- NEW: VALIDATION OF LLM RESPONSE ---
+            for task_to_prune in pruning_decision.tasks_to_prune:
+                if task_to_prune.task_id not in valid_candidate_ids:
+                    logger.error(
+                        f"LLM proposed pruning an invalid or protected task ID ('{task_to_prune.task_id}'). "
+                        f"Rejecting entire pruning plan for this cycle to ensure safety."
+                    )
+                    span.set_status(trace.Status(StatusCode.ERROR, "LLM proposed invalid task to prune"))
+                    return
+            # --- END OF VALIDATION ---
 
             pruned_ids = set()
             for task_to_prune in pruning_decision.tasks_to_prune:
@@ -742,6 +750,14 @@ class InteractiveDAGAgent(DAGAgent):
 
         task = self.registry.tasks[task_id]
         logger.info(f"Initiating pruning of task [{task_id}] with status '{new_status}'. Reason: {reason}")
+
+        UNPRUNABLE_STATUSES = {"running", "proposing", "planning", "complete"}
+        if task.status in UNPRUNABLE_STATUSES:
+            logger.error(
+                f"FATAL PRUNING ERROR: Attempted to prune task [{task_id}] which is in an "
+                f"unprunable state ('{task.status}'). This action has been BLOCKED."
+            )
+            return
 
         # 1. Recursively prune children first
         children_to_prune = list(task.children)
