@@ -40,6 +40,7 @@ from llm_agent_x.agents.dag_agent import (
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
     TaskForMerging, MergedTask, MergingDecision, NewSubtask, ContextualAnswer,
     RedundancyDecision,
+    ChainedExecutionPlan, TaskChain, TaskDescription,
 )
 
 from dotenv import load_dotenv
@@ -99,11 +100,18 @@ class InteractiveDAGAgent(DAGAgent):
         """Initializes or reinitializes all agent roles with the current self._tools_for_agents."""
         llm_model = self.base_llm_model  # Use the stored model string
 
+        planner_system_prompt = (
+            "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
+            "Structure your output as 'chains' of tasks. "
+            "A 'chain' is a list of tasks that must be done sequentially (e.g., 'Step 1: Research venues', 'Step 2: Book venue'). "
+            "You can have multiple chains, and all chains will be executed in parallel. "
+            "Group related sequential steps into a single chain. Use parallel chains for independent streams of work."
+        )
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt="You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. You can link tasks to pre-existing completed tasks, but you should try to design tasks so that they are as self-contained as possible, since the people who do them can't talk to each other. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true.",
-            output_type=ExecutionPlan,  # MODIFIED: Removed Union[..., UserQuestion]
-            tools=self._tools_for_agents,  # Use the internal tools list
+            system_prompt=planner_system_prompt,
+            output_type=ChainedExecutionPlan,  # MODIFIED
+            tools=self._tools_for_agents,
         )
         self.cycle_breaker = Agent(
             model=llm_model,
@@ -120,14 +128,13 @@ class InteractiveDAGAgent(DAGAgent):
         self.task_merger = Agent(
             model=llm_model,
             system_prompt=(
-                "You are an aggressive efficiency expert. Your goal is to consolidate an overly granular list of tasks. "
-                "Imagine each task is given to a different person who works in isolation and cannot communicate with others. "
-                "If a sequence of steps should logically be done by one person, merge them. "
-                "For example, '1. Research conference venues', '2. Contact top 3 venues for quotes', and '3. Negotiate contract with the best venue' "
-                "are all sequential parts of one larger action and MUST be merged into a single task like: 'Research, contact, and book a suitable conference venue'. "
-                "Be decisive and merge liberally."
+                "You are an efficiency expert. Your SOLE job is to merge an ordered list of task descriptions "
+                "into a single, coherent, and actionable task description that encapsulates the entire sequence. "
+                "For example, if you receive ['Research venues', 'Contact venues', 'Book venue'], you should output "
+                "something like 'Research, contact, and book a suitable conference venue based on requirements.' "
+                "Your output MUST be only the final, merged task description as a single string."
             ),
-            output_type=MergingDecision,
+            output_type=str,  # MODIFIED to output a simple string
             tools=[],
         )
 
@@ -145,10 +152,15 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.adaptive_decomposer = Agent(
             model=llm_model,
-            system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is.",
-            output_type=AdaptiveDecomposerResponse,  # MODIFIED: Removed Union[..., UserQuestion]
-            tools=self._tools_for_agents,  # Use the internal tools list
+            system_prompt=(
+                "You are an adaptive expert. Analyze the given task. If it is too complex, break it down into one or more 'chains' of new, more granular sub-tasks. "
+                "A 'chain' is a list of tasks that must be done sequentially. You can create multiple parallel chains for independent workstreams."
+            ),
+            output_type=ChainedExecutionPlan,  # MODIFIED
+            tools=self._tools_for_agents,
         )
+
+        # cycle_breaker, redundancy_checker, and conflict_resolver are no longer needed, but we will keep them for now.
 
         self.dependency_pruner = Agent(
             model=llm_model,
@@ -1323,130 +1335,67 @@ class InteractiveDAGAgent(DAGAgent):
                 self._broadcast_state_update(t)
 
     async def _run_initial_planning(self, ctx: TaskContext):
+        """
+        OVERRIDDEN: Implements the new "Plan Chains -> Merge Chains -> Commit Tasks" workflow.
+        """
         t = ctx.task
-        logger.info(f"[{t.id}] Running initial planning for: {t.desc}")
-        if len(self.registry.tasks) >= self.max_total_tasks:
-            logger.warning(
-                f"[{t.id}] Task graph is full ({len(self.registry.tasks)}/{self.max_total_tasks}). "
-                f"Initial planning is FROZEN. The agent will focus on completing existing tasks."
-            )
-            # By returning here, the task remains in the 'planning' state but makes no progress,
-            # effectively freezing this branch of decomposition until space is available.
-            return
-        completed_tasks = [
-            tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id
-        ]
-        context_str = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
+        logger.info(f"[{t.id}] Running initial planning (chain-based) for: {t.desc}")
 
+        # (The first part of getting the prompt is the same as the base class)
+        completed_tasks = [tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id]
+        context_str = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
         prompt_parts = [
             f"Objective: {t.desc}",
-            f"\n\nAvailable completed data sources:\n{context_str}",
-            f"\n\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
-            self._get_notebook_tool_guidance(t, "initial_planner"),
+            f"\nAvailable completed data sources:\n{context_str}",
+            f"\n--- Current Shared Notebook for Task {t.id} ---\n{self._format_notebook_for_llm(t)}",
         ]
         self._inject_and_clear_user_response(prompt_parts, t)
-        if t.human_directive:
-            prompt_parts.append(
-                f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
-            t.human_directive = None
-            self._broadcast_state_update(t)
-
         full_prompt = "\n".join(prompt_parts)
 
-        plan_res = await self.initial_planner.run(
-            user_prompt=full_prompt, message_history=t.last_llm_history
-        )
-        is_paused, initial_plan = await self._handle_agent_output(
-            ctx=ctx,
-            agent_res=plan_res,
-            expected_output_type=ExecutionPlan,
-            agent_role_name="initial_planner",
+        plan_res = await self.initial_planner.run(user_prompt=full_prompt, message_history=t.last_llm_history)
+        is_paused, chained_plan = await self._handle_agent_output(
+            ctx=ctx, agent_res=plan_res, expected_output_type=ChainedExecutionPlan, agent_role_name="initial_planner"
         )
 
-        if is_paused: return
-        if not initial_plan:
-            t.status = "failed"
-            t.result = "Initial planner failed to produce a valid plan."
-            self._broadcast_state_update(t)
-            logger.error(f"[{t.id}] Initial planner returned no plan.")
+        if is_paused or not chained_plan or not chained_plan.task_chains:
+            if not is_paused: logger.info(f"[{t.id}] Planning complete. No subtasks needed. Proceeding to execution.")
             return
 
-        plan = initial_plan
-        # 1. Cycle Breaker
-        if initial_plan.needs_subtasks and initial_plan.subtasks:
-            fixer_prompt = f"Analyze and fix cycles in this plan:\n\n{initial_plan.model_dump_json(indent=2)}"
-            fixed_plan = await self._run_stateless_agent(self.cycle_breaker, fixer_prompt, ctx)
-            if not fixed_plan:
-                t.status = "failed"
-                t.result = "Cycle breaker failed to produce a valid plan."
-                self._broadcast_state_update(t)
-                logger.error(f"[{t.id}] Cycle breaker returned no plan.")
-                return
-            plan = fixed_plan
+        logger.info(f"[{t.id}] Planner proposed {len(chained_plan.task_chains)} chain(s). Consolidating...")
 
-        # 2. Task Merger
-        if plan.needs_subtasks and plan.subtasks:
-            logger.info(f"[{t.id}] Running task merger to consolidate plan.")
-            tasks_for_merging = [
-                TaskForMerging(local_id=st.local_id, desc=st.desc, deps=[d.local_id for d in st.deps])
-                for st in plan.subtasks
-            ]
-            merger_prompt = (
-                "Analyze the following list of tasks. Consolidate any that are too granular or sequential. If you see tasks that are multiple steps, then combine them. Think of it this way: each task goes to one person, and they can't talk to each other, and they all do their things at once.\n\n"
-                f"{json.dumps([m.model_dump() for m in tasks_for_merging], indent=2)}"
-            )
-            merging_decision = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
+        final_task_descriptions = []
+        for chain_obj in chained_plan.task_chains:
+            if not chain_obj.chain: continue
 
-            if merging_decision:
-                reconstructed_subtasks = []
-                original_subtasks_map = {st.local_id: st for st in plan.subtasks}
+            if len(chain_obj.chain) == 1:
+                # If a chain has only one step, use it directly
+                final_task_descriptions.append(chain_obj.chain[0])
+            else:
+                # If a chain has multiple steps, merge them into a single task
+                descriptions_to_merge = [td.desc for td in chain_obj.chain]
+                merger_prompt = (
+                    "Combine the following sequential steps into a single, comprehensive task description:\n"
+                    f"{json.dumps(descriptions_to_merge, indent=2)}"
+                )
+                merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
 
-                merged_and_kept_ids = {task.new_local_id for task in merging_decision.merged_tasks} | set(
-                    merging_decision.kept_task_ids)
-
-                # Add the newly merged tasks
-                for merged in merging_decision.merged_tasks:
-                    # --- START OF FIX ---
-                    # Use a dictionary to ensure unique dependencies based on local_id
-                    unique_deps = {}
-                    for subsumed_id in merged.subsumed_task_ids:
-                        if subsumed_id in original_subtasks_map:
-                            for dep in original_subtasks_map[subsumed_id].deps:
-                                if dep.local_id not in merged.subsumed_task_ids and dep.local_id in merged_and_kept_ids:
-                                    # If not already present, add the Dependency object
-                                    if dep.local_id not in unique_deps:
-                                        unique_deps[dep.local_id] = dep
-
-                    reconstructed_subtasks.append(
-                        NewSubtask(
-                            local_id=merged.new_local_id,
-                            desc=merged.new_desc,
-                            deps=list(unique_deps.values()),  # Convert back to a list
-                            can_request_new_subtasks=True
+                if merged_desc:
+                    final_task_descriptions.append(
+                        TaskDescription(
+                            local_id=f"merged_{chain_obj.chain[0].local_id}",
+                            desc=merged_desc,
+                            can_request_new_subtasks=True  # Merged tasks are inherently more complex
                         )
                     )
-                    # --- END OF FIX ---
+                else:
+                    logger.warning(f"[{t.id}] Task merger failed for a chain. Discarding chain.")
 
-                # Add back the tasks that were kept
-                for kept_id in merging_decision.kept_task_ids:
-                    if kept_id in original_subtasks_map:
-                        original_task = original_subtasks_map[kept_id]
-                        valid_deps = [dep for dep in original_task.deps if dep.local_id in merged_and_kept_ids]
-                        original_task.deps = valid_deps
-                        reconstructed_subtasks.append(original_task)
-
-                plan.subtasks = reconstructed_subtasks
-                logger.info(f"[{t.id}] Plan consolidated. New subtask count: {len(plan.subtasks)}")
-            else:
-                logger.warning(f"[{t.id}] Task merger failed. Proceeding with unmerged plan.")
-
-        t.already_planned = True
-
-        if plan.needs_subtasks and plan.subtasks:
-            await self._process_initial_planning_output(ctx, plan)
+        if final_task_descriptions:
+            logger.info(f"[{t.id}] Committing {len(final_task_descriptions)} consolidated sub-tasks.")
+            self._commit_task_descriptions(ctx, final_task_descriptions)
             t.status = "waiting_for_children"
         else:
-            logger.info(f"[{t.id}] Planning complete. No subtasks needed. Proceeding to execution.")
+            logger.info(f"[{t.id}] No valid sub-tasks remained after consolidation.")
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -1483,73 +1432,80 @@ class InteractiveDAGAgent(DAGAgent):
                     self.registry.add_dependency(new_global_id, dep_global_id)
 
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
+        """
+        OVERRIDDEN: Implements the new "Plan Chains -> Merge Chains -> Commit Tasks" workflow
+        for dynamic, bottom-up decomposition.
+        """
         t = ctx.task
-
+        # (Same graph size check as before)
         if len(self.registry.tasks) >= self.max_total_tasks:
-            logger.warning(
-                f"[{t.id}] Task graph is full ({len(self.registry.tasks)}/{self.max_total_tasks}). "
-                f"Adaptive decomposition is FROZEN. The agent will focus on completing existing tasks."
-            )
-            # Transition the task to wait for its current children, as it cannot create new ones.
-            # This allows the agent to proceed with execution instead of getting stuck in 'proposing'.
+            logger.warning(f"[{t.id}] Task graph is full. Adaptive decomposition is FROZEN.")
             t.status = "running"
             self._broadcast_state_update(t)
             return True
 
-
+        # (Same prompt setup as before)
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
-        available_tasks = str(
-            [{"id": task.id, "desc": task.desc} for task in self.registry.tasks.values()]
-        )
-
         prompt_parts = [
-            f"Task: {t.desc}",
-            f"\n\nResults from dependencies:\n{json.dumps(t.dep_results, indent=2)}",
-            f"\n\n--- Available tasks to request results from: {available_tasks}",
-            self._get_notebook_tool_guidance(t, "adaptive_decomposer"),
+            f"Your current complex task is: {t.desc}",
+            f"\nResults from dependencies:\n{json.dumps(t.dep_results, indent=2)}",
+            "\nBreak this down into smaller steps if necessary.",
         ]
         self._inject_and_clear_user_response(prompt_parts, t)
-        if t.human_directive:
-            prompt_parts.append(
-                f"\n\n--- HUMAN OPERATOR DIRECTIVE ---\n{t.human_directive}\n----------------------------\n")
-            t.human_directive = None
-            self._broadcast_state_update(t)
-
         full_prompt = "\n".join(prompt_parts)
 
-        # --- FIX: Revert to stateful agent.run() for context-aware decomposition ---
-        proposals_res = await self.adaptive_decomposer.run(
-            user_prompt=full_prompt, message_history=t.last_llm_history
+        proposals_res = await self.adaptive_decomposer.run(user_prompt=full_prompt, message_history=t.last_llm_history)
+        is_paused, chained_plan = await self._handle_agent_output(
+            ctx=ctx, agent_res=proposals_res, expected_output_type=ChainedExecutionPlan,
+            agent_role_name="adaptive_decomposer"
         )
-        is_paused, proposals_response = await self._handle_agent_output(
-            ctx=ctx,
-            agent_res=proposals_res,
-            expected_output_type=AdaptiveDecomposerResponse,
-            agent_role_name="adaptive_decomposer",
-        )
-        # --- End of Fix ---
 
-        if is_paused: return
-        if not proposals_response:
-            # If the decomposer has nothing to add, it's not a failure, it just means we can proceed.
-            logger.info(f"[{t.id}] Adaptive decomposer proposed no new tasks. Proceeding to execution.")
-            t.status = "waiting_for_children"  # Or running, if no children
-            return
+        if is_paused or not chained_plan or not chained_plan.task_chains:
+            if not is_paused: logger.info(f"[{t.id}] Adaptive decomposer proposed no new tasks.")
+            return False
 
-        if proposals_response.tasks:
-            logger.info(f"Task [{t.id}] proposing {len(proposals_response.tasks)} new sub-tasks.")
-            for sub in proposals_response.tasks:
-                self.proposed_tasks_buffer.append((sub, t.id))
+        logger.info(f"[{t.id}] Decomposer proposed {len(chained_plan.task_chains)} new chain(s). Consolidating...")
 
-        if proposals_response.dep_requests:
+        # (Same consolidation logic as in _run_initial_planning)
+        final_task_descriptions = []
+        for chain_obj in chained_plan.task_chains:
+            if not chain_obj.chain: continue
+            if len(chain_obj.chain) == 1:
+                final_task_descriptions.append(chain_obj.chain[0])
+            else:
+                descriptions_to_merge = [td.desc for td in chain_obj.chain]
+                merger_prompt = f"Combine these steps into one task: {json.dumps(descriptions_to_merge)}"
+                merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
+                if merged_desc:
+                    final_task_descriptions.append(
+                        TaskDescription(local_id=f"merged_{chain_obj.chain[0].local_id}", desc=merged_desc,
+                                        can_request_new_subtasks=True))
+
+        if final_task_descriptions:
             logger.info(
-                f"Task [{t.id}] requesting results from {len(proposals_response.dep_requests)} new dependencies.")
-            for dep in proposals_response.dep_requests:
-                self.proposed_task_dependencies_buffer.append((dep, t.id))
+                f"[{t.id}] Committing {len(final_task_descriptions)} consolidated sub-tasks from decomposition.")
+            self._commit_task_descriptions(ctx, final_task_descriptions)
 
-        if proposals_response.tasks or proposals_response.dep_requests:
-            t.status = "waiting_for_children"
-            self._broadcast_state_update(t)
+        return False
+
+    def _commit_task_descriptions(self, ctx: TaskContext, task_descriptions: List[TaskDescription]):
+        """
+        NEW HELPER: A clean way to add a list of final, consolidated tasks to the registry.
+        """
+        t = ctx.task
+        for desc in task_descriptions:
+            new_task = Task(
+                id=str(uuid.uuid4())[:8],
+                desc=desc.desc,
+                parent=t.id,
+                can_request_new_subtasks=desc.can_request_new_subtasks,
+                mcp_servers=t.mcp_servers,
+            )
+            self.registry.add_task(new_task)
+            t.children.append(new_task.id)
+            # The parent task automatically depends on all its new children
+            self.registry.add_dependency(t.id, new_task.id)
+            self._broadcast_state_update(new_task)
 
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task

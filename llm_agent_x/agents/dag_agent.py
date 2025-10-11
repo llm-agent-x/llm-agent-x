@@ -153,6 +153,26 @@ class RedundancyDecision(BaseModel):
     """The decision on which proposed tasks are not redundant and should proceed."""
     non_redundant_tasks: List[ProposedSubtask] = Field(description="A list of the tasks from the proposal that are unique and not covered by existing work.")
 
+
+class TaskDescription(BaseModel):
+    """A single, discrete step in a plan."""
+    local_id: str = Field(description="A temporary, unique identifier for this task within the current plan.")
+    desc: str = Field(description="A clear and concise description of the task.")
+    can_request_new_subtasks: bool = Field(False,
+                                           description="Set to true ONLY for complex, integrative, or uncertain tasks that might need further dynamic decomposition later.")
+
+class TaskChain(BaseModel):
+    """Represents a sequence of tasks that MUST be executed in a specific order."""
+    chain: List[TaskDescription] = Field(description="An ordered list of tasks forming a sequential chain.")
+
+class ChainedExecutionPlan(BaseModel):
+    """
+    The full execution plan, composed of one or more parallel chains of tasks.
+    Each chain represents a sequence of dependent tasks. Different chains can be executed in parallel.
+    """
+    task_chains: List[TaskChain] = Field(description="A list of task chains. All chains can run in parallel.")
+
+
 # The main Task model, enhanced for the new architecture
 class Task(BaseModel):
     id: str
@@ -286,18 +306,21 @@ class DAGAgent:
         # NEW: Create a dynamic system prompt for the planner
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
-            "You can link tasks to pre-existing completed tasks. For each new sub-task, decide if it is complex enough to merit further dynamic decomposition by setting `can_request_new_subtasks` to true. "
-            "If you need a crucial piece of information from the human manager to proceed with planning, you may output a `UserQuestion`.\n\n"
+            "Structure your output as 'chains' of tasks. "
+            "A 'chain' is a list of tasks that must be done sequentially. "
+            "You can have multiple chains, and all chains will be executed in parallel. "
+            "Group related sequential steps into a single chain. Use parallel chains for independent streams of work. "
             f"The executor has access to the following remote tools. You can create sub-tasks that use these tools, but you cannot execute them yourself:\n"
             f"--- AVAILABLE REMOTE TOOLS ---\n{self.mcp_tool_schemas_str}\n------------------------------"
         )
 
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt=planner_system_prompt,  # MODIFIED: Use dynamic prompt
-            output_type=Union[ExecutionPlan, UserQuestion],
-            tools=[],  # MODIFIED: Planner explicitly has no tools to execute
+            system_prompt=planner_system_prompt,
+            output_type=ChainedExecutionPlan,  # MODIFIED
+            tools=[],
         )
+
         self.cycle_breaker = Agent(
             model=llm_model,
             system_prompt=(
@@ -311,8 +334,11 @@ class DAGAgent:
         )
         self.adaptive_decomposer = Agent(
             model=llm_model,
-            system_prompt="You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, propose a list of new, more granular sub-tasks to achieve it. You MUST provide an `importance` score (1-100) for each proposal, reflecting how critical it is. If you need a crucial piece of information from the human manager to proceed with decomposition, you may output a `UserQuestion`.",
-            output_type=Union[List[ProposedSubtask], UserQuestion],
+            system_prompt=(
+                "You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, break it down into one or more 'chains' of new, more granular sub-tasks. "
+                "A 'chain' is a list of tasks that must be done sequentially. You can create multiple parallel chains for independent workstreams."
+            ),
+            output_type=ChainedExecutionPlan,  # MODIFIED
             tools=self._tools_for_agents,
         )
         self.conflict_resolver = Agent(
@@ -598,22 +624,39 @@ class DAGAgent:
             t.human_directive = None
         plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts),
                                                   message_history=t.last_llm_history)
-        is_paused, initial_plan = await self._handle_agent_output(ctx=ctx, agent_res=plan_res,
-                                                                  expected_output_type=ExecutionPlan,
-                                                                  agent_role_name="initial_planner")
-        if is_paused: return
-        if initial_plan and initial_plan.needs_subtasks and initial_plan.subtasks:
-            fixed_plan_res = await self.cycle_breaker.run(
-                user_prompt=f"Analyze and fix cycles in this plan:\n{initial_plan.model_dump_json(indent=2)}",
-                message_history=t.last_llm_history)
-            is_paused, plan = await self._handle_agent_output(ctx=ctx, agent_res=fixed_plan_res,
-                                                              expected_output_type=ExecutionPlan,
-                                                              agent_role_name="cycle_breaker")
-            if is_paused: return
-        else:
-            plan = initial_plan
-        if not plan.needs_subtasks: return
-        await self._process_initial_planning_output(ctx, plan)
+        is_paused, plan = await self._handle_agent_output(ctx=ctx, agent_res=plan_res,
+                                                          expected_output_type=ChainedExecutionPlan,
+                                                          agent_role_name="initial_planner")
+        if is_paused or not plan: return
+        await self._process_chained_plan_output(ctx, plan)
+
+    async def _process_chained_plan_output(self, ctx: TaskContext, plan: ChainedExecutionPlan):
+        """
+        Processes a ChainedExecutionPlan by creating tasks and auto-linking them within each chain.
+        This is the simpler "Path A" implementation for the base agent.
+        """
+        t = ctx.task
+        if not plan.task_chains:
+            return
+
+        for chain in plan.task_chains:
+            previous_task_id_in_chain = None
+            for task_desc in chain.chain:
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=task_desc.desc,
+                    parent=t.id,
+                    can_request_new_subtasks=task_desc.can_request_new_subtasks
+                )
+                self.registry.add_task(new_task)
+                t.children.append(new_task.id)
+                self.registry.add_dependency(t.id, new_task.id)
+
+                # Auto-link to the previous task in the same chain
+                if previous_task_id_in_chain:
+                    self.registry.add_dependency(new_task.id, previous_task_id_in_chain)
+
+                previous_task_id_in_chain = new_task.id
 
     async def _process_initial_planning_output(self, ctx: TaskContext, plan: ExecutionPlan):
         t = ctx.task;
@@ -646,13 +689,14 @@ class DAGAgent:
             t.human_directive = None
         proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts),
                                                            message_history=t.last_llm_history)
-        is_paused, proposals = await self._handle_agent_output(ctx=ctx, agent_res=proposals_res,
-                                                               expected_output_type=List[ProposedSubtask],
-                                                               agent_role_name="adaptive_decomposer")
-        if is_paused: return
-        if proposals:
-            logger.info(f"Task [{t.id}] proposing {len(proposals)} new sub-tasks.")
-            for sub in proposals: self.proposed_tasks_buffer.append((sub, t.id))
+        is_paused, plan = await self._handle_agent_output(ctx=ctx, agent_res=proposals_res,
+                                                          expected_output_type=ChainedExecutionPlan,
+                                                          agent_role_name="adaptive_decomposer")
+        if is_paused or not plan: return
+        # Since this is the base agent, we don't buffer proposals. We just process them directly.
+        if plan.task_chains:
+             logger.info(f"Task [{t.id}] is decomposing into {len(plan.task_chains)} new chain(s).")
+             await self._process_chained_plan_output(ctx, plan)
 
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
