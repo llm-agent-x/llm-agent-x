@@ -562,17 +562,14 @@ class InteractiveDAGAgent(DAGAgent):
         """
         Checks if the graph is over the task limit or will be after adding new tasks.
         Invokes the graph_pruner agent to free up the necessary number of slots.
+        Prioritizes pruning safe "leaf" tasks before considering more destructive options.
         """
-        # --- START OF FIX ---
         current_size = len(self.registry.tasks)
         limit = self.max_total_tasks
 
-        # Calculate how many tasks we are over the limit right now.
         current_overage = max(0, current_size - limit)
-        # Calculate how many tasks we will be over after adding new ones.
         future_overage = max(0, (current_size + required_space) - limit)
 
-        # Determine the total number of tasks we must prune.
         num_to_prune = max(current_overage, future_overage)
 
         if num_to_prune == 0:
@@ -584,20 +581,15 @@ class InteractiveDAGAgent(DAGAgent):
         )
 
         with self.tracer.start_as_current_span("GraphPruning") as span:
-
-            prunable_statuses = {"pending", "planning", "proposing", "waiting_for_children", "running"}
-            pending_tasks = [
+            prunable_statuses = {"pending", "planning"}
+            all_eligible_tasks = [
                 t for t in self.registry.tasks.values()
                 if t.status in prunable_statuses and t.parent is not None
             ]
 
-            if not pending_tasks:
-                logger.warning("Pruning needed, but no eligible pending tasks were found to remove.")
+            if not all_eligible_tasks:
+                logger.warning("Pruning needed, but no eligible in-progress tasks were found to remove.")
                 return
-
-            span.set_attribute("graph.tasks.total", current_size)
-            span.set_attribute("graph.tasks.pruning_candidates", len(pending_tasks))
-            span.set_attribute("graph.tasks.required_to_prune", num_to_prune)
 
             downstream_dependents: Dict[str, List[str]] = {task.id: [] for task in self.registry.tasks.values()}
             for task in self.registry.tasks.values():
@@ -605,20 +597,52 @@ class InteractiveDAGAgent(DAGAgent):
                     if dep_id in downstream_dependents:
                         downstream_dependents[dep_id].append(task.id)
 
-            pruning_candidates_prompt = "\n".join([
-                (f"- ID: {t.id}, Description: {t.desc}, "
-                 f"Dependencies: {list(t.deps)}, "
-                 f"Required by: {downstream_dependents.get(t.id, [])}")
-                for t in pending_tasks
-            ])
+            # --- START OF FIX ---
+            # Tier 1: Identify "leaf" nodes among eligible tasks (tasks that no other task depends on)
+            safe_candidates = [
+                task for task in all_eligible_tasks
+                if not downstream_dependents.get(task.id)
+            ]
 
-            # Pass the number of tasks to prune directly in the prompt.
-            pruner_prompt = (
-                f"The project has {current_size} tasks, but the maximum allowed is {limit}. "
-                f"You MUST select at least {num_to_prune} of the LEAST critical tasks for removal from the following list. "
-                f"Pay close attention to the 'Required by' field; pruning a task with many dependents is high-risk.\n\n"
-                f"CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
-            )
+            pruning_candidates = []
+            pruner_prompt = ""
+
+            if safe_candidates:
+                logger.info(f"Found {len(safe_candidates)} safe leaf-node tasks to consider for pruning.")
+                pruning_candidates = safe_candidates
+                pruning_candidates_prompt = "\n".join([
+                    (f"- ID: {t.id}, Status: {t.status}, Description: {t.desc}")
+                    for t in pruning_candidates
+                ])
+                pruner_prompt = (
+                    f"The project has too many tasks. You MUST select at least {num_to_prune} of the LEAST critical tasks for removal from the "
+                    f"following pre-filtered list of tasks that are safe to remove without causing cascading failures.\n\n"
+                    f"SAFE CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
+                )
+            else:
+                # Tier 2: Fallback to the risky method if no safe candidates exist
+                logger.warning(
+                    "No safe leaf-node tasks found for pruning. Falling back to considering all in-progress tasks. "
+                    "This is risky and may cause cascading cancellations."
+                )
+                pruning_candidates = all_eligible_tasks
+                pruning_candidates_prompt = "\n".join([
+                    (f"- ID: {t.id}, Status: {t.status}, Description: {t.desc}, "
+                     f"Required by: {downstream_dependents.get(t.id, [])}")
+                    for t in pruning_candidates
+                ])
+                pruner_prompt = (
+                    f"The project has too many tasks and no safe 'leaf' tasks could be found to prune. "
+                    f"You MUST select at least {num_to_prune} of the LEAST critical tasks for removal from the following list. "
+                    f"Be extremely careful: Pruning a task that is 'Required by' other tasks will cause a destructive cascade. "
+                    f"Avoid this unless absolutely necessary.\n\n"
+                    f"CANDIDATES FOR PRUNING:\n{pruning_candidates_prompt}"
+                )
+            # --- END OF FIX ---
+
+            span.set_attribute("graph.tasks.total", current_size)
+            span.set_attribute("graph.tasks.pruning_candidates", len(pruning_candidates))
+            span.set_attribute("graph.tasks.required_to_prune", num_to_prune)
 
             pruning_decision = await self._run_stateless_agent(self.graph_pruner, pruner_prompt, ctx=None)
 
@@ -629,7 +653,6 @@ class InteractiveDAGAgent(DAGAgent):
 
             pruned_ids = set()
             for task_to_prune in pruning_decision.tasks_to_prune:
-                # We await inside the loop to ensure cascade effects of one prune are settled before the next.
                 await self._prune_specific_task(
                     task_id=task_to_prune.task_id,
                     reason=f"Pruned by graph manager: {task_to_prune.reason}",
@@ -642,7 +665,6 @@ class InteractiveDAGAgent(DAGAgent):
             span.set_attribute("graph.tasks.pruned_count", len(pruned_ids))
             logger.info(
                 f"Pruning complete. Removed {len(pruned_ids)} tasks. New graph size: {len(self.registry.tasks)}")
-        # --- END OF FIX ---
 
     async def _prune_orphaned_tasks(self):
         """
