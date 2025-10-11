@@ -708,36 +708,43 @@ class InteractiveDAGAgent(DAGAgent):
         excluding completed tasks and the root task. This is a cleanup utility.
         """
         logger.info("Running orphan task cleanup...")
-        while True:
-            all_task_ids = set(self.registry.tasks.keys())
 
-            # 1. Build a set of all tasks that are listed as a dependency by at least one other task.
-            tasks_with_dependents = set()
-            for task in self.registry.tasks.values():
-                tasks_with_dependents.update(task.deps)
+        # --- START OF MODIFICATION ---
+        # The while True loop is the source of the infinite loop. We will remove it
+        # and replace it with a single, safer pass.
 
-            # 2. Identify orphans: tasks that are NOT in the set from step 1.
-            # We also exclude completed tasks and root tasks (tasks without a parent).
-            orphaned_ids = [
-                task_id for task_id in all_task_ids
-                if task_id not in tasks_with_dependents
-                   and self.registry.tasks[task_id].status != "complete"
-                   and self.registry.tasks[task_id].parent is not None
-            ]
+        all_task_ids = set(self.registry.tasks.keys())
 
-            # 3. If no orphans are found, the cleanup is done.
-            if not orphaned_ids:
-                logger.info("No orphaned tasks found.")
-                break
+        # 1. Build a set of all tasks that are listed as a dependency by at least one other task.
+        tasks_with_dependents = set()
+        for task in self.registry.tasks.values():
+            tasks_with_dependents.update(task.deps)
 
-            # 4. Prune the found orphans and loop again, as pruning them might create new orphans.
-            logger.warning(f"Found {len(orphaned_ids)} orphaned tasks to prune: {orphaned_ids}")
-            for orphan_id in orphaned_ids:
-                await self._prune_specific_task(
-                    task_id=orphan_id,
-                    reason="Orphaned: No other tasks depend on this task.",
-                    new_status="cancelled"
-                )
+        # 2. Identify orphans: tasks that are NOT in the set from step 1
+        #    and are NOT currently being executed.
+        orphaned_ids = [
+            task_id for task_id in all_task_ids
+            if task_id not in tasks_with_dependents
+               and self.registry.tasks[task_id].status != "complete"
+               and self.registry.tasks[task_id].parent is not None
+               and task_id not in self.inflight  # CRITICAL CHECK: Do not touch in-flight tasks
+        ]
+
+        # 3. If no safe-to-prune orphans are found, the cleanup is done for this cycle.
+        if not orphaned_ids:
+            logger.info("No orphaned tasks found to prune.")
+            return  # Exit the function
+
+        # 4. Prune the found orphans.
+        logger.warning(f"Found {len(orphaned_ids)} orphaned tasks to prune: {orphaned_ids}")
+        for orphan_id in orphaned_ids:
+            # The safety check inside _prune_specific_task is still valuable, but this
+            # pre-check prevents the infinite loop condition.
+            await self._prune_specific_task(
+                task_id=orphan_id,
+                reason="Orphaned: No other tasks depend on this task.",
+                new_status="cancelled"
+            )
 
     async def _prune_specific_task(self, task_id: str, reason: str, new_status: str = "cancelled"):
         """
@@ -1539,6 +1546,10 @@ class InteractiveDAGAgent(DAGAgent):
                 f"Task [{t.id}] requesting results from {len(proposals_response.dep_requests)} new dependencies.")
             for dep in proposals_response.dep_requests:
                 self.proposed_task_dependencies_buffer.append((dep, t.id))
+
+        if proposals_response.tasks or proposals_response.dep_requests:
+            t.status = "waiting_for_children"
+            self._broadcast_state_update(t)
 
     async def _run_task_execution(self, ctx: TaskContext):
         t = ctx.task
