@@ -608,7 +608,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         with self.tracer.start_as_current_span("GraphPruning") as span:
             # All tasks that are not active or finished are eligible candidates.
-            prunable_statuses = {"pending", "paused_by_human", "waiting_for_user_response", "failed", "cancelled"}
+            prunable_statuses = {"pending", "paused_by_human", "failed", "cancelled"}
             all_eligible_tasks = [
                 t for t in self.registry.tasks.values()
                 if t.status in prunable_statuses and t.parent is not None  # Never prune a root task
