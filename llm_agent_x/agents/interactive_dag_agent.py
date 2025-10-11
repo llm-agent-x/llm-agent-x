@@ -1380,11 +1380,16 @@ class InteractiveDAGAgent(DAGAgent):
                 merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
 
                 if merged_desc:
+                    # NEW LOGIC: A merged task should only be decomposable if one of
+                    # its original constituent parts was explicitly marked as such.
+                    # Otherwise, we trust the merge and mark it for execution.
+                    should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
+
                     final_task_descriptions.append(
                         TaskDescription(
                             local_id=f"merged_{chain_obj.chain[0].local_id}",
                             desc=merged_desc,
-                            can_request_new_subtasks=True  # Merged tasks are inherently more complex
+                            can_request_new_subtasks=should_decompose_further  # <-- CORRECTED
                         )
                     )
                 else:
@@ -1477,9 +1482,18 @@ class InteractiveDAGAgent(DAGAgent):
                 merger_prompt = f"Combine these steps into one task: {json.dumps(descriptions_to_merge)}"
                 merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
                 if merged_desc:
+                    # NEW LOGIC: A merged task should only be decomposable if one of
+                    # its original constituent parts was explicitly marked as such.
+                    # Otherwise, we trust the merge and mark it for execution.
+                    should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
+
                     final_task_descriptions.append(
-                        TaskDescription(local_id=f"merged_{chain_obj.chain[0].local_id}", desc=merged_desc,
-                                        can_request_new_subtasks=True))
+                        TaskDescription(
+                            local_id=f"merged_{chain_obj.chain[0].local_id}",
+                            desc=merged_desc,
+                            can_request_new_subtasks=should_decompose_further  # <-- CORRECTED
+                        )
+                    )
 
         if final_task_descriptions:
             logger.info(
