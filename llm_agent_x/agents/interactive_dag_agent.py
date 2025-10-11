@@ -1278,9 +1278,11 @@ class InteractiveDAGAgent(DAGAgent):
                         )
                 elif t.can_request_new_subtasks and t.status != 'proposing':
                     update_status_and_broadcast("proposing")
-                    await self._run_adaptive_decomposition(ctx)
-                    if t.status not in ["paused_by_human", "waiting_for_user_response"]:
-                        update_status_and_broadcast("waiting_for_children")
+
+                    was_frozen = await self._run_adaptive_decomposition(ctx)
+                    if not was_frozen:
+                        if t.status not in ["paused_by_human", "waiting_for_user_response"]:
+                            update_status_and_broadcast("waiting_for_children")
                 elif t.status in ["pending", "running"]:
                     update_status_and_broadcast("running")
                     await self._run_task_execution(ctx)
@@ -1483,9 +1485,9 @@ class InteractiveDAGAgent(DAGAgent):
             )
             # Transition the task to wait for its current children, as it cannot create new ones.
             # This allows the agent to proceed with execution instead of getting stuck in 'proposing'.
-            t.status = "waiting_for_children"
+            t.status = "running"
             self._broadcast_state_update(t)
-            return
+            return True
 
 
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
