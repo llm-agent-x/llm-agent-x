@@ -39,6 +39,7 @@ from llm_agent_x.agents.dag_agent import (
     ProposalResolutionPlan,
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
     TaskForMerging, MergedTask, MergingDecision, NewSubtask, ContextualAnswer,
+    RedundancyDecision,
 )
 
 from dotenv import load_dotenv
@@ -119,12 +120,26 @@ class InteractiveDAGAgent(DAGAgent):
         self.task_merger = Agent(
             model=llm_model,
             system_prompt=(
-                "You are an efficiency expert. Your job is to analyze a list of proposed sub-tasks and identify opportunities for consolidation. "
-                "Merge tasks that are too granular or represent sequential steps of a single action (e.g., 'Research venues' and 'Book venue' should be one task: 'Research and book a venue'). "
-                "You MUST provide a new description for each merged task. "
-                "Ensure you also list all original tasks that were NOT merged and should be kept."
+                "You are an aggressive efficiency expert. Your goal is to consolidate an overly granular list of tasks. "
+                "Imagine each task is given to a different person who works in isolation and cannot communicate with others. "
+                "If a sequence of steps should logically be done by one person, merge them. "
+                "For example, '1. Research conference venues', '2. Contact top 3 venues for quotes', and '3. Negotiate contract with the best venue' "
+                "are all sequential parts of one larger action and MUST be merged into a single task like: 'Research, contact, and book a suitable conference venue'. "
+                "Be decisive and merge liberally."
             ),
             output_type=MergingDecision,
+            tools=[],
+        )
+
+        self.redundancy_checker = Agent(
+            model=llm_model,
+            system_prompt=(
+                "You are a meticulous de-duplication expert. Your job is to check if a list of 'Proposed Tasks' is redundant given the 'Existing Tasks' already in the project plan. "
+                "A proposed task is redundant if its objective is already covered by an existing task that is completed, running, proposing, planning, or even cancelled (as it indicates the idea was already considered). "
+                "Use semantic understanding: for example, a proposal to 'Finalize the marketing plan' is redundant if there's an existing task to 'Create the marketing plan'. "
+                "Your SOLE output must be the list of proposed tasks that are genuinely new and not redundant."
+            ),
+            output_type=RedundancyDecision,
             tools=[],
         )
 
@@ -240,6 +255,7 @@ class InteractiveDAGAgent(DAGAgent):
             "initial_planner": self.initial_planner,
             "cycle_breaker": self.cycle_breaker,
             "task_merger": self.task_merger,
+            "redundancy_checker": self.redundancy_checker,
             "adaptive_decomposer": self.adaptive_decomposer,
             "conflict_resolver": self.conflict_resolver,
             "graph_pruner": self.graph_pruner,
@@ -668,7 +684,7 @@ class InteractiveDAGAgent(DAGAgent):
                 await self._prune_specific_task(
                     task_id=task_to_prune.task_id,
                     reason=f"Pruned by graph manager: {task_to_prune.reason}",
-                    new_status="cancelled"
+                    new_status="pruned"
                 )
                 pruned_ids.add(task_to_prune.task_id)
 
@@ -841,7 +857,8 @@ class InteractiveDAGAgent(DAGAgent):
     async def _handle_directive(self, directive: dict):
         command = directive.get("command")
         task_id = directive.get("task_id")
-
+        payload = directive.get("payload")
+        task = self.registry.tasks.get(task_id)
         # ADD_ROOT_TASK logic remains the same...
         if command == "ADD_ROOT_TASK":
             payload = directive.get("payload", {})
@@ -868,20 +885,36 @@ class InteractiveDAGAgent(DAGAgent):
 
         # --- NEW LOGIC FOR CANCEL ---
         if command == "CANCEL":
-            payload = directive.get("payload", "Cancelled by operator.")
-            await self._prune_specific_task(task_id, reason=payload)
+            if task:
+                logger.info(f"Soft cancelling task {task_id} by operator directive.")
+                task.status = "cancelled"
+                task.result = f"Cancelled by operator: {payload or 'No reason given.'}"
+                # Cancel in-flight asyncio task but do not delete from registry
+                if task_id in self.task_futures:
+                    self.task_futures[task_id].cancel()
+                self._broadcast_state_update(task)
+                # Invalidate downstream tasks so they can be re-evaluated
+                self._reset_downstream_tasks(task_id)
+            else:
+                logger.warning(f"Directive 'CANCEL' for unknown task {task_id} ignored.")
+            return
+
+        if command == "PRUNE_TASK":
+            reason = payload or "Pruned by operator."
+            await self._prune_specific_task(task_id, reason=reason, new_status="pruned")
             await self._prune_orphaned_tasks()
-            return  # Task is deleted, stop processing.
+            return
+
         # ----------------------------
 
         # All other directives require the task to exist
-        task = self.registry.tasks.get(task_id)
+
         if not task:
             logger.warning(f"Directive '{command}' for unknown task {task_id} ignored.")
             return
 
         logger.info(f"Handling command '{command}' for task {task_id}")
-        payload = directive.get("payload")
+
 
         # Cancel in-flight task future if a directive changes its state
         if task_id in self.task_futures and not self.task_futures[task_id].done():
@@ -943,42 +976,45 @@ class InteractiveDAGAgent(DAGAgent):
         if broadcast_needed or task.status != original_status:
             self._broadcast_state_update(task)
 
-    def _reset_downstream_tasks(self, task_id: str):
+    async def _reset_downstream_tasks(self, task_id: str):
         """
-        Recursively reset all downstream tasks (dependents) of the given task.
-
-        Args:
-            task_id: The ID of the task whose downstream tasks should be reset
+        Recursively finds all downstream tasks that depend on the given task_id
+        and resets their state to 'pending', forcing re-evaluation.
         """
         logger.info(f"Resetting downstream tasks of {task_id}")
 
-        # Find all tasks that depend on this task
-        downstream_tasks = []
-        for tid, task_data in self.registry.tasks.items():
-            if task_id in task_data.get("dependencies", []):
-                downstream_tasks.append(tid)
+        downstream_ids_to_reset = set()
+        q = deque([task_id])
 
-        # Reset each downstream task and its own downstream tasks recursively
-        for downstream_id in downstream_tasks:
-            logger.info(f"Resetting downstream task {downstream_id}")
+        # Build a complete set of all tasks that need resetting
+        while q:
+            current_id = q.popleft()
+            for task in self.registry.tasks.values():
+                if current_id in task.deps and task.id not in downstream_ids_to_reset:
+                    downstream_ids_to_reset.add(task.id)
+                    q.append(task.id)
 
-            # Reset the downstream task's state
-            if downstream_id in self.state.tasks:
-                self.state.tasks[downstream_id]["status"] = "pending"
-                self.state.tasks[downstream_id]["output"] = None
-                self.state.tasks[downstream_id]["error"] = None
-                self.state.tasks[downstream_id]["verification_status"] = None
-                self.state.tasks[downstream_id]["verification_feedback"] = None
+        if not downstream_ids_to_reset:
+            return
 
-                # Broadcast the state update
-                self._broadcast_state_update(
-                    update_type="task_reset",
-                    task_id=downstream_id,
-                    details={"reason": f"dependency {task_id} was reset"}
-                )
+        logger.info(f"Found {len(downstream_ids_to_reset)} downstream tasks to reset: {downstream_ids_to_reset}")
 
-            # Recursively reset tasks that depend on this downstream task
-            self._reset_downstream_tasks(downstream_id)
+        for downstream_id in downstream_ids_to_reset:
+            task_to_reset = self.registry.tasks.get(downstream_id)
+            if task_to_reset and task_to_reset.status != "pending":
+                logger.info(f"Resetting task {downstream_id} to 'pending' state.")
+                task_to_reset.status = "pending"
+                task_to_reset.result = None
+                task_to_reset.fix_attempts = 0
+                task_to_reset.grace_attempts = 0
+                task_to_reset.verification_scores = []
+                task_to_reset.human_directive = None
+                task_to_reset.user_response = None
+                task_to_reset.current_question = None
+                task_to_reset.last_llm_history = None
+                task_to_reset.agent_role_paused = None
+
+                self._broadcast_state_update(task_to_reset)
 
 
     def _reset_task_and_dependents(self, task_id: str):
@@ -1652,9 +1688,10 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _run_global_resolution(self):
         """
-        System-level operation to evaluate buffered task proposals.
-        It resolves proposal conflicts and coordinates with the graph pruner
-        to ensure the total task limit is not breached.
+        UPDATED: System-level operation to evaluate buffered task proposals.
+        It now acts as a strict gatekeeper, calculating total required space,
+        triggering a coordinated prune, and discarding all proposals if pruning fails
+        to create sufficient space, thus preventing uncontrolled decomposition.
         """
         with self.tracer.start_as_current_span("GlobalConflictResolution") as span:
             num_proposals = len(self.proposed_tasks_buffer)
@@ -1665,7 +1702,7 @@ class InteractiveDAGAgent(DAGAgent):
                 approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
                 parent_map = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
 
-                # Step 1: Resolve conflicts among the proposals themselves.
+                # Step 1: Resolve conflicts if proposal count > limit.
                 if len(approved_proposals) > self.global_proposal_limit:
                     logger.warning(
                         f"Proposal buffer ({len(approved_proposals)}) exceeds proposal limit ({self.global_proposal_limit}). Engaging resolver."
@@ -1673,30 +1710,59 @@ class InteractiveDAGAgent(DAGAgent):
                     prompt_list = [f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}" for p in
                                    approved_proposals]
                     resolver_prompt = f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
-
                     resolved_plan = await self._run_stateless_agent(self.conflict_resolver, resolver_prompt, ctx=None)
-
                     if resolved_plan and isinstance(resolved_plan, ProposalResolutionPlan):
                         approved_proposals = resolved_plan.approved_tasks
                     else:
-                        logger.error("Conflict resolver failed. Discarding all proposals for this cycle.")
+                        logger.error("Conflict resolver failed. Discarding all proposals.")
                         approved_proposals = []
 
-                # Step 2: Check if space is needed and trigger a coordinated prune.
+                # Step 2: De-duplicate proposals against existing tasks.
+                if approved_proposals:
+                    statuses_to_check = {"completed", "running", "proposing", "planning", "cancelled"}
+                    existing_tasks_context = "\n".join([
+                        f"- ID: {t.id}, Status: {t.status}, Description: {t.desc}"
+                        for t in self.registry.tasks.values() if t.status in statuses_to_check
+                    ])
+                    proposals_json = json.dumps([p.model_dump() for p in approved_proposals], indent=2)
+
+                    redundancy_prompt = (
+                        f"Here are the tasks already in the project:\n--- EXISTING TASKS ---\n{existing_tasks_context}\n\n"
+                        f"Now, review the following 'Proposed Tasks' and return ONLY the ones that are not redundant.\n"
+                        f"--- PROPOSED TASKS ---\n{proposals_json}"
+                    )
+
+                    deduplication_result = await self._run_stateless_agent(self.redundancy_checker, redundancy_prompt,
+                                                                           ctx=None)
+
+                    if deduplication_result and isinstance(deduplication_result, RedundancyDecision):
+                        original_count = len(approved_proposals)
+                        approved_proposals = deduplication_result.non_redundant_tasks
+                        new_count = len(approved_proposals)
+                        if original_count != new_count:
+                            logger.info(
+                                f"Redundancy check complete. Removed {original_count - new_count} redundant proposals.")
+                            span.set_attribute("proposals.redundant_removed", original_count - new_count)
+                    else:
+                        logger.warning("Redundancy checker failed. Proceeding with potentially duplicate tasks.")
+
+                # --- START: NEW COORDINATED PRUNING AND SAFETY CHECK ---
+                # Step 3: Check if space is needed and trigger a coordinated prune.
                 num_to_commit = len(approved_proposals)
                 if num_to_commit > 0:
                     await self._prune_task_graph_if_needed(required_space=num_to_commit)
 
+                    # Step 4: CRITICAL SAFETY CHECK. If pruning failed, discard everything for this cycle.
                     if (len(self.registry.tasks) + num_to_commit) > self.max_total_tasks:
                         logger.error(
                             f"Pruning did not create enough space for {num_to_commit} new tasks. "
                             "Discarding proposals for this cycle to prevent graph overgrowth."
                         )
-                        approved_proposals = []
+                        approved_proposals = []  # This is the key change
                         span.set_status(trace.Status(StatusCode.ERROR, "Pruning failed to create sufficient space"))
+                # --- END: NEW COORDINATED PRUNING AND SAFETY CHECK ---
 
-                # --- START OF FIX ---
-                # Step 3: Filter out proposals whose parent tasks may have been pruned.
+                # Step 5: Filter out proposals whose parents were pruned.
                 final_proposals_to_commit = []
                 if approved_proposals:
                     for proposal in approved_proposals:
@@ -1708,14 +1774,12 @@ class InteractiveDAGAgent(DAGAgent):
                                 f"Discarding proposal '{proposal.desc[:50]}...' because its parent task '{parent_id}' was pruned."
                             )
                     approved_proposals = final_proposals_to_commit
-                # --- END OF FIX ---
 
-                # Step 4: Commit the final, filtered list of proposals.
+                # Step 6: Commit the final, filtered list.
                 if approved_proposals:
                     logger.info(f"Committing {len(approved_proposals)} approved sub-tasks to the graph.")
                     self._commit_proposals(approved_proposals, parent_map)
                     span.set_attribute("proposals.approved_count", len(approved_proposals))
-                    span.set_status(StatusCode.OK)
                 else:
                     logger.info("No proposals were approved or committed in this cycle.")
 

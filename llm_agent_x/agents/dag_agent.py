@@ -149,14 +149,16 @@ class ContextualAnswer(BaseModel):
     source_task_id: Optional[str] = Field(None, description="The ID of the task that contained the answer.")
     reasoning: str = Field(description="A brief explanation of why the context is or is not sufficient to answer the question.")
 
-
+class RedundancyDecision(BaseModel):
+    """The decision on which proposed tasks are not redundant and should proceed."""
+    non_redundant_tasks: List[ProposedSubtask] = Field(description="A list of the tasks from the proposal that are unique and not covered by existing work.")
 
 # The main Task model, enhanced for the new architecture
 class Task(BaseModel):
     id: str
     desc: str
     deps: Set[str] = Field(default_factory=set)
-    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, paused_by_human, waiting_for_user_response
+    status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, pruned, paused_by_human, waiting_for_user_response
     is_critical: bool = Field(False,
                               description="If True, this task cannot be automatically pruned by the graph manager.")
     result: Optional[str] = None
