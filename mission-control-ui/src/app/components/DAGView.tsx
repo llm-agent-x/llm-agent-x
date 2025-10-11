@@ -121,10 +121,13 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
       });
 
       // Add dependencies as edges
-      (task.deps || []).forEach((depId: string) => {
+      (task.deps || []).forEach((dep: any) => {
+        // Extract the task_id from the dependency object
+        const depId = typeof dep === 'string' ? dep : dep.task_id;
+        
         // Ensure the dependency exists as a node. If not, it might be a document or an external resource.
         // For simplicity, we only draw edges between active tasks.
-        if (tasks.some(t => t.id === depId)) {
+        if (depId && tasks.some(t => t.id === depId)) {
           newEdges.push({
             id: `e${depId}-${task.id}`,
             source: depId,

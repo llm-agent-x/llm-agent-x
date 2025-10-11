@@ -1316,7 +1316,14 @@ class InteractiveDAGAgent(DAGAgent):
     async def _run_initial_planning(self, ctx: TaskContext):
         t = ctx.task
         logger.info(f"[{t.id}] Running initial planning for: {t.desc}")
-
+        if len(self.registry.tasks) >= self.max_total_tasks:
+            logger.warning(
+                f"[{t.id}] Task graph is full ({len(self.registry.tasks)}/{self.max_total_tasks}). "
+                f"Initial planning is FROZEN. The agent will focus on completing existing tasks."
+            )
+            # By returning here, the task remains in the 'planning' state but makes no progress,
+            # effectively freezing this branch of decomposition until space is available.
+            return
         completed_tasks = [
             tk for tk in self.registry.tasks.values() if tk.status == "complete" and tk.id != t.id
         ]
@@ -1468,6 +1475,19 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
         t = ctx.task
+
+        if len(self.registry.tasks) >= self.max_total_tasks:
+            logger.warning(
+                f"[{t.id}] Task graph is full ({len(self.registry.tasks)}/{self.max_total_tasks}). "
+                f"Adaptive decomposition is FROZEN. The agent will focus on completing existing tasks."
+            )
+            # Transition the task to wait for its current children, as it cannot create new ones.
+            # This allows the agent to proceed with execution instead of getting stuck in 'proposing'.
+            t.status = "waiting_for_children"
+            self._broadcast_state_update(t)
+            return
+
+
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
         available_tasks = str(
             [{"id": task.id, "desc": task.desc} for task in self.registry.tasks.values()]
