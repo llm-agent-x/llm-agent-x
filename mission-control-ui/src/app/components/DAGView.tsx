@@ -1,7 +1,7 @@
 // mission-control-ui/src/app/components/DAGView.tsx
 "use client";
 
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react"; // Import useRef
 import ReactFlow, {
   MiniMap,
   Controls,
@@ -13,16 +13,16 @@ import ReactFlow, {
   Edge,
   Handle,
   Position,
-  Panel, // Re-import Panel for layout controls
+  Panel,
 } from "reactflow";
-import dagre from "dagre"; // Re-import dagre
+import dagre from "dagre";
 import "reactflow/dist/style.css";
 
 // ============================================================================
 // ** 1. ALL COMPONENTS AND CONSTANTS REMAIN AT THE TOP LEVEL **
 // ============================================================================
 
-// --- StatusBadge Component (stable) ---
+// --- (StatusBadge, CustomTaskNode, nodeTypes, getLayoutedElements are unchanged)
 export const StatusBadge = ({ status }: { status: string }) => {
   const statusStyles: { [key: string]: string } = {
     running: "bg-blue-500/20 text-blue-300 border-blue-400/30",
@@ -41,7 +41,6 @@ export const StatusBadge = ({ status }: { status: string }) => {
   );
 };
 
-// --- CustomTaskNode Component with Handles (stable) ---
 interface CustomTaskNodeData {
   id: string;
   desc: string;
@@ -49,7 +48,6 @@ interface CustomTaskNodeData {
   human_directive: any;
   current_question: any;
 }
-
 const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected: boolean }) => {
   return (
     <div
@@ -81,103 +79,89 @@ const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected
     </div>
   );
 };
-
-// --- Stable, top-level constant for nodeTypes ---
-const nodeTypes = {
-  customTaskNode: CustomTaskNode,
-};
-
-// --- Auto-Layout Function (now safe to use) ---
-const nodeWidth = 250;
-const nodeHeight = 150; // Adjusted for potentially taller nodes
+const nodeTypes = { customTaskNode: CustomTaskNode };
 
 const getLayoutedElements = (nodes: Node[], edges: Edge[], direction = 'TB') => {
   const dagreGraph = new dagre.graphlib.Graph();
   dagreGraph.setDefaultEdgeLabel(() => ({}));
   dagreGraph.setGraph({ rankdir: direction, nodesep: 50, ranksep: 100 });
-
   nodes.forEach((node) => {
-    dagreGraph.setNode(node.id, { width: nodeWidth, height: nodeHeight });
+    dagreGraph.setNode(node.id, { width: node.width, height: node.height });
   });
-
   edges.forEach((edge) => {
     dagreGraph.setEdge(edge.source, edge.target);
   });
-
   dagre.layout(dagreGraph);
-
   const layoutedNodes = nodes.map((node) => {
     const nodeWithPosition = dagreGraph.node(node.id);
     return {
       ...node,
       position: {
-        x: nodeWithPosition.x - nodeWidth / 2,
-        y: nodeWithPosition.y - nodeHeight / 2,
+        x: nodeWithPosition.x - (node.width! / 2),
+        y: nodeWithPosition.y - (node.height! / 2),
       },
     };
   });
-
   return { nodes: layoutedNodes, edges };
 };
 
-
 // ============================================================================
-// ** 2. THE MAIN DAGVIEW COMPONENT WITH AUTO-LAYOUT RE-IMPLEMENTED **
+// ** 2. THE MAIN DAGVIEW COMPONENT WITH THE ROBUST `useRef` FIX **
 // ============================================================================
-
 interface DAGViewProps {
   tasks: any[];
 }
-
 export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [layoutDirection, setLayoutDirection] = React.useState('TB');
+  // **THE FIX**: A ref to track if the current `tasks` have been laid out.
+  const layouted = useRef(false);
 
-  const proOptions = { hideAttribution: true };
-
+  // **PASS 1: Create initial nodes**
   useEffect(() => {
     if (!tasks) return;
+    // When the tasks change, reset the layout flag.
+    layouted.current = false;
 
-    // 1. Create nodes and edges without positions first.
     const initialNodes: Node<CustomTaskNodeData>[] = tasks.map((task) => ({
       id: task.id,
-      position: { x: 0, y: 0 }, // Dagre will calculate this
+      position: { x: 0, y: 0 },
       type: "customTaskNode",
       data: {
-        id: task.id,
-        desc: task.desc,
-        status: task.status,
-        human_directive: task.human_directive,
-        current_question: task.current_question,
+        id: task.id, desc: task.desc, status: task.status,
+        human_directive: task.human_directive, current_question: task.current_question,
       },
     }));
-
     const initialEdges: Edge[] = [];
     tasks.forEach((task) => {
       if (task.parent && tasks.some(t => t.id === task.parent)) {
         initialEdges.push({
-          id: `e${task.parent}-${task.id}`,
-          source: task.parent,
-          target: task.id,
-          type: 'default',
-          markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" },
+          id: `e${task.parent}-${task.id}`, source: task.parent, target: task.id,
+          type: 'default', markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" },
           style: { stroke: "#a3a3a3", strokeWidth: 1.5 },
         });
       }
     });
+    setNodes(initialNodes);
+    setEdges(initialEdges);
+  }, [tasks, setNodes, setEdges]);
 
-    // 2. Calculate the layout.
-    const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(
-      initialNodes,
-      initialEdges,
-      layoutDirection
+  // **PASS 2: Calculate layout after nodes are measured**
+  useEffect(() => {
+    // GUARD CLAUSE: Only run layout if nodes exist, have been measured,
+    // and have NOT been laid out yet for this set of tasks.
+    if (nodes.length === 0 || !nodes[0].width || layouted.current) {
+      return;
+    }
+    const { nodes: finalNodes, edges: finalEdges } = getLayoutedElements(
+      nodes, edges, layoutDirection
     );
-
-    // 3. Set the final, layouted nodes and edges.
-    setNodes(layoutedNodes);
-    setEdges(layoutedEdges);
-  }, [tasks, layoutDirection, setNodes, setEdges]);
+    setNodes(finalNodes);
+    setEdges(finalEdges);
+    // Mark this set as laid out to break the loop.
+    layouted.current = true;
+  }, [nodes, edges, layoutDirection, setNodes, setEdges]);
 
   return (
     <div className="flex-grow h-full bg-zinc-800/50 rounded-lg border border-zinc-700">
@@ -188,7 +172,7 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         fitView
-        proOptions={proOptions}
+        proOptions={{ hideAttribution: true }}
         selectionOnDrag
         panOnDrag={[1, 2]}
       >
@@ -201,16 +185,12 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
         >
           <h3 className="text-zinc-200 text-sm font-semibold mb-2">Layout</h3>
           <div className="flex gap-2">
-            <button
-              onClick={() => setLayoutDirection('TB')}
-              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === 'TB' ? 'bg-blue-600' : 'bg-zinc-600 hover:bg-zinc-500'}`}
-            >
+            <button onClick={() => { layouted.current = false; setLayoutDirection('TB'); }}
+              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === 'TB' ? 'bg-blue-600' : 'bg-zinc-600 hover:bg-zinc-500'}`} >
               Top-Bottom
             </button>
-            <button
-              onClick={() => setLayoutDirection('LR')}
-              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === 'LR' ? 'bg-blue-600' : 'bg-zinc-600 hover:bg-zinc-500'}`}
-            >
+            <button onClick={() => { layouted.current = false; setLayoutDirection('LR'); }}
+              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === 'LR' ? 'bg-blue-600' : 'bg-zinc-600 hover:bg-zinc-500'}`} >
               Left-Right
             </button>
           </div>
