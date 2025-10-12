@@ -1,8 +1,8 @@
 // mission-control-ui/src/app/page.tsx
 "use client";
 
-// ... (all imports remain the same)
-import { useState, useEffect } from "react";
+// Make sure to import useMemo and useCallback
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { TaskList } from "./components/TaskList";
 import { TaskInspector } from "./components/TaskInspector";
@@ -29,13 +29,12 @@ const DEFAULT_SERVERS: McpServer[] = [
 const LOCAL_STORAGE_KEY = "mcpServers";
 
 export default function MissionControl() {
-  // ... (all state and useEffect hooks remain the same)
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [tasks, setTasks] = useState<{ [key: string]: any }>({});
   const [isConnected, setIsConnected] = useState(false);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
 
-  // On initial mount, load servers from localStorage
+  // --- (No changes to the useEffect hooks for localStorage, servers, or sockets) ---
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -49,11 +48,9 @@ export default function MissionControl() {
       console.error("Failed to parse MCP servers from localStorage:", error);
       setMcpServers(DEFAULT_SERVERS);
     }
-  }, []); // Empty array ensures this runs only once on mount
+  }, []);
 
-  // When servers change, save them back to localStorage
   useEffect(() => {
-    // We check if the initial load is done to avoid overwriting on first render
     if (mcpServers.length > 0) {
       try {
         window.localStorage.setItem(
@@ -65,11 +62,9 @@ export default function MissionControl() {
       }
     }
   }, [mcpServers]);
-  // --- END MCP SERVER LOGIC ---
 
   useEffect(() => {
     const socket: Socket = io(API_BASE_URL);
-
     const onConnect = () => {
       console.log("Connected to gateway!");
       setIsConnected(true);
@@ -81,22 +76,18 @@ export default function MissionControl() {
         })
         .catch((err) => console.error("Failed to fetch initial state:", err));
     };
-
     const onDisconnect = () => {
       console.log("Disconnected from gateway.");
       setIsConnected(false);
     };
-
     const onTaskUpdate = (data: { task: any }) => {
       if (data && data.task) {
-        // console.log("Received task update:", data.task.id, data.task.status);
         setTasks((prevTasks) => ({
           ...prevTasks,
           [data.task.id]: data.task,
         }));
       }
     };
-
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("task_update", onTaskUpdate);
@@ -105,10 +96,17 @@ export default function MissionControl() {
     };
   }, []);
 
-  const taskList = Object.values(tasks).sort((a, b) =>
-    a.id.localeCompare(b.id),
-  );
+  // **THE FIX**: Memoize the taskList so it's only recalculated when `tasks` changes.
+  const taskList = useMemo(() => {
+    return Object.values(tasks).sort((a, b) => a.id.localeCompare(b.id));
+  }, [tasks]);
+
   const selectedTask = tasks[selectedTaskId!] || null;
+
+  // Note: setSelectedTaskId from useState is already stable, so no useCallback is needed for it.
+  const handleSelectTask = useCallback((id: string) => {
+    setSelectedTaskId(id);
+  }, []); // Empty array means this function is created only once.
 
   useEffect(() => {
     if (selectedTaskId && !tasks[selectedTaskId]) {
@@ -119,7 +117,6 @@ export default function MissionControl() {
     }
   }, [tasks, selectedTaskId, taskList]);
 
-  // Now you can use `mcpServers` anywhere in this component or pass it to children
   useEffect(() => {
     console.log("Current MCP Servers:", mcpServers);
   }, [mcpServers]);
@@ -141,7 +138,6 @@ export default function MissionControl() {
               title={isConnected ? "Connected" : "Disconnected"}
             ></div>
           </div>
-          {/* Pass state and setters down as props */}
           <McpServerManager
             servers={mcpServers}
             setServers={setMcpServers}
@@ -155,11 +151,10 @@ export default function MissionControl() {
             <TaskList
               tasks={taskList}
               selectedTaskId={selectedTaskId}
-              onSelectTask={setSelectedTaskId}
+              onSelectTask={handleSelectTask}
             />
           </div>
           <div className="flex-shrink-0">
-            {/* --- PASS MCP SERVERS TO THE FORM --- */}
             <NewTaskForm mcpServers={mcpServers} />
           </div>
         </div>
@@ -167,7 +162,7 @@ export default function MissionControl() {
           <DAGView
             tasks={taskList}
             selectedTaskId={selectedTaskId}
-            onSelectTask={setSelectedTaskId}
+            onSelectTask={handleSelectTask}
           />
         </div>
         <div className="lg:col-span-1 h-full">

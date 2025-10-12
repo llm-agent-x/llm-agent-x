@@ -1,5 +1,7 @@
 // mission-control-ui/src/app/components/DAGView.tsx
-import React, { useCallback, useEffect, useState } from "react";
+"use client";
+
+import React, { useEffect } from "react";
 import ReactFlow, {
   MiniMap,
   Controls,
@@ -9,243 +11,137 @@ import ReactFlow, {
   MarkerType,
   Node,
   Edge,
-  Panel,
+  Handle,     // Import Handle
+  Position,   // Import Position
 } from "reactflow";
-import dagre from "dagre";
 import "reactflow/dist/style.css";
-import { StatusBadge } from "./StatusBadge";
 
+// ============================================================================
+// ** 1. DEFINE ALL COMPONENTS AND CONSTANTS AT THE TOP LEVEL (OUTSIDE) **
+// ============================================================================
+
+// --- StatusBadge Component ---
+export const StatusBadge = ({ status }: { status: string }) => {
+  const statusStyles: { [key: string]: string } = {
+    running: "bg-blue-500/20 text-blue-300 border-blue-400/30",
+    complete: "bg-green-500/20 text-green-300 border-green-400/30",
+    failed: "bg-red-500/20 text-red-300 border-red-400/30",
+    pending: "bg-yellow-500/20 text-yellow-300 border-yellow-400/30",
+  };
+  const defaultStyle = "bg-zinc-500/20 text-zinc-300 border-zinc-400/30";
+  const style = statusStyles[status] || defaultStyle;
+  return (
+    <span
+      className={`px-2 py-0.5 text-xs font-medium rounded-full border ${style}`}
+    >
+      {status}
+    </span>
+  );
+};
+
+
+// --- CustomTaskNode Component (with Handles) ---
 interface CustomTaskNodeData {
   id: string;
   desc: string;
   status: string;
-  selectedTaskId: string | null;
-  human_directive: any; // Use a more specific type if known
-  current_question: any; // Use a more specific type if known
-  onSelectTask: (id: string) => void; // This is the function we want
+  human_directive: any;
+  current_question: any;
 }
-// Custom Node Component to display task info
-const CustomTaskNode = ({
-  data,
-  id,
-  selected,
-}: {
-  data: CustomTaskNodeData;
-  id: string;
-  selected: boolean;
-}) => {
-  const isSelected = selected || id === data.selectedTaskId;
+
+const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected: boolean }) => {
   return (
     <div
-      className={`px-4 py-2 shadow-md rounded-lg border transition-all duration-200 cursor-pointer ${
-        isSelected
-          ? "border-blue-500 ring-2 ring-blue-500 bg-blue-900/40"
-          : "border-zinc-700 bg-zinc-800/60 hover:bg-zinc-700/70"
-      }`}
-      onClick={() => data.onSelectTask(id)} // Corrected: Access data.onSelectTask
+      className={`px-4 py-2 shadow-md rounded-lg border-2 ${
+        selected ? "border-blue-500" : "border-zinc-700"
+      } bg-zinc-800 w-[250px]`} // Set a fixed width
     >
+      {/* Target handle on top (edges can connect TO this) */}
+      <Handle type="target" position={Position.Top} className="!bg-zinc-500" />
+
       <div className="flex justify-between items-center mb-1">
         <div className="text-sm font-mono text-zinc-400 truncate max-w-[120px]">
           {data.id}
         </div>
         <StatusBadge status={data.status} />
       </div>
-      <div className="text-zinc-100 text-sm whitespace-pre-wrap max-w-[200px] font-semibold">
+      <div className="text-zinc-100 text-sm whitespace-pre-wrap font-semibold">
         {data.desc}
       </div>
       {data.human_directive && (
-        <div className="mt-2 text-xs text-blue-300 bg-blue-900/20 p-1 rounded-md animate-pulse">
+        <div className="mt-2 text-xs text-blue-300 bg-blue-900/20 p-1 rounded-md">
           Directive: {data.human_directive.slice(0, 50)}...
         </div>
       )}
       {data.current_question && (
-        <div className="mt-2 text-xs text-yellow-300 bg-yellow-900/20 p-1 rounded-md animate-pulse">
+        <div className="mt-2 text-xs text-yellow-300 bg-yellow-900/20 p-1 rounded-md">
           Question: {data.current_question.question.slice(0, 50)}...
         </div>
       )}
+
+      {/* Source handle on bottom (edges can connect FROM this) */}
+      <Handle type="source" position={Position.Bottom} className="!bg-zinc-500" />
     </div>
   );
 };
 
+// --- Stable, top-level constant for nodeTypes ---
 const nodeTypes = {
   customTaskNode: CustomTaskNode,
 };
 
-// Dagre layout setup
-const dagreGraph = new dagre.graphlib.Graph();
-dagreGraph.setDefaultEdgeLabel(() => ({}));
-
-const nodeWidth = 250;
-const nodeHeight = 100;
-
-const getLayoutedElements = (
-  nodes: Node[],
-  edges: Edge[],
-  direction = "TB",
-) => {
-  dagreGraph.setGraph({ rankdir: direction, nodesep: 50, ranksep: 50 });
-
-  nodes.forEach((node) => {
-    dagreGraph.setNode(node.id, { width: nodeWidth, height: nodeHeight });
-  });
-
-  edges.forEach((edge) => {
-    dagreGraph.setEdge(edge.source, edge.target);
-  });
-
-  dagre.layout(dagreGraph);
-
-  const layoutedNodes = nodes.map((node) => {
-    const nodeWithPosition = dagreGraph.node(node.id);
-    // We need to pass a negative position to React Flow for proper rendering
-    node.position = {
-      x: nodeWithPosition.x - nodeWidth / 2,
-      y: nodeWithPosition.y - nodeHeight / 2,
-    };
-    return node;
-  });
-
-  return { nodes: layoutedNodes, edges };
-};
+// ============================================================================
+// ** 2. THE MAIN DAGVIEW COMPONENT IS NOW CLEAN AND RELIABLE **
+// ============================================================================
 
 interface DAGViewProps {
   tasks: any[];
-  selectedTaskId: string | null;
-  onSelectTask: (id: string) => void;
+  // `selectedTaskId` and `onSelectTask` are no longer needed for the graph itself,
+  // but you can keep them if other parts of your UI depend on them.
+  // We'll remove them here for simplicity as the graph is self-contained.
 }
 
-export const DAGView: React.FC<DAGViewProps> = ({
-  tasks,
-  selectedTaskId,
-  onSelectTask,
-}) => {
+export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const [layoutDirection, setLayoutDirection] = useState<"TB" | "LR">("TB"); // Top-Bottom or Left-Right
 
-  const proOptions = { hideAttribution: true, showConnections: true }; // Show connections
+  const proOptions = { hideAttribution: true };
+
   useEffect(() => {
-    const newNodes: Node[] = [];
-    const newEdges: Edge[] = [];
+    if (!tasks) return;
 
-    // Add debug logging to see task structure
-    console.log(
-      "Tasks for DAG:",
-      tasks.map((t) => ({ id: t.id, deps: t.deps, children: t.children })),
-    );
-
-    tasks.forEach((task) => {
-      newNodes.push({
+    // We'll create a simple grid layout manually. No more dagre.
+    const newNodes: Node<CustomTaskNodeData>[] = tasks.map((task, index) => ({
+      id: task.id,
+      position: { x: (index % 4) * 300, y: Math.floor(index / 4) * 200 }, // Simple grid
+      type: "customTaskNode",
+      data: {
         id: task.id,
-        position: { x: 0, y: 0 }, // Position will be set by dagre
-        data: {
-          id: task.id,
-          desc: task.desc,
-          status: task.status,
-          selectedTaskId: selectedTaskId,
-          human_directive: task.human_directive,
-          current_question: task.current_question,
-          onSelectTask: onSelectTask,
-        },
-        type: "customTaskNode",
-      });
+        desc: task.desc,
+        status: task.status,
+        human_directive: task.human_directive,
+        current_question: task.current_question,
+      },
+    }));
 
-      // Add dependencies as edges
-      (task.deps || []).forEach((dep: any) => {
-        // Debug log each dependency
-        console.log(`Processing dep for task ${task.id}:`, dep, typeof dep);
-
-        // Extract the task_id from the dependency object
-        const depId = typeof dep === "string" ? dep : dep?.task_id || dep?.id;
-
-        console.log(`Extracted depId: ${depId}`);
-
-        // CRITICAL FIX: Check if depId is a valid string and not "undefined"
-        if (
-          depId &&
-          typeof depId === "string" &&
-          depId !== "undefined" &&
-          tasks.some((t) => t.id === depId)
-        ) {
-          console.log(`Creating edge from ${depId} to ${task.id}`);
-          newEdges.push({
-            id: `e${depId}-${task.id}`,
-            source: depId,
-            target: task.id,
-            type: "default",
-            markerEnd: {
-              type: MarkerType.ArrowClosed,
-              color: "#a3a3a3", // zinc-400
-            },
-            style: { stroke: "#a3a3a3", strokeWidth: 1.5 },
-          });
-        } else {
-          console.log(
-            `Skipping edge: depId="${depId}", type=${typeof depId}, exists=${depId ? tasks.some((t) => t.id === depId) : false}`,
-          );
-        }
-      });
-
-      // Add parent-child relationships as edges
-      (task.children || []).forEach((child: any) => {
-        console.log(`Processing child for task ${task.id}:`, child);
-
-        // Extract child ID - handle both string and object
-        const childId =
-          typeof child === "string" ? child : child?.task_id || child?.id;
-
-        console.log(`Extracted childId: ${childId}`);
-
-        // CRITICAL FIX: Same check for children
-        if (
-          childId &&
-          typeof childId === "string" &&
-          childId !== "undefined" &&
-          tasks.some((t) => t.id === childId)
-        ) {
-          console.log(`Creating child edge from ${childId} to ${task.id}`);
-          newEdges.push({
-            id: `e${task.id}-${childId}-child`,
-            source: childId,
-            target: task.id,
-            type: "default",
-            markerEnd: {
-              type: MarkerType.ArrowClosed,
-              color: "#60a5fa", // blue-400
-            },
-            style: {
-              stroke: "#60a5fa",
-              strokeWidth: 1.5,
-              strokeDasharray: "5,5",
-            },
-            data: { label: "Synthesizes from" },
-          });
-        } else {
-          console.log(
-            `Skipping child edge: childId="${childId}", type=${typeof childId}, exists=${childId ? tasks.some((t) => t.id === childId) : false}`,
-          );
-        }
-      });
+    const newEdges: Edge[] = [];
+    tasks.forEach((task) => {
+      // Create an edge only if the parent exists in the provided tasks.
+      if (task.parent && tasks.some(t => t.id === task.parent)) {
+        newEdges.push({
+          id: `e${task.parent}-${task.id}`,
+          source: task.parent,
+          target: task.id,
+          type: 'default', // Using a default edge for simplicity
+          markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" },
+          style: { stroke: "#a3a3a3", strokeWidth: 1.5 },
+        });
+      }
     });
 
-    console.log("Created edges:", newEdges);
-
-    const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(
-      newNodes,
-      newEdges,
-      layoutDirection,
-    );
-
-    setNodes(layoutedNodes);
-    setEdges(layoutedEdges);
-  }, [
-    tasks,
-    selectedTaskId,
-    layoutDirection,
-    setNodes,
-    setEdges,
-    onSelectTask,
-  ]);
+    setNodes(newNodes);
+    setEdges(newEdges);
+  }, [tasks, setNodes, setEdges]); // Depend only on the stable `tasks` prop.
 
   return (
     <div className="flex-grow h-full bg-zinc-800/50 rounded-lg border border-zinc-700">
@@ -258,31 +154,12 @@ export const DAGView: React.FC<DAGViewProps> = ({
         fitView
         proOptions={proOptions}
         selectionOnDrag
-        panOnDrag={[1, 2]} // Allow pan with left click
+        panOnDrag={[1, 2]}
       >
         <MiniMap nodeStrokeWidth={3} zoomable pannable />
         <Controls />
         <Background variant="dots" gap={12} size={1} />
-        <Panel
-          position="top-right"
-          className="bg-zinc-900/70 p-2 rounded-md shadow-lg border border-zinc-700"
-        >
-          <h3 className="text-zinc-200 text-sm font-semibold mb-2">Layout</h3>
-          <div className="flex gap-2">
-            <button
-              onClick={() => setLayoutDirection("TB")}
-              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === "TB" ? "bg-blue-600" : "bg-zinc-600 hover:bg-zinc-500"}`}
-            >
-              Top-Bottom
-            </button>
-            <button
-              onClick={() => setLayoutDirection("LR")}
-              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === "LR" ? "bg-blue-600" : "bg-zinc-600 hover:bg-zinc-500"}`}
-            >
-              Left-Right
-            </button>
-          </div>
-        </Panel>
+        {/* We can remove the layout panel since the layout is now automatic */}
       </ReactFlow>
     </div>
   );
