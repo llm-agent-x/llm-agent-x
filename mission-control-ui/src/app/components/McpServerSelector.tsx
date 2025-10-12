@@ -1,9 +1,9 @@
 // src/app/components/McpServerSelector.tsx
 "use client";
 
-import { useState } from 'react';
-import { McpServer } from './McpServerManager';
-import { ChevronDown } from 'lucide-react';
+import { useState } from "react";
+import { McpServer } from "./McpServerManager";
+import { ChevronDown } from "lucide-react";
 
 interface McpServerSelectorProps {
   allServers: McpServer[];
@@ -11,12 +11,16 @@ interface McpServerSelectorProps {
   onSelectionChange: (newSelectedIds: string[]) => void;
 }
 
-export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionChange }: McpServerSelectorProps) => {
+export const McpServerSelector = ({
+  allServers,
+  selectedServerIds,
+  onSelectionChange,
+}: McpServerSelectorProps) => {
   const [isOpen, setIsOpen] = useState(false);
 
   const handleCheckboxChange = (serverId: string) => {
     const newSelection = selectedServerIds.includes(serverId)
-      ? selectedServerIds.filter(id => id !== serverId)
+      ? selectedServerIds.filter((id) => id !== serverId)
       : [...selectedServerIds, serverId];
     onSelectionChange(newSelection);
   };
@@ -25,7 +29,7 @@ export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionCh
     if (selectedServerIds.length === allServers.length) {
       onSelectionChange([]);
     } else {
-      onSelectionChange(allServers.map(s => s.id));
+      onSelectionChange(allServers.map((s) => s.id));
     }
   };
 
@@ -39,7 +43,6 @@ export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionCh
         When the content panel expands, it will do so *above* the stationary button.
       */}
       <div className="flex flex-col-reverse">
-
         {/* --- TRIGGER BUTTON (DOM Order: Second) --- */}
         <button
           type="button"
@@ -50,20 +53,23 @@ export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionCh
           <span>
             Targeting {selectedServerIds.length} of {allServers.length} Servers
           </span>
-          <ChevronDown size={18} className={`transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`} />
+          <ChevronDown
+            size={18}
+            className={`transition-transform duration-300 ${isOpen ? "rotate-180" : ""}`}
+          />
         </button>
 
         {/* --- COLLAPSIBLE CONTENT (DOM Order: First) --- */}
         <div
           className={`grid transition-all duration-300 ease-in-out overflow-hidden ${
-            isOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
+            isOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
           }`}
         >
           <div className="overflow-hidden">
             {/* This inner div has margin-bottom to create space between itself and the button when open */}
             <div className="mb-2 p-2 border border-zinc-700 rounded-md bg-zinc-900/50">
               <div className="max-h-40 overflow-y-auto pr-1">
-                {allServers.map(server => (
+                {allServers.map((server) => (
                   <label
                     key={server.id}
                     className="flex items-center gap-3 p-2 text-sm rounded-md hover:bg-zinc-800 cursor-pointer"
@@ -76,23 +82,34 @@ export const McpServerSelector = ({ allServers, selectedServerIds, onSelectionCh
                     />
                     <div className="flex flex-col">
                       <span className="text-zinc-200">{server.name}</span>
-                      <span className="text-zinc-500 text-xs font-mono">{server.address}</span>
+                      <span className="text-zinc-500 text-xs font-mono">
+                        {server.address}
+                      </span>
                     </div>
                   </label>
                 ))}
-                {allServers.length === 0 && <div className="p-2 text-sm text-zinc-500">No servers configured.</div>}
+                {allServers.length === 0 && (
+                  <div className="p-2 text-sm text-zinc-500">
+                    No servers configured.
+                  </div>
+                )}
               </div>
               {allServers.length > 0 && (
-                 <div className="pt-2 mt-2 border-t border-zinc-700">
-                    <button type="button" onClick={handleSelectAll} className="w-full text-center text-xs text-zinc-400 hover:text-blue-400">
-                        {selectedServerIds.length === allServers.length ? 'Deselect All' : 'Select All'}
-                    </button>
-                 </div>
+                <div className="pt-2 mt-2 border-t border-zinc-700">
+                  <button
+                    type="button"
+                    onClick={handleSelectAll}
+                    className="w-full text-center text-xs text-zinc-400 hover:text-blue-400"
+                  >
+                    {selectedServerIds.length === allServers.length
+                      ? "Deselect All"
+                      : "Select All"}
+                  </button>
+                </div>
               )}
             </div>
           </div>
         </div>
-
       </div>
     </div>
   );
