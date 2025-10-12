@@ -11,16 +11,18 @@ import ReactFlow, {
   MarkerType,
   Node,
   Edge,
-  Handle,     // Import Handle
-  Position,   // Import Position
+  Handle,
+  Position,
+  Panel, // Re-import Panel for layout controls
 } from "reactflow";
+import dagre from "dagre"; // Re-import dagre
 import "reactflow/dist/style.css";
 
 // ============================================================================
-// ** 1. DEFINE ALL COMPONENTS AND CONSTANTS AT THE TOP LEVEL (OUTSIDE) **
+// ** 1. ALL COMPONENTS AND CONSTANTS REMAIN AT THE TOP LEVEL **
 // ============================================================================
 
-// --- StatusBadge Component ---
+// --- StatusBadge Component (stable) ---
 export const StatusBadge = ({ status }: { status: string }) => {
   const statusStyles: { [key: string]: string } = {
     running: "bg-blue-500/20 text-blue-300 border-blue-400/30",
@@ -39,8 +41,7 @@ export const StatusBadge = ({ status }: { status: string }) => {
   );
 };
 
-
-// --- CustomTaskNode Component (with Handles) ---
+// --- CustomTaskNode Component with Handles (stable) ---
 interface CustomTaskNodeData {
   id: string;
   desc: string;
@@ -54,11 +55,9 @@ const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected
     <div
       className={`px-4 py-2 shadow-md rounded-lg border-2 ${
         selected ? "border-blue-500" : "border-zinc-700"
-      } bg-zinc-800 w-[250px]`} // Set a fixed width
+      } bg-zinc-800 w-[250px]`}
     >
-      {/* Target handle on top (edges can connect TO this) */}
       <Handle type="target" position={Position.Top} className="!bg-zinc-500" />
-
       <div className="flex justify-between items-center mb-1">
         <div className="text-sm font-mono text-zinc-400 truncate max-w-[120px]">
           {data.id}
@@ -78,8 +77,6 @@ const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected
           Question: {data.current_question.question.slice(0, 50)}...
         </div>
       )}
-
-      {/* Source handle on bottom (edges can connect FROM this) */}
       <Handle type="source" position={Position.Bottom} className="!bg-zinc-500" />
     </div>
   );
@@ -90,30 +87,62 @@ const nodeTypes = {
   customTaskNode: CustomTaskNode,
 };
 
+// --- Auto-Layout Function (now safe to use) ---
+const nodeWidth = 250;
+const nodeHeight = 150; // Adjusted for potentially taller nodes
+
+const getLayoutedElements = (nodes: Node[], edges: Edge[], direction = 'TB') => {
+  const dagreGraph = new dagre.graphlib.Graph();
+  dagreGraph.setDefaultEdgeLabel(() => ({}));
+  dagreGraph.setGraph({ rankdir: direction, nodesep: 50, ranksep: 100 });
+
+  nodes.forEach((node) => {
+    dagreGraph.setNode(node.id, { width: nodeWidth, height: nodeHeight });
+  });
+
+  edges.forEach((edge) => {
+    dagreGraph.setEdge(edge.source, edge.target);
+  });
+
+  dagre.layout(dagreGraph);
+
+  const layoutedNodes = nodes.map((node) => {
+    const nodeWithPosition = dagreGraph.node(node.id);
+    return {
+      ...node,
+      position: {
+        x: nodeWithPosition.x - nodeWidth / 2,
+        y: nodeWithPosition.y - nodeHeight / 2,
+      },
+    };
+  });
+
+  return { nodes: layoutedNodes, edges };
+};
+
+
 // ============================================================================
-// ** 2. THE MAIN DAGVIEW COMPONENT IS NOW CLEAN AND RELIABLE **
+// ** 2. THE MAIN DAGVIEW COMPONENT WITH AUTO-LAYOUT RE-IMPLEMENTED **
 // ============================================================================
 
 interface DAGViewProps {
   tasks: any[];
-  // `selectedTaskId` and `onSelectTask` are no longer needed for the graph itself,
-  // but you can keep them if other parts of your UI depend on them.
-  // We'll remove them here for simplicity as the graph is self-contained.
 }
 
 export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [layoutDirection, setLayoutDirection] = React.useState('TB');
 
   const proOptions = { hideAttribution: true };
 
   useEffect(() => {
     if (!tasks) return;
 
-    // We'll create a simple grid layout manually. No more dagre.
-    const newNodes: Node<CustomTaskNodeData>[] = tasks.map((task, index) => ({
+    // 1. Create nodes and edges without positions first.
+    const initialNodes: Node<CustomTaskNodeData>[] = tasks.map((task) => ({
       id: task.id,
-      position: { x: (index % 4) * 300, y: Math.floor(index / 4) * 200 }, // Simple grid
+      position: { x: 0, y: 0 }, // Dagre will calculate this
       type: "customTaskNode",
       data: {
         id: task.id,
@@ -124,24 +153,31 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
       },
     }));
 
-    const newEdges: Edge[] = [];
+    const initialEdges: Edge[] = [];
     tasks.forEach((task) => {
-      // Create an edge only if the parent exists in the provided tasks.
       if (task.parent && tasks.some(t => t.id === task.parent)) {
-        newEdges.push({
+        initialEdges.push({
           id: `e${task.parent}-${task.id}`,
           source: task.parent,
           target: task.id,
-          type: 'default', // Using a default edge for simplicity
+          type: 'default',
           markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" },
           style: { stroke: "#a3a3a3", strokeWidth: 1.5 },
         });
       }
     });
 
-    setNodes(newNodes);
-    setEdges(newEdges);
-  }, [tasks, setNodes, setEdges]); // Depend only on the stable `tasks` prop.
+    // 2. Calculate the layout.
+    const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(
+      initialNodes,
+      initialEdges,
+      layoutDirection
+    );
+
+    // 3. Set the final, layouted nodes and edges.
+    setNodes(layoutedNodes);
+    setEdges(layoutedEdges);
+  }, [tasks, layoutDirection, setNodes, setEdges]);
 
   return (
     <div className="flex-grow h-full bg-zinc-800/50 rounded-lg border border-zinc-700">
@@ -159,7 +195,26 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
         <MiniMap nodeStrokeWidth={3} zoomable pannable />
         <Controls />
         <Background variant="dots" gap={12} size={1} />
-        {/* We can remove the layout panel since the layout is now automatic */}
+        <Panel
+          position="top-right"
+          className="bg-zinc-900/70 p-2 rounded-md shadow-lg border border-zinc-700"
+        >
+          <h3 className="text-zinc-200 text-sm font-semibold mb-2">Layout</h3>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setLayoutDirection('TB')}
+              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === 'TB' ? 'bg-blue-600' : 'bg-zinc-600 hover:bg-zinc-500'}`}
+            >
+              Top-Bottom
+            </button>
+            <button
+              onClick={() => setLayoutDirection('LR')}
+              className={`px-3 py-1 text-xs rounded-md ${layoutDirection === 'LR' ? 'bg-blue-600' : 'bg-zinc-600 hover:bg-zinc-500'}`}
+            >
+              Left-Right
+            </button>
+          </div>
+        </Panel>
       </ReactFlow>
     </div>
   );
