@@ -49,8 +49,12 @@ To run the system in interactive mode, you need to start three services: a Rabbi
     ```
 4.  **Access the Mission Control UI:**
     Once the services are running, open a web browser and navigate to the Mission Control UI (typically `http://localhost:3000` if you are running it locally).
+    <img width="2560" height="1279" alt="Screenshot 2025-10-12 at 18-28-24 " src="https://github.com/user-attachments/assets/20fa2b7a-2c5b-4af4-901e-b8a188985cad" />
+    <img width="2560" height="1279" alt="Screenshot 2025-10-12 at 18-30-10 " src="https://github.com/user-attachments/assets/b26cc3d1-6fc5-4dfb-ba83-7f7b427cf7f7" />
 
-5.  **Shutting Down:**
+
+
+6.  **Shutting Down:**
     Press `Ctrl+C` in the terminals.
 
 ## Gateway API Endpoints
