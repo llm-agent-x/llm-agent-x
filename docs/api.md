@@ -6,7 +6,9 @@ LLM Agent X offers two distinct agent architectures for programmatic use, each s
 
 *   **`DAGAgent`**: An evolution of the recursive model, the `DAGAgent` (Directed Acyclic Graph Agent) treats tasks as nodes in a graph. This allows for complex, non-linear dependencies where a task can depend on multiple other tasks, not just a single parent. It features a more sophisticated, multi-phase planning and execution process, making it suitable for complex problems that require adaptation and overcoming uncertainty.
 
-This guide covers the API for both architectures.
+*   **`InteractiveDAGAgent`**: A specialized version of the `DAGAgent` designed to run as a persistent service. It communicates via a message queue to receive real-time commands and broadcast state updates, enabling human-in-the-loop control and monitoring. For details, see the **[Interactive Mode](./interactive_mode.md)** documentation.
+
+This guide covers the API for the `RecursiveAgent` and the standard `DAGAgent`.
 
 ## `RecursiveAgent`
 
