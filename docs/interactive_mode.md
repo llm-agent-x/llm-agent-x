@@ -22,7 +22,7 @@ This separation ensures that the core agent logic is decoupled from the web inte
 
 ## How to Run
 
-To run the system in interactive mode, you need to start three services: a RabbitMQ instance, the Gateway, and at least one Worker.
+To run the system in interactive mode, you need to start three services: a RabbitMQ instance, the Gateway, and at least one Worker. Also, it is recommended that you use the provided frontend interface, although it is possibly to use without it.
 
 ### Prerequisites
 
@@ -31,7 +31,10 @@ To run the system in interactive mode, you need to start three services: a Rabbi
 
 ### Running with Docker Compose
 
-1.  **Start all services:**
+1.  **Install Dependencies**
+    From the root of the project, create a python environment, whether with `conda`, `poetry` (recommended), or `python-virtualenv`. From the root of the project, install `poetry` if it isn't already installed. Then, run `pip install -e .` and/or `poetry install`.
+    
+3.  **Start all services:**
     From the root of the project, run:
     ```sh
     poetry run llm-agent-x-gateway
@@ -44,10 +47,10 @@ To run the system in interactive mode, you need to start three services: a Rabbi
     ```sh
     cd mi* && npm run dev
     ```
-3.  **Access the Mission Control UI:**
+4.  **Access the Mission Control UI:**
     Once the services are running, open a web browser and navigate to the Mission Control UI (typically `http://localhost:3000` if you are running it locally).
 
-4.  **Shutting Down:**
+5.  **Shutting Down:**
     Press `Ctrl+C` in the terminals.
 
 ## Gateway API Endpoints
