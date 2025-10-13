@@ -22,31 +22,33 @@ This separation ensures that the core agent logic is decoupled from the web inte
 
 ## How to Run
 
-To run the system in interactive mode, you need to start three services: a RabbitMQ instance, the Gateway, and at least one Worker. The project includes a `docker-compose.yml` file to simplify this process.
+To run the system in interactive mode, you need to start three services: a RabbitMQ instance, the Gateway, and at least one Worker.
 
 ### Prerequisites
 
-*   Docker and Docker Compose installed.
-*   An environment file (`.env`) with your API keys (e.g., `OPENAI_API_KEY`).
+*   Dependencies met
+*   An environment file (`.env`) configured.
 
 ### Running with Docker Compose
 
 1.  **Start all services:**
     From the root of the project, run:
     ```sh
-    docker-compose up --build
+    poetry run llm-agent-x-gateway
     ```
-    This command will:
-    *   Build the Docker images for the gateway and worker.
-    *   Start a RabbitMQ container.
-    *   Start the Gateway container (usually available at `http://localhost:8000`).
-    *   Start the Worker container, which will connect to RabbitMQ and wait for tasks.
-
-2.  **Access the Mission Control UI:**
+    In a separate terminal:
+    ```sh
+    poetry run llm-agent-x-worker
+    ```
+    In another separate terminal:
+    ```sh
+    cd mi* && npm run dev
+    ```
+3.  **Access the Mission Control UI:**
     Once the services are running, open a web browser and navigate to the Mission Control UI (typically `http://localhost:3000` if you are running it locally).
 
-3.  **Shutting Down:**
-    Press `Ctrl+C` in the terminal where `docker-compose` is running to stop all services.
+4.  **Shutting Down:**
+    Press `Ctrl+C` in the terminals.
 
 ## Gateway API Endpoints
 
