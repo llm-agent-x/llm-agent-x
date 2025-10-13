@@ -20,6 +20,7 @@ This documentation provides a comprehensive guide to installing, using, and unde
 -   **[Installation](./installation.md):** Learn how to install LLM Agent X and set up your environment.
 -   **[Command-Line Interface (CLI)](./cli.md):** Understand how to use the `llm-agent-x` command-line tool.
 -   **[API Usage](./api.md):** Discover how to use LLM Agent X programmatically in your own projects.
+-   **[Interactive Mode](./interactive_mode.md):** Learn how to run the agent as a persistent service with a UI.
 -   **[Python Sandbox](./sandbox.md):** Find out more about the optional Python execution sandbox.
 -   **[Examples](./examples.md):** See practical examples of how LLM Agent X can be used.
 
