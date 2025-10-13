@@ -97,6 +97,7 @@ class TaskObject(LLMTaskObject):
             return str(v)
         return v
 
+
 class TaskObjectPlusPriority(TaskObject):
     priority: float
 
@@ -104,9 +105,12 @@ class TaskObjectPlusPriority(TaskObject):
 class task(TaskObject):
     pass
 
+
 class task_request(BaseModel):
     task: str
-    task_importance_float: float = Field(description="A float between 0 and 1 describing the importance of the task, where 0 is the lowest priority and 1 is the highest priority. Use above .9 only for tasks that will cause errors if not completed.")
+    task_importance_float: float = Field(
+        description="A float between 0 and 1 describing the importance of the task, where 0 is the lowest priority and 1 is the highest priority. Use above .9 only for tasks that will cause errors if not completed."
+    )
 
 
 class task_result(BaseModel):
@@ -570,7 +574,7 @@ class RecursiveAgent:
                 current_layer=self.current_layer + 1,
                 parent=self,
                 context=child_context,
-                common_ancestors=new_common_ancestors
+                common_ancestors=new_common_ancestors,
             )
             child_agents_in_order.append(child_agent)
             child_contexts.append(child_context)
@@ -870,15 +874,23 @@ Make sure to include citations [1] and a citations section at the end.
                 response, single_task_span
             )
 
-            final_result_content = (response.output.result if not self.is_dynamically_added else response) or "No result."
+            final_result_content = (
+                response.output.result if not self.is_dynamically_added else response
+            ) or "No result."
 
             if not self.is_dynamically_added:
-                extra_tasks: List[task_request] = response.output.extra_requested_tasks or []
+                extra_tasks: List[task_request] = (
+                    response.output.extra_requested_tasks or []
+                )
                 ic_dev(extra_tasks)
                 if extra_tasks:
                     self.newly_requested_tasks = [
                         TaskObjectPlusPriority(
-                            task=t.task, type="research", allow_search=True, allow_tools=True, priority=t.task_importance_float
+                            task=t.task,
+                            type="research",
+                            allow_search=True,
+                            allow_tools=True,
+                            priority=t.task_importance_float,
                         )
                         for t in extra_tasks
                     ]

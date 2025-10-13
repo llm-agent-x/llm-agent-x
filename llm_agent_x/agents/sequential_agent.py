@@ -206,6 +206,7 @@ class Code(BaseModel):
         description="A string containing valid Python code to be executed."
     )
 
+
 class Critique(BaseModel):
     reasoning: str = Field(
         description="A place for you to think about what you are doing, and to try to catch any mistakes before you make them."
@@ -219,6 +220,7 @@ class Critique(BaseModel):
     is_final_answer_valid: bool = Field(
         description="Set to true if the last message from the assistant is a valid, complete final answer to the user's original request. Otherwise, set to false."
     )
+
 
 # --- Async SequentialCodeAgent (Unchanged) ---
 class SequentialCodeAgent:
@@ -253,7 +255,7 @@ class SequentialCodeAgent:
         )
 
         self.critic_agent = Agent(
-            model=llm, # You could use a more powerful model like gpt-4o for the critic if desired
+            model=llm,  # You could use a more powerful model like gpt-4o for the critic if desired
             system_prompt=critic_system_prompt,
             output_type=Critique,
             result_retries=3,
@@ -335,7 +337,7 @@ class SequentialCodeAgent:
             if critique.mistakes:
                 ic("Critic found mistakes! Sending back for correction.")
                 # Formulate a new, corrective prompt that will be the 'user_input' for the next loop.
-                mistakes = '\n- '.join(critique.mistakes)
+                mistakes = "\n- ".join(critique.mistakes)
                 user_input = (
                     "A supervising critic has reviewed your plan and found the following flaws. "
                     "You MUST address these issues in your next step. DO NOT ignore them.\n\n"
@@ -381,7 +383,9 @@ class SequentialCodeAgent:
                 if stderr:
                     user_input += f"\n\nSTDERR:\n```\n{stderr}\n```"
                 if not stdout and not stderr:
-                    user_input += "\n\nNOTE: The code ran without error and produced no output."
+                    user_input += (
+                        "\n\nNOTE: The code ran without error and produced no output."
+                    )
 
             elif isinstance(response.output, str):
                 # Case 3: The agent provided a final answer.
@@ -391,7 +395,9 @@ class SequentialCodeAgent:
                     return response.output
                 else:
                     # This case handles when the agent gives up prematurely.
-                    ic("Critic invalidated the final answer. Sending back for more work.")
+                    ic(
+                        "Critic invalidated the final answer. Sending back for more work."
+                    )
                     user_input = (
                         "A supervising critic has reviewed your final answer and determined it is INCOMPLETE. "
                         "You have not finished all parts of the original request. Please continue working."
@@ -407,14 +413,17 @@ class SequentialCodeAgent:
         print("Agent reached maximum turns without providing a final answer.")
         return None
 
+
 # --- REFACTORED: Main usage with 'async with' ---
 parser = argparse.ArgumentParser()
 parser.add_argument("prompt", type=str)
+
+
 async def main():
     mcp_url = "http://localhost:8001/mcp"
     args = parser.parse_args()
     try:
-        async with (MCPToolInjector(mcp_url=mcp_url) as injector):
+        async with MCPToolInjector(mcp_url=mcp_url) as injector:
             tool_namespace = injector.get_tool_namespace()
             tool_prompt = injector.get_tools_prompt_string()
 
@@ -430,7 +439,10 @@ async def main():
             # "They should be in the food and beverage industry. Get their owner's contact info, "
             # "add them to the CRM, and draft a personalized introductory email for each."
             # )
-            prompt = args.prompt or "The owner of 'Austin's Artisan Bakery' has approved the proposal we generated at ./proposals/austins_artisan_bakery_proposal.pdf. Please send this document to austin.artisan@example.com for an e-signature. After sending it, schedule a 15-minute follow-up call with them for a 'Policy Onboarding Walkthrough'."
+            prompt = (
+                args.prompt
+                or "The owner of 'Austin's Artisan Bakery' has approved the proposal we generated at ./proposals/austins_artisan_bakery_proposal.pdf. Please send this document to austin.artisan@example.com for an e-signature. After sending it, schedule a 15-minute follow-up call with them for a 'Policy Onboarding Walkthrough'."
+            )
             ic(prompt)
             final_result = await agent.run(prompt)
             print("\n--- AGENT'S FINAL RESPONSE ---")
