@@ -4,10 +4,11 @@ import logging
 import os
 import threading
 import uuid
+from datetime import timezone, datetime
 
 import pika
 import socketio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, HTTPException, File
 from fastapi.middleware.cors import CORSMiddleware
 from pika.adapters.blocking_connection import BlockingChannel
 from dotenv import load_dotenv
@@ -69,7 +70,7 @@ DIRECTIVES_QUEUE = "directives_queue"
 # --- API Endpoints (Unchanged) ---
 @app.get("/api/tasks")
 async def get_all_tasks():
-    logger.info("Received request for all tasks.")
+    logger.info("Received request for all tasks and documents.")
     return {"tasks": task_state_cache}
 
 
@@ -115,7 +116,165 @@ async def add_root_task(request: Request):
         if connection and connection.is_open:
             connection.close()
 
+@app.get("/api/documents")
+async def get_all_documents():
+    """Fetches all entities marked as documents from the state cache."""
+    logger.info("Received request for all documents.")
+    documents = []
+    for task_id, task_data in task_state_cache.items():
+        if task_data.get("task_type") == "document":
+            doc_state = task_data.get("document_state", {})
+            # Extract name from description, assuming "Document: {name}" format
+            name = task_data.get("desc", "").replace("Document: ", "", 1)
+            documents.append({
+                "id": task_id,
+                "name": name,
+                "content": doc_state.get("content", ""),
+            })
+    return documents
 
+@app.post("/api/documents")
+async def add_document(request: Request):
+    """Receives a new document from the UI and sends a directive to the agent."""
+    logger.info("Received request to add document.")
+    connection, channel = None, None
+    try:
+        body = await request.json()
+        name = body.get("name")
+        content = body.get("content")
+
+        # Validate that name and content are provided
+        if not name or content is None:
+            raise ValueError("Document name and content cannot be empty")
+
+        # Construct the message for the agent
+        message = {
+            "task_id": str(uuid.uuid4()),  # The backend generates the unique ID
+            "command": "ADD_DOCUMENT",
+            "payload": {
+                "name": name,
+                "content": content,
+            },
+        }
+
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "message": "Service unavailable: Cannot connect to message queue."
+                },
+            )
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(
+                delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+            ),
+        )
+        logger.info(f"Published new document directive to queue: {name}")
+        return {"status": "new document submitted"}
+
+    except Exception as e:
+        logger.exception(f"Error in add_document: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal server error"},
+        )
+    finally:
+        if connection and connection.is_open:
+            connection.close()
+@app.put("/api/documents/{document_id}")
+async def update_document(document_id: str, request: Request):
+    """Sends a directive to update an existing document."""
+    logger.info(f"Received request to update document {document_id}.")
+    connection, channel = None, None
+    try:
+        body = await request.json()
+        message = {
+            "task_id": document_id,
+            "command": "UPDATE_DOCUMENT",
+            "payload": {
+                "name": body.get("name"),
+                "content": body.get("content"),
+            },
+        }
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(status_code=503, content={"message": "Service unavailable."})
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
+        return {"status": "update directive sent"}
+    except Exception as e:
+        logger.exception(f"Error in update_document: {e}")
+        return JSONResponse(status_code=500, content={"message": "Internal server error"})
+    finally:
+        if connection and connection.is_open:
+            connection.close()
+
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: str):
+    """Sends a directive to delete (prune) a document."""
+    logger.info(f"Received request to delete document {document_id}.")
+    connection, channel = None, None
+    try:
+        message = {
+            "task_id": document_id,
+            "command": "DELETE_DOCUMENT",
+            "payload": {}
+        }
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(status_code=503, content={"message": "Service unavailable."})
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
+        return {"status": "delete directive sent"}
+    except Exception as e:
+        logger.exception(f"Error in delete_document: {e}")
+        return JSONResponse(status_code=500, content={"message": "Internal server error"})
+    finally:
+        if connection and connection.is_open:
+            connection.close()
+
+# --- MODIFIED listen_for_state_updates FUNCTION ---
+# The existing RabbitMQ listener for state updates needs a small tweak
+# to handle documents correctly.
+
+def callback(ch, method, properties, body):
+    global task_state_cache
+    update = json.loads(body)
+    task_id = update.get("id")
+    if task_id:
+        # Check if the task is being pruned/deleted
+        if update.get("status") == "pruned":
+            if task_id in task_state_cache:
+                del task_state_cache[task_id]
+                logger.info(f"Removed pruned task/document {task_id} from cache.")
+                # We can optionally emit a deletion event to the UI here if needed
+        else:
+            task_state_cache[task_id] = update
+            logger.debug(f"Received state update for {task_id}, broadcasting.")
+
+        # The existing sio.emit will now broadcast updates for tasks AND documents
+        # The frontend will need to handle these updates appropriately.
+        if main_event_loop:
+            asyncio.run_coroutine_threadsafe(
+                sio.emit("task_update", {"task": update}), main_event_loop
+            )
+    ch.basic_ack(delivery_tag=method.delivery_tag)
 @app.post("/api/tasks/{task_id}/directive")
 async def post_directive(task_id: str, request: Request):
     logger.info(f"Received directive for task {task_id}")
@@ -148,6 +307,68 @@ async def post_directive(task_id: str, request: Request):
         if connection and connection.is_open:
             connection.close()
 
+@app.get("/api/state/download")
+async def download_state():
+    """
+    Returns the entire task_state_cache as a JSON file for download.
+    """
+    logger.info("Request received to download current graph state.")
+    if not task_state_cache:
+        return JSONResponse(status_code=404, content={"message": "No state to download."})
+
+    # Generate a timestamped filename
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"graph_state_{timestamp}.json"
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+
+    return JSONResponse(content=task_state_cache, headers=headers)
+
+
+@app.post("/api/state/upload")
+async def upload_state(file: UploadFile = File(...)):
+    """
+    Receives a JSON state file and sends a 'RESET_STATE' directive to the agent.
+    """
+    logger.info(f"Request received to upload graph state from file: {file.filename}")
+    connection, channel = None, None
+    try:
+        contents = await file.read()
+        state_data = json.loads(contents)
+
+        if not isinstance(state_data, dict):
+             raise HTTPException(status_code=400, detail="Invalid file format. Must be a JSON object of tasks.")
+
+        # This is a special, high-level directive for the agent
+        message = {
+            "task_id": "system", # Use a special ID for system-level commands
+            "command": "RESET_STATE",
+            "payload": state_data,
+        }
+
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(status_code=503, content={"message": "Service unavailable."})
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
+        logger.info("Published RESET_STATE directive to the agent.")
+        return {"status": "State upload directive sent successfully."}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in uploaded file.")
+    except Exception as e:
+        logger.exception(f"Error in upload_state: {e}")
+        return JSONResponse(status_code=500, content={"message": "Internal server error"})
+    finally:
+        if connection and connection.is_open:
+            connection.close()
 
 # --- RabbitMQ Listener for State Updates (runs in background) ---
 def listen_for_state_updates():

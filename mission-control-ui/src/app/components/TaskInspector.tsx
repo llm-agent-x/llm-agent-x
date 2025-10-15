@@ -1,5 +1,6 @@
 // app/components/TaskInspector.tsx
 
+import { format, parseISO } from "date-fns";
 import { StatusBadge } from "./StatusBadge";
 import { CommandPalette } from "./CommandPalette";
 
@@ -16,6 +17,52 @@ const DetailRow = ({
   </div>
 );
 
+const DocumentDetails = ({ task }: { task: any }) => {
+  // ... (This component remains unchanged)
+  if (!task.document_state) {
+    return (
+      <DetailRow
+        label="Document Content"
+        value={
+          <pre className="whitespace-pre-wrap font-sans text-red-400">
+            Error: Document state is missing.
+          </pre>
+        }
+      />
+    );
+  }
+
+  const { content, version, updated_at } = task.document_state;
+  const formattedDate = updated_at
+    ? format(parseISO(updated_at), "yyyy-MM-dd HH:mm:ss 'UTC'")
+    : "Unknown date";
+
+  return (
+    <>
+      <DetailRow
+        label="Version History"
+        value={
+          <div className="flex items-center gap-2 text-xs">
+            <span className="bg-zinc-700 px-2 py-0.5 rounded-md font-mono">
+              Version {version}
+            </span>
+            <span className="text-zinc-400">Last updated: {formattedDate}</span>
+          </div>
+        }
+      />
+      <DetailRow
+        label="Document Content"
+        value={
+          <pre className="whitespace-pre-wrap font-sans bg-zinc-900/80 p-3 rounded-md max-h-96 overflow-y-auto">
+            {content || "Document is empty."}
+          </pre>
+        }
+      />
+    </>
+  );
+};
+
+// --- MODIFIED MAIN COMPONENT ---
 export const TaskInspector = ({ task }: { task: any | null }) => {
   if (!task) {
     return (
@@ -28,70 +75,91 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
   const depsArray = Array.isArray(task.deps) ? task.deps : [];
 
   return (
-    <div className="bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 h-full overflow-y-auto">
-      <div className="flex justify-between items-start mb-1">
-        <h2 className="text-xl font-bold text-zinc-100 pr-4">{task.desc}</h2>
-        <StatusBadge status={task.status} />
+    // --- START OF FIX ---
+    // 1. Change to a flex column layout.
+    // 2. Remove `overflow-y-auto` from this main container.
+    <div className="bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 h-full flex flex-col gap-4">
+      {/* Header Section (will not grow) */}
+      <div>
+        <div className="flex justify-between items-start mb-1">
+          <h2 className="text-xl font-bold text-zinc-100 pr-4">{task.desc}</h2>
+          <StatusBadge status={task.status} />
+        </div>
+        <p className="font-mono text-xs text-zinc-500">{task.id}</p>
       </div>
-      <p className="font-mono text-xs text-zinc-500 mb-4">{task.id}</p>
 
-      <dl>
-        <DetailRow
-          label="Dependencies"
-          value={
-            depsArray.length > 0 ? (
-              <pre className="font-mono text-xs">{depsArray.join("\n")}</pre>
-            ) : (
-              "None"
-            )
-          }
-        />
-        <DetailRow
-          label="Result"
-          value={
-            <pre className="whitespace-pre-wrap font-sans bg-zinc-900/80 p-2 rounded-md max-h-48 overflow-y-auto">
-              {task.result || "Not available"}
-            </pre>
-          }
-        />
-        {task.human_directive && (
+      {/* Scrollable Details Section */}
+      {/* 3. This wrapper will grow to fill space and handle its own scrolling. */}
+      {/* `min-h-0` is a crucial flexbox trick to allow shrinking. */}
+      <div className="flex-grow overflow-y-auto min-h-0 pr-2 -mr-2">
+        <dl>
           <DetailRow
-            label="Active Human Directive"
+            label="Dependencies"
             value={
-              <span className="bg-blue-900/50 text-blue-300 p-2 rounded-md block animate-pulse">
-                {task.human_directive}
-              </span>
+              depsArray.length > 0 ? (
+                <pre className="font-mono text-xs">{depsArray.join("\n")}</pre>
+              ) : (
+                "None"
+              )
             }
           />
-        )}
-        {task.current_question && (
-          <DetailRow
-            label="Agent's Question"
-            value={
-              <span className="bg-orange-900/50 text-orange-300 p-2 rounded-md block animate-pulse">
-                Priority {task.current_question.priority}/10:{" "}
-                {task.current_question.question}
-              </span>
-            }
-          />
-        )}
-        {task.user_response && (
-          <DetailRow
-            label="Your Last Response"
-            value={
-              <span className="bg-green-900/50 text-green-300 p-2 rounded-md block">
-                {task.user_response}
-              </span>
-            }
-          />
-        )}
-      </dl>
 
-      <CommandPalette
-        taskId={task.id}
-        taskStatus={task.status}
-        currentQuestion={task.current_question}
-      />
+          {task.task_type === "document" ? (
+            <DocumentDetails task={task} />
+          ) : (
+            <DetailRow
+              label="Result"
+              value={
+                <pre className="whitespace-pre-wrap font-sans bg-zinc-900/80 p-2 rounded-md max-h-48 overflow-y-auto">
+                  {task.result || "Not available"}
+                </pre>
+              }
+            />
+          )}
+
+          {task.human_directive && (
+            <DetailRow
+              label="Active Human Directive"
+              value={
+                <span className="bg-blue-900/50 text-blue-300 p-2 rounded-md block animate-pulse">
+                  {task.human_directive}
+                </span>
+              }
+            />
+          )}
+          {task.current_question && (
+            <DetailRow
+              label="Agent's Question"
+              value={
+                <span className="bg-orange-900/50 text-orange-300 p-2 rounded-md block animate-pulse">
+                  Priority {task.current_question.priority}/10:{" "}
+                  {task.current_question.question}
+                </span>
+              }
+            />
+          )}
+          {task.user_response && (
+            <DetailRow
+              label="Your Last Response"
+              value={
+                <span className="bg-green-900/50 text-green-300 p-2 rounded-md block">
+                  {task.user_response}
+                </span>
+              }
+            />
+          )}
+        </dl>
+      </div>
+
+      {/* Footer Command Palette Section (will not grow) */}
+      <div className="flex-shrink-0">
+        <CommandPalette
+          taskId={task.id}
+          taskStatus={task.status}
+          currentQuestion={task.current_question}
+        />
+      </div>
+      {/* --- END OF FIX --- */}
     </div>
   );
 };

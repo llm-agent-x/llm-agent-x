@@ -40,7 +40,7 @@ from llm_agent_x.agents.dag_agent import (
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
     TaskForMerging, MergedTask, MergingDecision, NewSubtask, ContextualAnswer,
     RedundancyDecision,
-    ChainedExecutionPlan, TaskChain, TaskDescription,
+    ChainedExecutionPlan, TaskChain, TaskDescription, DocumentState, generate_hash,
 )
 
 from dotenv import load_dotenv
@@ -72,8 +72,8 @@ class InteractiveDAGAgent(DAGAgent):
         self.max_total_tasks = kwargs.pop("max_total_tasks", 25)
         self.max_dependencies_per_task = kwargs.pop("max_dependencies_per_task", 7)
 
-
-        super().__init__(*args, **kwargs)
+        self.registry = TaskRegistry(broadcast_callback=self._broadcast_state_update)
+        super().__init__(*args, registry=self.registry, **kwargs)
 
         self.directives_queue = asyncio.Queue()
         self._publisher_connection: Optional[pika.BlockingConnection] = None
@@ -102,15 +102,22 @@ class InteractiveDAGAgent(DAGAgent):
 
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
-            "Structure your output as 'chains' of tasks. "
-            "A 'chain' is a list of tasks that must be done sequentially (e.g., 'Step 1: Research venues', 'Step 2: Book venue'). "
-            "You can have multiple chains, and all chains will be executed in parallel. "
-            "Group related sequential steps into a single chain. Use parallel chains for independent streams of work."
+            "You will be given the main objective and, crucially, a list of 'AVAILABLE DOCUMENTS' and their global IDs. These documents are your primary data sources."
+            "\n\n**YOUR DECISION PROCESS MUST FOLLOW THESE RULES:**"
+            "\n1. **CHECK DOCUMENTS FIRST:** Before creating any task, review the list of AVAILABLE DOCUMENTS. Ask yourself: 'Is the information needed for this step already present in one of these documents?'"
+            "\n2. **DEPEND, DON'T RE-CREATE:** If a task's primary purpose is to get information from an existing document, you MUST NOT create a new task to 'read' or 'analyze' it. Instead, create a task that USES the information and add the document's global ID directly to its `deps` list."
+            "\n3. **LINK SEQUENTIAL STEPS:** Structure your output as 'chains' of tasks. A 'chain' is a list of tasks that must be done sequentially. All chains will run in parallel."
+            "\n\n**EXAMPLE:**"
+            "\n- Objective: 'Create a summary of Q2 performance.'"
+            "\n- AVAILABLE DOCUMENTS: `[{'id': 'doc-abc', 'desc': 'Document: Q2 Financials'}]`"
+            "\n- **CORRECT ACTION:** Create a single task like `{'desc': 'Synthesize Q2 Financials into a summary', 'deps': ['doc-abc']}`."
+            "\n- **INCORRECT ACTION:** Creating a task like `{'desc': 'Read the Q2 Financials document', 'deps': []}`. This is redundant."
         )
+
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt=planner_system_prompt,
-            output_type=ChainedExecutionPlan,  # MODIFIED
+            system_prompt=planner_system_prompt,  # Use the new, improved prompt
+            output_type=ChainedExecutionPlan,
             tools=self._tools_for_agents,
         )
         self.cycle_breaker = Agent(
@@ -623,7 +630,7 @@ class InteractiveDAGAgent(DAGAgent):
             prunable_statuses = {"pending", "paused_by_human", "failed", "cancelled"}
             all_eligible_tasks = [
                 t for t in self.registry.tasks.values()
-                if t.status in prunable_statuses and t.parent is not None  # Never prune a root task
+                if t.status in prunable_statuses and t.parent is not None and (not t.is_critical) and t.counts_toward_limit  # Never prune a root task
             ]
 
             # Build a map of which tasks depend on which other tasks.
@@ -758,7 +765,7 @@ class InteractiveDAGAgent(DAGAgent):
                 new_status="cancelled"
             )
 
-    async def _prune_specific_task(self, task_id: str, reason: str, new_status: str = "cancelled"):
+    async def _prune_specific_task(self, task_id: str, reason: str, new_status: str = "cancelled", override_critical=False):
         """
         Safely removes a task from the registry and cleans up all references to it.
         Now uses a 'cancelled' status by default for a clearer UI representation.
@@ -769,6 +776,13 @@ class InteractiveDAGAgent(DAGAgent):
 
         task = self.registry.tasks[task_id]
         logger.info(f"Initiating pruning of task [{task_id}] with status '{new_status}'. Reason: {reason}")
+
+        if task.is_critical and not override_critical:
+            logger.error(
+                f"FATAL PRUNING ERROR: Attempted to prune task [{task_id}] which is a critical task. "
+                f"This action has been BLOCKED."
+            )
+            return
 
         UNPRUNABLE_STATUSES = {"running", "proposing", "planning", "complete"}
         if task.status in UNPRUNABLE_STATUSES:
@@ -918,6 +932,63 @@ class InteractiveDAGAgent(DAGAgent):
             self._broadcast_state_update(new_task)
             return
 
+        if command == "ADD_DOCUMENT":
+            payload = directive.get("payload", {})
+            name = payload.get("name")
+            content = payload.get("content")
+            if not name or content is None:
+                logger.warning("ADD_DOCUMENT directive missing name or content.")
+                return
+
+            doc_state = DocumentState(content=content)
+            new_doc_task = Task(
+                id=str(uuid.uuid4())[:8],
+                desc=f"Document: {name}",
+                task_type="document",
+                document_state=doc_state,
+                status="complete",  # Documents are considered 'complete' by default
+                is_critical=True,
+                counts_toward_limit=False,  # Documents don't count towards the task limit
+            )
+            self.registry.add_task(new_doc_task)
+            logger.info(f"Added new document node: {new_doc_task.id} - {name}")
+            self._broadcast_state_update(new_doc_task)
+            return
+
+        elif command == "UPDATE_DOCUMENT":
+            if task and task.task_type == "document" and task.document_state:
+                new_name = payload.get("name")
+                new_content = payload.get("content")
+
+                if new_name:
+                    task.desc = f"Document: {new_name}"
+
+                if new_content is not None and generate_hash(new_content) != task.document_state.content_hash:
+                    logger.info(
+                        f"Updating content for document {task.id}. Version {task.document_state.version} -> {task.document_state.version + 1}")
+                    task.document_state = DocumentState(
+                        content=new_content,
+                        version=task.document_state.version + 1
+                    )
+
+                self._broadcast_state_update(task)
+            else:
+                logger.warning(f"UPDATE_DOCUMENT for invalid/non-document task {task_id}")
+            return
+
+        elif command == "DELETE_DOCUMENT":
+            if task and task.task_type == "document":
+                logger.info(f"Pruning document node {task.id} by operator directive.")
+                await self._prune_specific_task(
+                    task_id=task.id,
+                    reason="Document deleted by operator.",
+                    new_status="pruned",
+                    override_critical=True,
+                )
+            else:
+                logger.warning(f"DELETE_DOCUMENT for invalid/non-document task {task_id}")
+            return
+
         # --- NEW LOGIC FOR CANCEL ---
         if command == "CANCEL":
             if task:
@@ -940,7 +1011,39 @@ class InteractiveDAGAgent(DAGAgent):
             await self._prune_orphaned_tasks()
             return
 
-        # ----------------------------
+        if command == "RESET_STATE":
+            logger.warning("Received RESET_STATE directive. Wiping all current tasks and loading new state.")
+            payload = directive.get("payload", {})
+            if not isinstance(payload, dict):
+                logger.error("RESET_STATE payload is not a dictionary. Aborting.")
+                return
+
+            # 1. Cancel and clear all in-flight operations
+            for future in self.task_futures.values():
+                future.cancel()
+            self.task_futures.clear()
+            self.inflight.clear()
+
+            # 2. Wipe the current registry
+            self.registry.tasks.clear()
+
+            # 3. Load the new state from the payload
+            for task_id, task_data in payload.items():
+                try:
+                    # Re-create Task objects from the dictionary data
+                    new_task = Task(**task_data)
+                    self.registry.add_task(new_task)
+                except Exception as e:
+                    logger.error(f"Failed to load task {task_id} from state file: {e}")
+
+            # 4. Broadcast all loaded tasks to update the UI
+            logger.info(f"Successfully loaded {len(self.registry.tasks)} tasks. Broadcasting state to UI.")
+            for task in self.registry.tasks.values():
+                self._broadcast_state_update(task)
+
+            return
+
+            # ----------------------------
 
         # All other directives require the task to exist
 
@@ -1363,44 +1466,55 @@ class InteractiveDAGAgent(DAGAgent):
 
         logger.info(f"[{t.id}] Planner proposed {len(chained_plan.task_chains)} chain(s). Consolidating...")
 
-        final_task_descriptions = []
+        local_to_global_id_map = {}
+        all_new_task_descriptions = []
+
+        # Pass 1: Create all tasks and build the ID map.
+        # This is where we also link tasks sequentially within their chain.
         for chain_obj in chained_plan.task_chains:
-            if not chain_obj.chain: continue
+            previous_task_global_id_in_chain = None
+            for task_desc in chain_obj.chain:
+                # Add the description to a flat list for the second pass
+                all_new_task_descriptions.append(task_desc)
 
-            if len(chain_obj.chain) == 1:
-                # If a chain has only one step, use it directly
-                final_task_descriptions.append(chain_obj.chain[0])
-            else:
-                # If a chain has multiple steps, merge them into a single task
-                descriptions_to_merge = [td.desc for td in chain_obj.chain]
-                merger_prompt = (
-                    "Combine the following sequential steps into a single, comprehensive task description:\n"
-                    f"{json.dumps(descriptions_to_merge, indent=2)}"
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=task_desc.desc,
+                    parent=t.id,
+                    can_request_new_subtasks=task_desc.can_request_new_subtasks,
+                    mcp_servers=t.mcp_servers,
                 )
-                merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
+                self.registry.add_task(new_task)
+                t.children.append(new_task.id)
+                local_to_global_id_map[task_desc.local_id] = new_task.id
+                self._broadcast_state_update(new_task)
 
-                if merged_desc:
-                    # NEW LOGIC: A merged task should only be decomposable if one of
-                    # its original constituent parts was explicitly marked as such.
-                    # Otherwise, we trust the merge and mark it for execution.
-                    should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
+                # Auto-link to the previous task in the same chain
+                if previous_task_global_id_in_chain:
+                    self.registry.add_dependency(new_task.id, previous_task_global_id_in_chain)
 
-                    final_task_descriptions.append(
-                        TaskDescription(
-                            local_id=f"merged_{chain_obj.chain[0].local_id}",
-                            desc=merged_desc,
-                            can_request_new_subtasks=should_decompose_further  # <-- CORRECTED
-                        )
-                    )
+                previous_task_global_id_in_chain = new_task.id
+
+        # Pass 2: Resolve and add all other dependencies.
+        # Now that all new tasks exist, we can link them using our map.
+        for task_desc in all_new_task_descriptions:
+            new_task_global_id = local_to_global_id_map.get(task_desc.local_id)
+            if not new_task_global_id: continue
+
+            for dep_id in task_desc.deps:
+                dep_global_id = local_to_global_id_map.get(dep_id) or (
+                    dep_id if dep_id in self.registry.tasks else None)
+
+                if dep_global_id:
+                    # This call will now automatically broadcast updates for both tasks!
+                    self.registry.add_dependency(new_task_global_id, dep_global_id)
                 else:
-                    logger.warning(f"[{t.id}] Task merger failed for a chain. Discarding chain.")
+                    logger.warning(
+                        f"[{t.id}] Planner specified a dependency ('{dep_id}') that could not be found. It will be ignored.")
 
-        if final_task_descriptions:
-            logger.info(f"[{t.id}] Committing {len(final_task_descriptions)} consolidated sub-tasks.")
-            self._commit_task_descriptions(ctx, final_task_descriptions)
-            t.status = "waiting_for_children"
-        else:
-            logger.info(f"[{t.id}] No valid sub-tasks remained after consolidation.")
+        # Finally, update the parent task's state.
+        t.status = "waiting_for_children"
+        self._broadcast_state_update(t)
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -1475,6 +1589,14 @@ class InteractiveDAGAgent(DAGAgent):
         final_task_descriptions = []
         for chain_obj in chained_plan.task_chains:
             if not chain_obj.chain: continue
+
+            # --- START OF LOGICAL FIX (IDENTICAL TO THE ONE ABOVE) ---
+            # Collect all unique dependencies from every task in the chain.
+            all_deps_in_chain = set()
+            for task_desc in chain_obj.chain:
+                all_deps_in_chain.update(task_desc.deps)
+            # --- END OF LOGICAL FIX ---
+
             if len(chain_obj.chain) == 1:
                 final_task_descriptions.append(chain_obj.chain[0])
             else:
@@ -1482,16 +1604,15 @@ class InteractiveDAGAgent(DAGAgent):
                 merger_prompt = f"Combine these steps into one task: {json.dumps(descriptions_to_merge)}"
                 merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
                 if merged_desc:
-                    # NEW LOGIC: A merged task should only be decomposable if one of
-                    # its original constituent parts was explicitly marked as such.
-                    # Otherwise, we trust the merge and mark it for execution.
                     should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
 
+                    # --- CRUCIAL CHANGE: Create the new TaskDescription with the aggregated dependencies.
                     final_task_descriptions.append(
                         TaskDescription(
                             local_id=f"merged_{chain_obj.chain[0].local_id}",
                             desc=merged_desc,
-                            can_request_new_subtasks=should_decompose_further  # <-- CORRECTED
+                            can_request_new_subtasks=should_decompose_further,
+                            deps=list(all_deps_in_chain)  # Assign the collected deps here.
                         )
                     )
 
@@ -1504,7 +1625,8 @@ class InteractiveDAGAgent(DAGAgent):
 
     def _commit_task_descriptions(self, ctx: TaskContext, task_descriptions: List[TaskDescription]):
         """
-        NEW HELPER: A clean way to add a list of final, consolidated tasks to the registry.
+        MODIFIED HELPER: A clean way to add a list of final, consolidated tasks to the registry,
+        now with support for dependencies on existing nodes.
         """
         t = ctx.task
         for desc in task_descriptions:
@@ -1514,11 +1636,13 @@ class InteractiveDAGAgent(DAGAgent):
                 parent=t.id,
                 can_request_new_subtasks=desc.can_request_new_subtasks,
                 mcp_servers=t.mcp_servers,
+                # --- NEW: Apply dependencies specified by the planner ---
+                deps=set(desc.deps),
             )
             self.registry.add_task(new_task)
             t.children.append(new_task.id)
             # The parent task automatically depends on all its new children
-            self.registry.add_dependency(t.id, new_task.id)
+            # self.registry.add_dependency(t.id, new_task.id)
             self._broadcast_state_update(new_task)
 
     async def _run_task_execution(self, ctx: TaskContext):

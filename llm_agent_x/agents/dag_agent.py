@@ -1,11 +1,13 @@
 import asyncio
+import hashlib
 import uuid
 import logging
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from hashlib import md5
 from os import getenv
 import json  # NEW: For pretty-printing tool schemas
-from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable
+from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable, Literal
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
@@ -160,6 +162,8 @@ class TaskDescription(BaseModel):
     desc: str = Field(description="A clear and concise description of the task.")
     can_request_new_subtasks: bool = Field(False,
                                            description="Set to true ONLY for complex, integrative, or uncertain tasks that might need further dynamic decomposition later.")
+    deps: List[str] = Field(default_factory=list,
+                            description="A list of GLOBAL IDs of existing tasks or documents this new task depends on.")
 
 class TaskChain(BaseModel):
     """Represents a sequence of tasks that MUST be executed in a specific order."""
@@ -172,6 +176,21 @@ class ChainedExecutionPlan(BaseModel):
     """
     task_chains: List[TaskChain] = Field(description="A list of task chains. All chains can run in parallel.")
 
+def generate_hash(content: str) -> str:
+    """Generates a SHA256 hash for a string."""
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+class DocumentState(BaseModel):
+    """Holds the versioned content of a document."""
+    content: str
+    version: int = 1
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    content_hash: str = ""
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if not self.content_hash:
+            self.content_hash = generate_hash(self.content)
 
 # The main Task model, enhanced for the new architecture
 class Task(BaseModel):
@@ -181,6 +200,12 @@ class Task(BaseModel):
     status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, pruned, paused_by_human, waiting_for_user_response
     is_critical: bool = Field(False,
                               description="If True, this task cannot be automatically pruned by the graph manager.")
+
+    counts_toward_limit: bool = Field(True,
+                                      description="If False, this task does not count towards the limit of tasks that can exist")
+    task_type: Literal["task", "document"] = "task"
+    document_state: Optional[DocumentState] = None
+
     result: Optional[str] = None
     cost: float = 0.0
     parent: Optional[str] = None
@@ -225,25 +250,38 @@ class Task(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-
 class TaskRegistry:
-    def __init__(self):
+    def __init__(self, broadcast_callback: Callable[[Task],None] = None):
         self.tasks: Dict[str, Task] = {}
+        self._broadcast = broadcast_callback or (lambda task: None)
 
     def add_task(self, task: Task):
         if task.id in self.tasks: raise ValueError(f"Task {task.id} already exists")
         self.tasks[task.id] = task
+        self._broadcast(task)
 
     def add_document(self, document_name: str, content: Dict[str, str]) -> str:
         id = md5(f"{document_name}{content}".encode()).hexdigest()
         print(f"Adding document {document_name} with id {id}")
         print(f"Document content: {content}")
         self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete", result=content)
+        self._broadcast(self.tasks[id])
         return id
 
     def add_dependency(self, task_id: str, dep_id: str):
         if task_id not in self.tasks or dep_id not in self.tasks: return
-        self.tasks[task_id].deps.add(dep_id)
+        task = self.tasks[task_id]
+        dependency_task = self.tasks[dep_id]
+
+        # Add the dependency link for the scheduler
+        if dep_id not in task.deps:
+            task.deps.add(dep_id)
+
+        if task_id not in dependency_task.children:
+            dependency_task.children.append(task_id)
+
+        self._broadcast(self.tasks[task_id])
+        self._broadcast(self.tasks[dep_id])
 
     def print_status_tree(self):
         logger.info("--- CURRENT TASK STATUS TREE ---")
@@ -272,7 +310,7 @@ class TaskContext:
 class DAGAgent:
     def __init__(
             self,
-            registry: TaskRegistry,
+            registry: Optional[TaskRegistry] = None,
             llm_model: str = "gpt-4o-mini",
             tracer: Optional[Tracer] = None,
             tools: Optional[List[Any]] = None,
@@ -281,7 +319,7 @@ class DAGAgent:
             min_question_priority: int = 1,
             mcp_server_url: Optional[str] = None,  # NEW: MCP server URL parameter
     ):
-        self.registry = registry
+        self.registry = registry or TaskRegistry()
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.base_llm_model = llm_model
