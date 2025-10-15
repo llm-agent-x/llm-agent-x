@@ -35,6 +35,74 @@ export async function addTask(desc: string, mcp_servers: McpServer[]) {
   }
 }
 
+export interface Document {
+  id: string;
+  name: string;
+  content: string;
+}
+
+export async function fetchDocuments() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/documents`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch documents: ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Error fetching documents:", error);
+    alert(`Error: ${(error as Error).message}`);
+  }
+}
+
+export async function addDocument(document: Document) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/documents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(document),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to add document: ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Error adding document:", error);
+    alert(`Error: ${(error as Error).message}`);
+  }
+}
+
+export async function updateDocument(document: Document) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/documents/${document.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(document),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to update document: ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Error updating document:", error);
+    alert(`Error: ${(error as Error).message}`);
+  }
+}
+
+export async function deleteDocument(documentId: string) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/documents/${documentId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete document: ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Error deleting document:", error);
+    alert(`Error: ${(error as Error).message}`);
+  }
+}
+
 /**
  * Sends a specific directive (PAUSE, REDIRECT, etc.) to a running task.
  */

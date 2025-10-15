@@ -9,6 +9,7 @@ import { TaskInspector } from "./components/TaskInspector";
 import { NewTaskForm } from "./components/NewTaskForm";
 import { DAGView } from "./components/DAGView";
 import { McpServerManager, McpServer } from "./components/McpServerManager";
+import { DocumentManager } from "./components/DocumentManager"; // <-- 1. IMPORT THE NEW COMPONENT
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -96,17 +97,15 @@ export default function MissionControl() {
     };
   }, []);
 
-  // **THE FIX**: Memoize the taskList so it's only recalculated when `tasks` changes.
   const taskList = useMemo(() => {
     return Object.values(tasks).sort((a, b) => a.id.localeCompare(b.id));
   }, [tasks]);
 
   const selectedTask = tasks[selectedTaskId!] || null;
 
-  // Note: setSelectedTaskId from useState is already stable, so no useCallback is needed for it.
   const handleSelectTask = useCallback((id: string) => {
     setSelectedTaskId(id);
-  }, []); // Empty array means this function is created only once.
+  }, []);
 
   useEffect(() => {
     if (selectedTaskId && !tasks[selectedTaskId]) {
@@ -138,6 +137,8 @@ export default function MissionControl() {
               title={isConnected ? "Connected" : "Disconnected"}
             ></div>
           </div>
+          {/* <-- 2. ADD THE COMPONENT INSTANCE HERE --> */}
+          <DocumentManager />
           <McpServerManager
             servers={mcpServers}
             setServers={setMcpServers}
