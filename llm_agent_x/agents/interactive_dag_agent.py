@@ -1466,51 +1466,56 @@ class InteractiveDAGAgent(DAGAgent):
 
         logger.info(f"[{t.id}] Planner proposed {len(chained_plan.task_chains)} chain(s). Consolidating...")
 
-        final_task_descriptions = []
+        local_to_global_id_map = {}
+        all_new_task_descriptions = []
+
+        # Pass 1: Create all tasks and build the ID map.
+        # This is where we also link tasks sequentially within their chain.
         for chain_obj in chained_plan.task_chains:
-            if not chain_obj.chain: continue
-
-            # --- START OF LOGICAL FIX ---
-            # Collect all unique dependencies from every task in the chain.
-            all_deps_in_chain = set()
+            previous_task_global_id_in_chain = None
             for task_desc in chain_obj.chain:
-                all_deps_in_chain.update(task_desc.deps)
-            # --- END OF LOGICAL FIX ---
+                # Add the description to a flat list for the second pass
+                all_new_task_descriptions.append(task_desc)
 
-            if len(chain_obj.chain) == 1:
-                # If a chain has only one step, use it directly (it already has its deps).
-                final_task_descriptions.append(chain_obj.chain[0])
-            else:
-                # If a chain has multiple steps, merge them into a single task.
-                descriptions_to_merge = [td.desc for td in chain_obj.chain]
-                merger_prompt = (
-                    "Combine the following sequential steps into a single, comprehensive task description:\n"
-                    f"{json.dumps(descriptions_to_merge, indent=2)}"
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=task_desc.desc,
+                    parent=t.id,
+                    can_request_new_subtasks=task_desc.can_request_new_subtasks,
+                    mcp_servers=t.mcp_servers,
                 )
-                merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
+                self.registry.add_task(new_task)
+                t.children.append(new_task.id)
+                local_to_global_id_map[task_desc.local_id] = new_task.id
+                self._broadcast_state_update(new_task)
 
-                if merged_desc:
-                    # A merged task should be decomposable if any of its parts were.
-                    should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
+                # Auto-link to the previous task in the same chain
+                if previous_task_global_id_in_chain:
+                    self.registry.add_dependency(new_task.id, previous_task_global_id_in_chain)
 
-                    # --- CRUCIAL CHANGE: Create the new TaskDescription with the aggregated dependencies.
-                    final_task_descriptions.append(
-                        TaskDescription(
-                            local_id=f"merged_{chain_obj.chain[0].local_id}",
-                            desc=merged_desc,
-                            can_request_new_subtasks=should_decompose_further,
-                            deps=list(all_deps_in_chain)  # Assign the collected deps here.
-                        )
-                    )
+                previous_task_global_id_in_chain = new_task.id
+
+        # Pass 2: Resolve and add all other dependencies.
+        # Now that all new tasks exist, we can link them using our map.
+        for task_desc in all_new_task_descriptions:
+            new_task_global_id = local_to_global_id_map.get(task_desc.local_id)
+            if not new_task_global_id: continue
+
+            for dep_id in task_desc.deps:
+                # A dependency can be either another new task (a local_id) or an existing task/document (a global_id).
+                # Look it up in our local map first, otherwise, assume it's a global ID.
+                dep_global_id = local_to_global_id_map.get(dep_id) or (
+                    dep_id if dep_id in self.registry.tasks else None)
+
+                if dep_global_id:
+                    self.registry.add_dependency(new_task_global_id, dep_global_id)
                 else:
-                    logger.warning(f"[{t.id}] Task merger failed for a chain. Discarding chain.")
+                    logger.warning(
+                        f"[{t.id}] Planner specified a dependency ('{dep_id}') that could not be found. It will be ignored.")
 
-        if final_task_descriptions:
-            logger.info(f"[{t.id}] Committing {len(final_task_descriptions)} consolidated sub-tasks.")
-            self._commit_task_descriptions(ctx, final_task_descriptions)
-            t.status = "waiting_for_children"
-        else:
-            logger.info(f"[{t.id}] No valid sub-tasks remained after consolidation.")
+        # Finally, update the parent task's state.
+        t.status = "waiting_for_children"
+        self._broadcast_state_update(t)
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
