@@ -29,7 +29,6 @@ async def start_worker():
     registry = setup_initial_tasks()
 
     agent = InteractiveDAGAgent(
-        registry=registry,
         llm_model="gpt-4o-mini",
     )
 

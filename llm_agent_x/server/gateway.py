@@ -70,14 +70,8 @@ DIRECTIVES_QUEUE = "directives_queue"
 # --- API Endpoints (Unchanged) ---
 @app.get("/api/tasks")
 async def get_all_tasks():
-    logger.info("Received request for all tasks.")
-    # Filter out documents from the general task list
-    tasks_only = {
-        task_id: task
-        for task_id, task in task_state_cache.items()
-        if task.get("task_type", "task") == "task"
-    }
-    return {"tasks": tasks_only}
+    logger.info("Received request for all tasks and documents.")
+    return {"tasks": task_state_cache}
 
 
 @app.post("/api/tasks")

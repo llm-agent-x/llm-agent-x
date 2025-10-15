@@ -72,8 +72,8 @@ class InteractiveDAGAgent(DAGAgent):
         self.max_total_tasks = kwargs.pop("max_total_tasks", 25)
         self.max_dependencies_per_task = kwargs.pop("max_dependencies_per_task", 7)
 
-
-        super().__init__(*args, **kwargs)
+        self.registry = TaskRegistry(broadcast_callback=self._broadcast_state_update)
+        super().__init__(*args, registry=self.registry, **kwargs)
 
         self.directives_queue = asyncio.Queue()
         self._publisher_connection: Optional[pika.BlockingConnection] = None
@@ -1502,12 +1502,11 @@ class InteractiveDAGAgent(DAGAgent):
             if not new_task_global_id: continue
 
             for dep_id in task_desc.deps:
-                # A dependency can be either another new task (a local_id) or an existing task/document (a global_id).
-                # Look it up in our local map first, otherwise, assume it's a global ID.
                 dep_global_id = local_to_global_id_map.get(dep_id) or (
                     dep_id if dep_id in self.registry.tasks else None)
 
                 if dep_global_id:
+                    # This call will now automatically broadcast updates for both tasks!
                     self.registry.add_dependency(new_task_global_id, dep_global_id)
                 else:
                     logger.warning(

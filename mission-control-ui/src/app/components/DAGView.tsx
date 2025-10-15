@@ -133,13 +133,37 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
         human_directive: task.human_directive, current_question: task.current_question,
       },
     }));
+
+    // --- START OF LOGICAL FIX ---
     const initialEdges: Edge[] = [];
+    const taskIds = new Set(tasks.map(t => t.id));
+
     tasks.forEach((task) => {
-      if (task.parent && tasks.some(t => t.id === task.parent)) {
+      // 1. Create edges for parent -> child relationships (structural hierarchy)
+      if (task.parent && taskIds.has(task.parent)) {
         initialEdges.push({
-          id: `e${task.parent}-${task.id}`, source: task.parent, target: task.id,
-          type: 'default', markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" },
-          style: { stroke: "#a3a3a3", strokeWidth: 1.5 },
+          id: `e-parent-${task.parent}-${task.id}`,
+          source: task.parent,
+          target: task.id,
+          type: 'default',
+          markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" }, // Gray for hierarchy
+          style: { stroke: "#6b7280", strokeWidth: 1, strokeDasharray: '5 5' }, // Dashed for hierarchy
+        });
+      }
+
+      // 2. Create edges for dependency -> task relationships (data flow)
+      if (task.deps && Array.isArray(task.deps)) {
+        task.deps.forEach((depId: string) => {
+          if (taskIds.has(depId)) {
+            initialEdges.push({
+              id: `e-dep-${depId}-${task.id}`,
+              source: depId,
+              target: task.id,
+              type: 'default',
+              markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" }, // Lighter for data flow
+              style: { stroke: "#a3a3a3", strokeWidth: 2 }, // Solid, thicker for data flow
+            });
+          }
         });
       }
     });

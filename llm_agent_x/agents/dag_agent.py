@@ -251,23 +251,37 @@ class Task(BaseModel):
         arbitrary_types_allowed = True
 
 class TaskRegistry:
-    def __init__(self):
+    def __init__(self, broadcast_callback: Callable[[Task],None] = None):
         self.tasks: Dict[str, Task] = {}
+        self._broadcast = broadcast_callback or (lambda task: None)
 
     def add_task(self, task: Task):
         if task.id in self.tasks: raise ValueError(f"Task {task.id} already exists")
         self.tasks[task.id] = task
+        self._broadcast(task)
 
     def add_document(self, document_name: str, content: Dict[str, str]) -> str:
         id = md5(f"{document_name}{content}".encode()).hexdigest()
         print(f"Adding document {document_name} with id {id}")
         print(f"Document content: {content}")
         self.tasks[id] = Task(id=id, deps=set(), desc=f"Document: {document_name}", status="complete", result=content)
+        self._broadcast(self.tasks[id])
         return id
 
     def add_dependency(self, task_id: str, dep_id: str):
         if task_id not in self.tasks or dep_id not in self.tasks: return
-        self.tasks[task_id].deps.add(dep_id)
+        task = self.tasks[task_id]
+        dependency_task = self.tasks[dep_id]
+
+        # Add the dependency link for the scheduler
+        if dep_id not in task.deps:
+            task.deps.add(dep_id)
+
+        if task_id not in dependency_task.children:
+            dependency_task.children.append(task_id)
+
+        self._broadcast(self.tasks[task_id])
+        self._broadcast(self.tasks[dep_id])
 
     def print_status_tree(self):
         logger.info("--- CURRENT TASK STATUS TREE ---")
@@ -296,7 +310,7 @@ class TaskContext:
 class DAGAgent:
     def __init__(
             self,
-            registry: TaskRegistry,
+            registry: Optional[TaskRegistry] = None,
             llm_model: str = "gpt-4o-mini",
             tracer: Optional[Tracer] = None,
             tools: Optional[List[Any]] = None,
@@ -305,7 +319,7 @@ class DAGAgent:
             min_question_priority: int = 1,
             mcp_server_url: Optional[str] = None,  # NEW: MCP server URL parameter
     ):
-        self.registry = registry
+        self.registry = registry or TaskRegistry()
         self.inflight = set()
         self.task_futures: Dict[str, asyncio.Task] = {}
         self.base_llm_model = llm_model
