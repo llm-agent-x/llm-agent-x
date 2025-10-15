@@ -70,7 +70,13 @@ DIRECTIVES_QUEUE = "directives_queue"
 @app.get("/api/tasks")
 async def get_all_tasks():
     logger.info("Received request for all tasks.")
-    return {"tasks": task_state_cache}
+    # Filter out documents from the general task list
+    tasks_only = {
+        task_id: task
+        for task_id, task in task_state_cache.items()
+        if task.get("task_type", "task") == "task"
+    }
+    return {"tasks": tasks_only}
 
 
 @app.post("/api/tasks")
@@ -114,49 +120,6 @@ async def add_root_task(request: Request):
     finally:
         if connection and connection.is_open:
             connection.close()
-
-
-@app.post("/api/documents")
-def add_document(request: Request):
-    logger.info("Received request to add document.")
-    connection, channel = None, None
-    try:
-        body = request.json()
-        name = body.get("name")
-        content = body.get("content")
-
-        if not name or not content:
-            raise ValueError("Name and content cannot be empty")
-
-        message = {
-            "task_id": str(uuid.uuid4()),
-            "command": "ADD_DOCUMENT",
-            "payload": {
-                "name": name,
-                "content": content,
-            },
-        }
-
-        connection, channel = get_rabbitmq_connection_and_channel()
-        if not channel:
-            return JSONResponse(status_code=503, content={"message": "Service unavailable: Cannot connect to message queue."})
-
-        channel.basic_publish(
-            exchange="",
-            routing_key=DIRECTIVES_QUEUE,
-            body=json.dumps(message),
-            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
-        )
-        logger.info(f"Published new document directive to queue: {name}")
-        return {"status": "new document submitted"}
-
-    except Exception as e:
-        logger.exception(f"Error in add_document: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error"})
-    finally:
-        if connection and connection.is_open:
-            connection.close()
-
 
 @app.post("/api/tasks/{task_id}/directive")
 async def post_directive(task_id: str, request: Request):
