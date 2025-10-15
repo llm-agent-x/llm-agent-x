@@ -162,6 +162,8 @@ class TaskDescription(BaseModel):
     desc: str = Field(description="A clear and concise description of the task.")
     can_request_new_subtasks: bool = Field(False,
                                            description="Set to true ONLY for complex, integrative, or uncertain tasks that might need further dynamic decomposition later.")
+    deps: List[str] = Field(default_factory=list,
+                            description="A list of GLOBAL IDs of existing tasks or documents this new task depends on.")
 
 class TaskChain(BaseModel):
     """Represents a sequence of tasks that MUST be executed in a specific order."""

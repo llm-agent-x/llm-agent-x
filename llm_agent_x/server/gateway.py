@@ -4,10 +4,11 @@ import logging
 import os
 import threading
 import uuid
+from datetime import timezone, datetime
 
 import pika
 import socketio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, HTTPException, File
 from fastapi.middleware.cors import CORSMiddleware
 from pika.adapters.blocking_connection import BlockingChannel
 from dotenv import load_dotenv
@@ -312,6 +313,68 @@ async def post_directive(task_id: str, request: Request):
         if connection and connection.is_open:
             connection.close()
 
+@app.get("/api/state/download")
+async def download_state():
+    """
+    Returns the entire task_state_cache as a JSON file for download.
+    """
+    logger.info("Request received to download current graph state.")
+    if not task_state_cache:
+        return JSONResponse(status_code=404, content={"message": "No state to download."})
+
+    # Generate a timestamped filename
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"graph_state_{timestamp}.json"
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+
+    return JSONResponse(content=task_state_cache, headers=headers)
+
+
+@app.post("/api/state/upload")
+async def upload_state(file: UploadFile = File(...)):
+    """
+    Receives a JSON state file and sends a 'RESET_STATE' directive to the agent.
+    """
+    logger.info(f"Request received to upload graph state from file: {file.filename}")
+    connection, channel = None, None
+    try:
+        contents = await file.read()
+        state_data = json.loads(contents)
+
+        if not isinstance(state_data, dict):
+             raise HTTPException(status_code=400, detail="Invalid file format. Must be a JSON object of tasks.")
+
+        # This is a special, high-level directive for the agent
+        message = {
+            "task_id": "system", # Use a special ID for system-level commands
+            "command": "RESET_STATE",
+            "payload": state_data,
+        }
+
+        connection, channel = get_rabbitmq_connection_and_channel()
+        if not channel:
+            return JSONResponse(status_code=503, content={"message": "Service unavailable."})
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=DIRECTIVES_QUEUE,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE),
+        )
+        logger.info("Published RESET_STATE directive to the agent.")
+        return {"status": "State upload directive sent successfully."}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in uploaded file.")
+    except Exception as e:
+        logger.exception(f"Error in upload_state: {e}")
+        return JSONResponse(status_code=500, content={"message": "Internal server error"})
+    finally:
+        if connection and connection.is_open:
+            connection.close()
 
 # --- RabbitMQ Listener for State Updates (runs in background) ---
 def listen_for_state_updates():

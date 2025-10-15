@@ -102,15 +102,16 @@ class InteractiveDAGAgent(DAGAgent):
 
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
+            "You will be given the main objective and a list of available data sources (like documents) with their global IDs. "
+            "For each sub-task you create, you MUST identify which of the provided data sources it needs to read and set its `deps` field to the corresponding global ID(s). "
             "Structure your output as 'chains' of tasks. "
-            "A 'chain' is a list of tasks that must be done sequentially (e.g., 'Step 1: Research venues', 'Step 2: Book venue'). "
-            "You can have multiple chains, and all chains will be executed in parallel. "
-            "Group related sequential steps into a single chain. Use parallel chains for independent streams of work."
+            "A 'chain' is a list of tasks that must be done sequentially. "
+            "You can have multiple chains, and all chains will be executed in parallel."
         )
         self.initial_planner = Agent(
             model=llm_model,
             system_prompt=planner_system_prompt,
-            output_type=ChainedExecutionPlan,  # MODIFIED
+            output_type=ChainedExecutionPlan,
             tools=self._tools_for_agents,
         )
         self.cycle_breaker = Agent(
@@ -1004,7 +1005,39 @@ class InteractiveDAGAgent(DAGAgent):
             await self._prune_orphaned_tasks()
             return
 
-        # ----------------------------
+        if command == "RESET_STATE":
+            logger.warning("Received RESET_STATE directive. Wiping all current tasks and loading new state.")
+            payload = directive.get("payload", {})
+            if not isinstance(payload, dict):
+                logger.error("RESET_STATE payload is not a dictionary. Aborting.")
+                return
+
+            # 1. Cancel and clear all in-flight operations
+            for future in self.task_futures.values():
+                future.cancel()
+            self.task_futures.clear()
+            self.inflight.clear()
+
+            # 2. Wipe the current registry
+            self.registry.tasks.clear()
+
+            # 3. Load the new state from the payload
+            for task_id, task_data in payload.items():
+                try:
+                    # Re-create Task objects from the dictionary data
+                    new_task = Task(**task_data)
+                    self.registry.add_task(new_task)
+                except Exception as e:
+                    logger.error(f"Failed to load task {task_id} from state file: {e}")
+
+            # 4. Broadcast all loaded tasks to update the UI
+            logger.info(f"Successfully loaded {len(self.registry.tasks)} tasks. Broadcasting state to UI.")
+            for task in self.registry.tasks.values():
+                self._broadcast_state_update(task)
+
+            return
+
+            # ----------------------------
 
         # All other directives require the task to exist
 
@@ -1568,7 +1601,8 @@ class InteractiveDAGAgent(DAGAgent):
 
     def _commit_task_descriptions(self, ctx: TaskContext, task_descriptions: List[TaskDescription]):
         """
-        NEW HELPER: A clean way to add a list of final, consolidated tasks to the registry.
+        MODIFIED HELPER: A clean way to add a list of final, consolidated tasks to the registry,
+        now with support for dependencies on existing nodes.
         """
         t = ctx.task
         for desc in task_descriptions:
@@ -1578,6 +1612,8 @@ class InteractiveDAGAgent(DAGAgent):
                 parent=t.id,
                 can_request_new_subtasks=desc.can_request_new_subtasks,
                 mcp_servers=t.mcp_servers,
+                # --- NEW: Apply dependencies specified by the planner ---
+                deps=desc.deps
             )
             self.registry.add_task(new_task)
             t.children.append(new_task.id)

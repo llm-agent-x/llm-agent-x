@@ -1,15 +1,15 @@
 // mission-control-ui/src/app/page.tsx
 "use client";
 
-// Make sure to import useMemo and useCallback
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { io, Socket } from "socket.io-client";
+import { Download, Upload } from "lucide-react"; // Import new icons
 import { TaskList } from "./components/TaskList";
 import { TaskInspector } from "./components/TaskInspector";
 import { NewTaskForm } from "./components/NewTaskForm";
 import { DAGView } from "./components/DAGView";
 import { McpServerManager, McpServer } from "./components/McpServerManager";
-import { DocumentManager } from "./components/DocumentManager"; // <-- 1. IMPORT THE NEW COMPONENT
+import { DocumentManager } from "./components/DocumentManager";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -34,6 +34,85 @@ export default function MissionControl() {
   const [tasks, setTasks] = useState<{ [key: string]: any }>({});
   const [isConnected, setIsConnected] = useState(false);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+
+  const fileInputRef = useRef<HTMLInputElement>(null); // Ref for the hidden file input
+
+  // --- Handlers for state management ---
+
+  const handleDownloadState = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/state/download`);
+      if (!response.ok) {
+        throw new Error(`Failed to download state: ${response.statusText}`);
+      }
+
+      // Extract filename from Content-Disposition header
+      const disposition = response.headers.get("content-disposition");
+      let filename = "graph_state.json"; // Default filename
+      if (disposition && disposition.indexOf("attachment") !== -1) {
+        const filenameRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/;
+        const matches = filenameRegex.exec(disposition);
+        if (matches != null && matches[1]) {
+          filename = matches[1].replace(/['"]/g, "");
+        }
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Error downloading state:", error);
+      alert(`Error: ${(error as Error).message}`);
+    }
+  };
+
+  const handleUploadClick = () => {
+    // Trigger the hidden file input
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/state/upload`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(
+          `Failed to upload state: ${errorData.detail || response.statusText}`,
+        );
+      }
+
+      alert(
+        "State file uploaded successfully. The agent will now reset to the new state.",
+      );
+      // The UI will automatically update via WebSocket broadcasts from the agent.
+    } catch (error) {
+      console.error("Error uploading state:", error);
+      alert(`Error: ${(error as Error).message}`);
+    } finally {
+      // Reset the file input so the same file can be uploaded again
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  };
 
   // --- (No changes to the useEffect hooks for localStorage, servers, or sockets) ---
   useEffect(() => {
@@ -116,10 +195,6 @@ export default function MissionControl() {
     }
   }, [tasks, selectedTaskId, taskList]);
 
-  useEffect(() => {
-    console.log("Current MCP Servers:", mcpServers);
-  }, [mcpServers]);
-
   return (
     <main className="bg-zinc-900 text-white min-h-screen p-4 md:p-6 lg:p-8 max-h-screen">
       <header className="mb-6 flex justify-between items-center">
@@ -133,16 +208,41 @@ export default function MissionControl() {
           <div className="flex items-center gap-2 text-sm text-zinc-400">
             <span>Gateway Status</span>
             <div
-              className={`w-3 h-3 rounded-full transition-colors ${isConnected ? "bg-green-500 animate-pulse" : "bg-red-500"}`}
+              className={`w-3 h-3 rounded-full transition-colors ${
+                isConnected ? "bg-green-500 animate-pulse" : "bg-red-500"
+              }`}
               title={isConnected ? "Connected" : "Disconnected"}
             ></div>
           </div>
-          {/* <-- 2. ADD THE COMPONENT INSTANCE HERE --> */}
           <DocumentManager />
           <McpServerManager
             servers={mcpServers}
             setServers={setMcpServers}
             defaultServers={DEFAULT_SERVERS}
+          />
+
+          {/* --- NEW BUTTONS --- */}
+          <button
+            onClick={handleDownloadState}
+            className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
+            title="Download Graph State"
+          >
+            <Download className="h-5 w-5" />
+          </button>
+
+          <button
+            onClick={handleUploadClick}
+            className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
+            title="Upload Graph State"
+          >
+            <Upload className="h-5 w-5" />
+          </button>
+          <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileChange}
+            accept=".json"
+            style={{ display: "none" }}
           />
         </div>
       </header>
