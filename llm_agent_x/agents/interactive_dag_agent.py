@@ -102,15 +102,21 @@ class InteractiveDAGAgent(DAGAgent):
 
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
-            "You will be given the main objective and a list of available data sources (like documents) with their global IDs. "
-            "For each sub-task you create, you MUST identify which of the provided data sources it needs to read and set its `deps` field to the corresponding global ID(s). "
-            "Structure your output as 'chains' of tasks. "
-            "A 'chain' is a list of tasks that must be done sequentially. "
-            "You can have multiple chains, and all chains will be executed in parallel."
+            "You will be given the main objective and, crucially, a list of 'AVAILABLE DOCUMENTS' and their global IDs. These documents are your primary data sources."
+            "\n\n**YOUR DECISION PROCESS MUST FOLLOW THESE RULES:**"
+            "\n1. **CHECK DOCUMENTS FIRST:** Before creating any task, review the list of AVAILABLE DOCUMENTS. Ask yourself: 'Is the information needed for this step already present in one of these documents?'"
+            "\n2. **DEPEND, DON'T RE-CREATE:** If a task's primary purpose is to get information from an existing document, you MUST NOT create a new task to 'read' or 'analyze' it. Instead, create a task that USES the information and add the document's global ID directly to its `deps` list."
+            "\n3. **LINK SEQUENTIAL STEPS:** Structure your output as 'chains' of tasks. A 'chain' is a list of tasks that must be done sequentially. All chains will run in parallel."
+            "\n\n**EXAMPLE:**"
+            "\n- Objective: 'Create a summary of Q2 performance.'"
+            "\n- AVAILABLE DOCUMENTS: `[{'id': 'doc-abc', 'desc': 'Document: Q2 Financials'}]`"
+            "\n- **CORRECT ACTION:** Create a single task like `{'desc': 'Synthesize Q2 Financials into a summary', 'deps': ['doc-abc']}`."
+            "\n- **INCORRECT ACTION:** Creating a task like `{'desc': 'Read the Q2 Financials document', 'deps': []}`. This is redundant."
         )
+
         self.initial_planner = Agent(
             model=llm_model,
-            system_prompt=planner_system_prompt,
+            system_prompt=planner_system_prompt,  # Use the new, improved prompt
             output_type=ChainedExecutionPlan,
             tools=self._tools_for_agents,
         )
@@ -1464,11 +1470,18 @@ class InteractiveDAGAgent(DAGAgent):
         for chain_obj in chained_plan.task_chains:
             if not chain_obj.chain: continue
 
+            # --- START OF LOGICAL FIX ---
+            # Collect all unique dependencies from every task in the chain.
+            all_deps_in_chain = set()
+            for task_desc in chain_obj.chain:
+                all_deps_in_chain.update(task_desc.deps)
+            # --- END OF LOGICAL FIX ---
+
             if len(chain_obj.chain) == 1:
-                # If a chain has only one step, use it directly
+                # If a chain has only one step, use it directly (it already has its deps).
                 final_task_descriptions.append(chain_obj.chain[0])
             else:
-                # If a chain has multiple steps, merge them into a single task
+                # If a chain has multiple steps, merge them into a single task.
                 descriptions_to_merge = [td.desc for td in chain_obj.chain]
                 merger_prompt = (
                     "Combine the following sequential steps into a single, comprehensive task description:\n"
@@ -1477,16 +1490,16 @@ class InteractiveDAGAgent(DAGAgent):
                 merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
 
                 if merged_desc:
-                    # NEW LOGIC: A merged task should only be decomposable if one of
-                    # its original constituent parts was explicitly marked as such.
-                    # Otherwise, we trust the merge and mark it for execution.
+                    # A merged task should be decomposable if any of its parts were.
                     should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
 
+                    # --- CRUCIAL CHANGE: Create the new TaskDescription with the aggregated dependencies.
                     final_task_descriptions.append(
                         TaskDescription(
                             local_id=f"merged_{chain_obj.chain[0].local_id}",
                             desc=merged_desc,
-                            can_request_new_subtasks=should_decompose_further  # <-- CORRECTED
+                            can_request_new_subtasks=should_decompose_further,
+                            deps=list(all_deps_in_chain)  # Assign the collected deps here.
                         )
                     )
                 else:
@@ -1572,6 +1585,14 @@ class InteractiveDAGAgent(DAGAgent):
         final_task_descriptions = []
         for chain_obj in chained_plan.task_chains:
             if not chain_obj.chain: continue
+
+            # --- START OF LOGICAL FIX (IDENTICAL TO THE ONE ABOVE) ---
+            # Collect all unique dependencies from every task in the chain.
+            all_deps_in_chain = set()
+            for task_desc in chain_obj.chain:
+                all_deps_in_chain.update(task_desc.deps)
+            # --- END OF LOGICAL FIX ---
+
             if len(chain_obj.chain) == 1:
                 final_task_descriptions.append(chain_obj.chain[0])
             else:
@@ -1579,16 +1600,15 @@ class InteractiveDAGAgent(DAGAgent):
                 merger_prompt = f"Combine these steps into one task: {json.dumps(descriptions_to_merge)}"
                 merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
                 if merged_desc:
-                    # NEW LOGIC: A merged task should only be decomposable if one of
-                    # its original constituent parts was explicitly marked as such.
-                    # Otherwise, we trust the merge and mark it for execution.
                     should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
 
+                    # --- CRUCIAL CHANGE: Create the new TaskDescription with the aggregated dependencies.
                     final_task_descriptions.append(
                         TaskDescription(
                             local_id=f"merged_{chain_obj.chain[0].local_id}",
                             desc=merged_desc,
-                            can_request_new_subtasks=should_decompose_further  # <-- CORRECTED
+                            can_request_new_subtasks=should_decompose_further,
+                            deps=list(all_deps_in_chain)  # Assign the collected deps here.
                         )
                     )
 
@@ -1613,12 +1633,12 @@ class InteractiveDAGAgent(DAGAgent):
                 can_request_new_subtasks=desc.can_request_new_subtasks,
                 mcp_servers=t.mcp_servers,
                 # --- NEW: Apply dependencies specified by the planner ---
-                deps=desc.deps
+                deps=set(desc.deps),
             )
             self.registry.add_task(new_task)
             t.children.append(new_task.id)
             # The parent task automatically depends on all its new children
-            self.registry.add_dependency(t.id, new_task.id)
+            # self.registry.add_dependency(t.id, new_task.id)
             self._broadcast_state_update(new_task)
 
     async def _run_task_execution(self, ctx: TaskContext):
