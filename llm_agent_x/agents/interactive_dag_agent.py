@@ -623,7 +623,7 @@ class InteractiveDAGAgent(DAGAgent):
             prunable_statuses = {"pending", "paused_by_human", "failed", "cancelled"}
             all_eligible_tasks = [
                 t for t in self.registry.tasks.values()
-                if t.status in prunable_statuses and t.parent is not None  # Never prune a root task
+                if t.status in prunable_statuses and t.parent is not None and (not t.is_critical) and t.counts_toward_limit  # Never prune a root task
             ]
 
             # Build a map of which tasks depend on which other tasks.
@@ -770,6 +770,13 @@ class InteractiveDAGAgent(DAGAgent):
         task = self.registry.tasks[task_id]
         logger.info(f"Initiating pruning of task [{task_id}] with status '{new_status}'. Reason: {reason}")
 
+        if task.is_critical:
+            logger.error(
+                f"FATAL PRUNING ERROR: Attempted to prune task [{task_id}] which is a critical task. "
+                f"This action has been BLOCKED."
+            )
+            return
+
         UNPRUNABLE_STATUSES = {"running", "proposing", "planning", "complete"}
         if task.status in UNPRUNABLE_STATUSES:
             logger.error(
@@ -910,6 +917,30 @@ class InteractiveDAGAgent(DAGAgent):
                 needs_planning=payload.get("needs_planning", True),
                 status="pending",
                 mcp_servers=mcp_servers_config,
+            )
+            self.registry.add_task(new_task)
+            logger.info(
+                f"Added new root task from directive: {new_task.id} - {new_task.desc}"
+            )
+            self._broadcast_state_update(new_task)
+            return
+
+        if command == "ADD_DOCUMENT":
+            payload = directive.get("payload", {})
+            name = payload.get("name")
+            if not name:
+                logger.warning("ADD_ROOT_TASK directive received with no description.")
+                return
+
+            mcp_servers_config = payload.get("mcp_servers", [])
+
+            new_task = Task(
+                id=str(uuid.uuid4())[:8],
+                desc=f"Read document: {name}",
+                needs_planning=False,
+                status="complete",
+                is_critical=True, # So that it can never be pruned
+                counts_toward_limit=False,
             )
             self.registry.add_task(new_task)
             logger.info(

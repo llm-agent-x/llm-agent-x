@@ -181,6 +181,10 @@ class Task(BaseModel):
     status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, pruned, paused_by_human, waiting_for_user_response
     is_critical: bool = Field(False,
                               description="If True, this task cannot be automatically pruned by the graph manager.")
+
+    counts_toward_limit: bool = Field(True,
+                                      description="If False, this task does not count towards the limit of tasks that can exist")
+
     result: Optional[str] = None
     cost: float = 0.0
     parent: Optional[str] = None
