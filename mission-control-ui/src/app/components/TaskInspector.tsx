@@ -1,5 +1,7 @@
 // app/components/TaskInspector.tsx
 
+import React from "react";
+import { format, parseISO } from "date-fns"; // For formatting dates
 import { StatusBadge } from "./StatusBadge";
 import { CommandPalette } from "./CommandPalette";
 
@@ -16,6 +18,54 @@ const DetailRow = ({
   </div>
 );
 
+// --- NEW COMPONENT FOR DOCUMENT-SPECIFIC DETAILS ---
+const DocumentDetails = ({ task }: { task: any }) => {
+  if (!task.document_state) {
+    return (
+      <DetailRow
+        label="Document Content"
+        value={
+          <pre className="whitespace-pre-wrap font-sans text-red-400">
+            Error: Document state is missing.
+          </pre>
+        }
+      />
+    );
+  }
+
+  const { content, version, updated_at } = task.document_state;
+
+  // Safely format the date
+  const formattedDate = updated_at
+    ? format(parseISO(updated_at), "yyyy-MM-dd HH:mm:ss 'UTC'")
+    : "Unknown date";
+
+  return (
+    <>
+      <DetailRow
+        label="Version History"
+        value={
+          <div className="flex items-center gap-2 text-xs">
+            <span className="bg-zinc-700 px-2 py-0.5 rounded-md font-mono">
+              Version {version}
+            </span>
+            <span className="text-zinc-400">Last updated: {formattedDate}</span>
+          </div>
+        }
+      />
+      <DetailRow
+        label="Document Content"
+        value={
+          <pre className="whitespace-pre-wrap font-sans bg-zinc-900/80 p-3 rounded-md max-h-96 overflow-y-auto">
+            {content || "Document is empty."}
+          </pre>
+        }
+      />
+    </>
+  );
+};
+
+// --- MODIFIED MAIN COMPONENT ---
 export const TaskInspector = ({ task }: { task: any | null }) => {
   if (!task) {
     return (
@@ -46,14 +96,22 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
             )
           }
         />
-        <DetailRow
-          label="Result"
-          value={
-            <pre className="whitespace-pre-wrap font-sans bg-zinc-900/80 p-2 rounded-md max-h-48 overflow-y-auto">
-              {task.result || "Not available"}
-            </pre>
-          }
-        />
+
+        {/* --- START OF CONDITIONAL RENDERING LOGIC --- */}
+        {task.task_type === "document" ? (
+          <DocumentDetails task={task} />
+        ) : (
+          <DetailRow
+            label="Result"
+            value={
+              <pre className="whitespace-pre-wrap font-sans bg-zinc-900/80 p-2 rounded-md max-h-48 overflow-y-auto">
+                {task.result || "Not available"}
+              </pre>
+            }
+          />
+        )}
+        {/* --- END OF CONDITIONAL RENDERING LOGIC --- */}
+
         {task.human_directive && (
           <DetailRow
             label="Active Human Directive"
