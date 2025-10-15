@@ -1,11 +1,13 @@
 import asyncio
+import hashlib
 import uuid
 import logging
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from hashlib import md5
 from os import getenv
 import json  # NEW: For pretty-printing tool schemas
-from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable
+from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable, Literal
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
@@ -172,6 +174,21 @@ class ChainedExecutionPlan(BaseModel):
     """
     task_chains: List[TaskChain] = Field(description="A list of task chains. All chains can run in parallel.")
 
+def generate_hash(content: str) -> str:
+    """Generates a SHA256 hash for a string."""
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+class DocumentState(BaseModel):
+    """Holds the versioned content of a document."""
+    content: str
+    version: int = 1
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    content_hash: str = ""
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if not self.content_hash:
+            self.content_hash = generate_hash(self.content)
 
 # The main Task model, enhanced for the new architecture
 class Task(BaseModel):
@@ -184,6 +201,8 @@ class Task(BaseModel):
 
     counts_toward_limit: bool = Field(True,
                                       description="If False, this task does not count towards the limit of tasks that can exist")
+    task_type: Literal["task", "document"] = "task"
+    document_state: Optional[DocumentState] = None
 
     result: Optional[str] = None
     cost: float = 0.0
@@ -228,7 +247,6 @@ class Task(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
-
 
 class TaskRegistry:
     def __init__(self):

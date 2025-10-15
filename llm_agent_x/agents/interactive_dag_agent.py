@@ -40,7 +40,7 @@ from llm_agent_x.agents.dag_agent import (
     AdaptiveDecomposerResponse, InformationNeedDecision, DependencySelection, PruningDecision,
     TaskForMerging, MergedTask, MergingDecision, NewSubtask, ContextualAnswer,
     RedundancyDecision,
-    ChainedExecutionPlan, TaskChain, TaskDescription,
+    ChainedExecutionPlan, TaskChain, TaskDescription, DocumentState, generate_hash,
 )
 
 from dotenv import load_dotenv
@@ -758,7 +758,7 @@ class InteractiveDAGAgent(DAGAgent):
                 new_status="cancelled"
             )
 
-    async def _prune_specific_task(self, task_id: str, reason: str, new_status: str = "cancelled"):
+    async def _prune_specific_task(self, task_id: str, reason: str, new_status: str = "cancelled", override_critical=False):
         """
         Safely removes a task from the registry and cleans up all references to it.
         Now uses a 'cancelled' status by default for a clearer UI representation.
@@ -770,7 +770,7 @@ class InteractiveDAGAgent(DAGAgent):
         task = self.registry.tasks[task_id]
         logger.info(f"Initiating pruning of task [{task_id}] with status '{new_status}'. Reason: {reason}")
 
-        if task.is_critical:
+        if task.is_critical and not override_critical:
             logger.error(
                 f"FATAL PRUNING ERROR: Attempted to prune task [{task_id}] which is a critical task. "
                 f"This action has been BLOCKED."
@@ -928,25 +928,58 @@ class InteractiveDAGAgent(DAGAgent):
         if command == "ADD_DOCUMENT":
             payload = directive.get("payload", {})
             name = payload.get("name")
-            if not name:
-                logger.warning("ADD_ROOT_TASK directive received with no description.")
+            content = payload.get("content")
+            if not name or content is None:
+                logger.warning("ADD_DOCUMENT directive missing name or content.")
                 return
 
-            mcp_servers_config = payload.get("mcp_servers", [])
-
-            new_task = Task(
+            doc_state = DocumentState(content=content)
+            new_doc_task = Task(
                 id=str(uuid.uuid4())[:8],
-                desc=f"Read document: {name}",
-                needs_planning=False,
-                status="complete",
-                is_critical=True, # So that it can never be pruned
-                counts_toward_limit=False,
+                desc=f"Document: {name}",
+                task_type="document",
+                document_state=doc_state,
+                status="complete",  # Documents are considered 'complete' by default
+                is_critical=True,
+                counts_toward_limit=False,  # Documents don't count towards the task limit
             )
-            self.registry.add_task(new_task)
-            logger.info(
-                f"Added new root task from directive: {new_task.id} - {new_task.desc}"
-            )
-            self._broadcast_state_update(new_task)
+            self.registry.add_task(new_doc_task)
+            logger.info(f"Added new document node: {new_doc_task.id} - {name}")
+            self._broadcast_state_update(new_doc_task)
+            return
+
+        elif command == "UPDATE_DOCUMENT":
+            if task and task.task_type == "document" and task.document_state:
+                new_name = payload.get("name")
+                new_content = payload.get("content")
+
+                if new_name:
+                    task.desc = f"Document: {new_name}"
+
+                if new_content is not None and generate_hash(new_content) != task.document_state.content_hash:
+                    logger.info(
+                        f"Updating content for document {task.id}. Version {task.document_state.version} -> {task.document_state.version + 1}")
+                    task.document_state = DocumentState(
+                        content=new_content,
+                        version=task.document_state.version + 1
+                    )
+
+                self._broadcast_state_update(task)
+            else:
+                logger.warning(f"UPDATE_DOCUMENT for invalid/non-document task {task_id}")
+            return
+
+        elif command == "DELETE_DOCUMENT":
+            if task and task.task_type == "document":
+                logger.info(f"Pruning document node {task.id} by operator directive.")
+                await self._prune_specific_task(
+                    task_id=task.id,
+                    reason="Document deleted by operator.",
+                    new_status="pruned",
+                    override_critical=True,
+                )
+            else:
+                logger.warning(f"DELETE_DOCUMENT for invalid/non-document task {task_id}")
             return
 
         # --- NEW LOGIC FOR CANCEL ---
