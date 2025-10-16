@@ -3,20 +3,21 @@
 
 import React, { useEffect, useRef } from "react"; // Import useRef
 import ReactFlow, {
-  MiniMap,
-  Controls,
-  Background,
-  useNodesState,
-  useEdgesState,
-  MarkerType,
-  Node,
-  Edge,
-  Handle,
-  Position,
-  Panel,
+    MiniMap,
+    Controls,
+    Background,
+    useNodesState,
+    useEdgesState,
+    MarkerType,
+    Node,
+    Edge,
+    Handle,
+    Position,
+    Panel, BackgroundVariant,
 } from "reactflow";
 import dagre from "dagre";
 import "reactflow/dist/style.css";
+import {CurrentQuestion, HumanDirective, Task} from "@/lib/types";
 
 // ============================================================================
 // ** 1. ALL COMPONENTS AND CONSTANTS REMAIN AT THE TOP LEVEL **
@@ -41,12 +42,14 @@ export const StatusBadge = ({ status }: { status: string }) => {
   );
 };
 
+
+
 interface CustomTaskNodeData {
   id: string;
   desc: string;
   status: string;
-  human_directive: any;
-  current_question: any;
+  human_directive: HumanDirective | null;
+  current_question: CurrentQuestion | null;
 }
 const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected: boolean }) => {
   return (
@@ -65,12 +68,12 @@ const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected
       <div className="text-zinc-100 text-sm whitespace-pre-wrap font-semibold">
         {data.desc}
       </div>
-      {data.human_directive && (
+      {data.human_directive?.instruction && (
         <div className="mt-2 text-xs text-blue-300 bg-blue-900/20 p-1 rounded-md">
-          Directive: {data.human_directive.slice(0, 50)}...
+          Directive: {data.human_directive.instruction.slice(0, 50)}...
         </div>
       )}
-      {data.current_question && (
+      {data.current_question?.question && (
         <div className="mt-2 text-xs text-yellow-300 bg-yellow-900/20 p-1 rounded-md">
           Question: {data.current_question.question.slice(0, 50)}...
         </div>
@@ -108,10 +111,13 @@ const getLayoutedElements = (nodes: Node[], edges: Edge[], direction = 'TB') => 
 // ============================================================================
 // ** 2. THE MAIN DAGVIEW COMPONENT WITH THE ROBUST `useRef` FIX **
 // ============================================================================
+
 interface DAGViewProps {
-  tasks: any[];
+  tasks: Task[];
+  selectedTaskId: string | null;
+  onSelectTask: (id: string) => void;
 }
-export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
+export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelectTask }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [layoutDirection, setLayoutDirection] = React.useState('TB');
@@ -126,11 +132,15 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
 
     const initialNodes: Node<CustomTaskNodeData>[] = tasks.map((task) => ({
       id: task.id,
+      selected: task.id === selectedTaskId,
       position: { x: 0, y: 0 },
       type: "customTaskNode",
       data: {
-        id: task.id, desc: task.desc, status: task.status,
-        human_directive: task.human_directive, current_question: task.current_question,
+        id: task.id,
+        desc: task.desc || '', // Provide default empty string if desc is undefined
+        status: task.status || '', // Provide default empty string if status is undefined
+        human_directive: task.human_directive ?? null, // Convert undefined to null
+        current_question: task.current_question ?? null, // Convert undefined to null
       },
     }));
 
@@ -199,10 +209,11 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks }) => {
         proOptions={{ hideAttribution: true }}
         selectionOnDrag
         panOnDrag={[1, 2]}
+        onNodeClick={(_, node) => onSelectTask(node.id)}
       >
         <MiniMap nodeStrokeWidth={3} zoomable pannable />
         <Controls />
-        <Background variant="dots" gap={12} size={1} />
+        <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
         <Panel
           position="top-right"
           className="bg-zinc-900/70 p-2 rounded-md shadow-lg border border-zinc-700"

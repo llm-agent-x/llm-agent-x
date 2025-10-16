@@ -13,13 +13,14 @@ export interface McpServer {
 
 // --- REMOVED SELF-CONTAINED UI COMPONENTS ---
 // The custom <Button> is gone. We use standard <button> with classes.
+interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
+  className?: string;
+}
+
 const Input = ({
   className = "",
   ...props
-}: {
-  className?: string;
-  [key: string]: any;
-}) => (
+}: InputProps) => (
   <input
     className={`flex h-10 w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-zinc-900 ${className}`}
     {...props}
@@ -30,8 +31,7 @@ const Label = ({
   ...props
 }: {
   children: ReactNode;
-  [key: string]: any;
-}) => (
+} & React.LabelHTMLAttributes<HTMLLabelElement>) => (
   <label className="text-sm font-medium leading-none text-zinc-400" {...props}>
     {children}
   </label>
@@ -245,7 +245,7 @@ export function McpServerManager({
                     id="server-name"
                     placeholder="My MCP Server"
                     value={newServerName}
-                    onChange={(e) => setNewServerName(e.target.value)}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewServerName(e.target.value)}
                   />
                 </div>
                 <div className="grid w-full items-center gap-1.5">
@@ -255,7 +255,7 @@ export function McpServerManager({
                     id="server-address"
                     placeholder="http://localhost:8080/mcp"
                     value={newServerAddress}
-                    onChange={(e) => setNewServerAddress(e.target.value)}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewServerAddress(e.target.value)}
                   />
                 </div>
                 <div className="grid w-full items-center gap-1.5">

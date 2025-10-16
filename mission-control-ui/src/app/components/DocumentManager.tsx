@@ -1,7 +1,15 @@
 // mission-control-ui/src/app/components/DocumentManager.tsx
 "use client";
 
-import { useState, useRef, useEffect, ReactNode } from "react";
+// --- CHANGE 1: Import React types for props and events ---
+import {
+  useState,
+  useRef,
+  useEffect,
+  ReactNode,
+  ComponentProps,
+  ChangeEvent,
+} from "react";
 import {
   FileText,
   PlusCircle,
@@ -19,42 +27,29 @@ import {
   addDocument,
   updateDocument,
   deleteDocument,
-} from "@/lib/api"; // Adjust this path to your api.ts file
+} from "@/lib/api";
 
-// --- UI Components ---
-const Input = ({
-  className = "",
-  ...props
-}: {
-  className?: string;
-  [key: string]: any;
-}) => (
+// --- UI Components with Strict Typing ---
+
+// --- CHANGE 2: Use ComponentProps<'input'> instead of a generic object with `any` ---
+// This provides full type safety and autocomplete for all valid <input> attributes.
+const Input = ({ className = "", ...props }: ComponentProps<"input">) => (
   <input
     className={`flex h-10 w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-zinc-900 ${className}`}
     {...props}
   />
 );
 
-const Textarea = ({
-  className = "",
-  ...props
-}: {
-  className?: string;
-  [key: string]: any;
-}) => (
+// --- CHANGE 3: Use ComponentProps<'textarea'> for the Textarea component ---
+const Textarea = ({ className = "", ...props }: ComponentProps<"textarea">) => (
   <textarea
     className={`flex min-h-[250px] w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-zinc-900 ${className}`}
     {...props}
   />
 );
 
-const Label = ({
-  children,
-  ...props
-}: {
-  children: ReactNode;
-  [key: string]: any;
-}) => (
+// --- CHANGE 4: Use ComponentProps<'label'> for the Label component ---
+const Label = ({ children, ...props }: ComponentProps<"label">) => (
   <label className="text-sm font-medium leading-none text-zinc-400" {...props}>
     {children}
   </label>
@@ -177,9 +172,7 @@ export function DocumentManager() {
   const renderListView = () => (
     <>
       <div className="flex justify-between items-center mb-4">
-        <h3 className="text-lg font-semibold text-zinc-200">
-          All Documents
-        </h3>
+        <h3 className="text-lg font-semibold text-zinc-200">All Documents</h3>
         <button
           onClick={handleNewDocument}
           className={`${baseButtonClasses} px-3 py-1 text-sm bg-indigo-600 hover:bg-indigo-700 text-white`}
@@ -240,7 +233,8 @@ export function DocumentManager() {
               id="doc-name"
               placeholder="My Document"
               value={currentDocument.name}
-              onChange={(e) =>
+              // --- CHANGE 5: Type the event object for the input's onChange handler ---
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
                 setCurrentDocument({ ...currentDocument, name: e.target.value })
               }
             />
@@ -251,7 +245,8 @@ export function DocumentManager() {
               id="doc-content"
               placeholder="Type your content here..."
               value={currentDocument.content}
-              onChange={(e) =>
+              // --- CHANGE 6: Type the event object for the textarea's onChange handler ---
+              onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
                 setCurrentDocument({
                   ...currentDocument,
                   content: e.target.value,

@@ -1,16 +1,21 @@
 // app/components/TaskList.tsx
 
 import { StatusBadge } from "./StatusBadge";
+// --- CHANGE 1: Import the shared Task interface from TaskInspector ---
+import { Task } from "@/lib/types";
+
+// --- CHANGE 2: Create a specific props interface for clarity ---
+interface TaskListProps {
+  tasks: Task[];
+  selectedTaskId: string | null;
+  onSelectTask: (id: string) => void;
+}
 
 export const TaskList = ({
   tasks,
   selectedTaskId,
   onSelectTask,
-}: {
-  tasks: any[];
-  selectedTaskId: string | null;
-  onSelectTask: (id: string) => void;
-}) => {
+}: TaskListProps) => { // --- CHANGE 3: Apply the new props interface ---
   if (tasks.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-zinc-500 text-center p-4 max-w-[20rem]">
@@ -25,6 +30,7 @@ export const TaskList = ({
   return (
     <div className="flex flex-col gap-2 h-[calc(100vh-520px] w-[35rem] overflow-y-auto">
       <h2 className="text-lg font-bold text-zinc-300 px-2 mb-2">Task Swarm</h2>
+      {/* No changes needed below, TypeScript now understands `task` is of type `Task` */}
       {tasks.map((task) => (
         <button
           key={task.id}

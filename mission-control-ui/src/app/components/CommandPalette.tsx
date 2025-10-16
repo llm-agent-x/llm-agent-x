@@ -1,18 +1,37 @@
 // app/components/CommandPalette.tsx
 
-import { useState } from "react";
+// --- CHANGE 1: Import ChangeEvent for typing input events ---
+import { useState, ChangeEvent } from "react";
 import { sendDirective } from "@/lib/api";
 import {
   Play,
   Pause,
   X,
   Send,
-  Edit,
   MessageSquareQuoteIcon,
-} from "lucide-react"; // Import // app/components/TaskInspector.tsx
-
+} from "lucide-react";
 import { StatusBadge } from "./StatusBadge";
+import {CurrentQuestion} from "@/lib/types";
 
+// --- CHANGE 2: Define strict types for your data structures ---
+interface UserQuestion {
+  priority: number;
+  question: string;
+  details: Record<string, unknown>; // Use `unknown` for better type safety than `any`
+}
+
+interface Task {
+  id: string;
+  desc: string;
+  status: string;
+  deps: string[];
+  result: string | null;
+  human_directive: string | null;
+  current_question: CurrentQuestion | null;
+  user_response: string | null;
+}
+
+// --- DetailRow component remains the same, its types are already good ---
 const DetailRow = ({
   label,
   value,
@@ -26,7 +45,8 @@ const DetailRow = ({
   </div>
 );
 
-export const TaskInspector = ({ task }: { task: any | null }) => {
+// --- CHANGE 3: Apply the strict `Task` type to the `task` prop ---
+export const TaskInspector = ({ task }: { task: Task | null }) => {
   if (!task) {
     return (
       <div className="flex items-center justify-center h-full bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 text-zinc-400">
@@ -35,6 +55,7 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
     );
   }
 
+  // No change needed here, this is a safe type guard
   const depsArray = Array.isArray(task.deps) ? task.deps : [];
 
   return (
@@ -106,24 +127,27 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
   );
 };
 
+// --- CHANGE 4: Define a specific props interface for CommandPalette ---
+interface CommandPaletteProps {
+  taskId: string;
+  taskStatus: string;
+  currentQuestion: CurrentQuestion | null;
+}
+
 export const CommandPalette = ({
   taskId,
   taskStatus,
   currentQuestion,
-}: {
-  taskId: string;
-  taskStatus: string;
-  currentQuestion: any | null;
-}) => {
+}: CommandPaletteProps) => {
   const [redirectInput, setRedirectInput] = useState("");
   const [overrideInput, setOverrideInput] = useState("");
-  const [answerInput, setAnswerInput] = useState(""); // New state for answer
+  const [answerInput, setAnswerInput] = useState("");
 
   const handleCommand = async (command: string, payload?: string) => {
     await sendDirective(taskId, command, payload);
     setRedirectInput("");
     setOverrideInput("");
-    setAnswerInput(""); // Clear answer input after sending
+    setAnswerInput("");
   };
 
   return (
@@ -132,7 +156,6 @@ export const CommandPalette = ({
         Operator Directives
       </h3>
 
-      {/* Conditional Question Answering UI */}
       {taskStatus === "waiting_for_user_response" && currentQuestion ? (
         <div className="bg-orange-900/30 border border-orange-700 p-3 rounded-md mb-4 animate-pulse">
           <div className="flex items-center gap-2 mb-2 text-orange-200">
@@ -148,7 +171,10 @@ export const CommandPalette = ({
             <input
               type="text"
               value={answerInput}
-              onChange={(e) => setAnswerInput(e.target.value)}
+              // --- CHANGE 5: Type the `onChange` event handler ---
+              onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                setAnswerInput(e.target.value)
+              }
               placeholder="Type your answer here..."
               className="w-full bg-zinc-800 border border-orange-600 rounded-md p-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none"
               required
@@ -205,7 +231,10 @@ export const CommandPalette = ({
           <input
             type="text"
             value={redirectInput}
-            onChange={(e) => setRedirectInput(e.target.value)}
+            // --- CHANGE 6: Type the `onChange` event handler ---
+            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+              setRedirectInput(e.target.value)
+            }
             placeholder="Describe the correction..."
             className="w-full bg-zinc-800 border border-zinc-700 rounded-md p-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none"
           />

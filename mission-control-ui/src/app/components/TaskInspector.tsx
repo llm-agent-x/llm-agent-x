@@ -3,7 +3,9 @@
 import { format, parseISO } from "date-fns";
 import { StatusBadge } from "./StatusBadge";
 import { CommandPalette } from "./CommandPalette";
+import {Task} from "@/lib/types";
 
+// The DetailRow component is already well-typed, no changes needed
 const DetailRow = ({
   label,
   value,
@@ -17,8 +19,8 @@ const DetailRow = ({
   </div>
 );
 
-const DocumentDetails = ({ task }: { task: any }) => {
-  // ... (This component remains unchanged)
+// --- CHANGE 2: Apply the strict `Task` type to the `task` prop in DocumentDetails ---
+const DocumentDetails = ({ task }: { task: Task }) => {
   if (!task.document_state) {
     return (
       <DetailRow
@@ -62,8 +64,8 @@ const DocumentDetails = ({ task }: { task: any }) => {
   );
 };
 
-// --- MODIFIED MAIN COMPONENT ---
-export const TaskInspector = ({ task }: { task: any | null }) => {
+// --- CHANGE 3: Apply the strict `Task` type to the `task` prop in TaskInspector ---
+export const TaskInspector = ({ task }: { task: Task | null }) => {
   if (!task) {
     return (
       <div className="flex items-center justify-center h-full bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 text-zinc-400">
@@ -72,14 +74,12 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
     );
   }
 
+  // This type guard is still useful and correct
   const depsArray = Array.isArray(task.deps) ? task.deps : [];
 
   return (
-    // --- START OF FIX ---
-    // 1. Change to a flex column layout.
-    // 2. Remove `overflow-y-auto` from this main container.
     <div className="bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 h-full flex flex-col gap-4">
-      {/* Header Section (will not grow) */}
+      {/* Header Section */}
       <div>
         <div className="flex justify-between items-start mb-1">
           <h2 className="text-xl font-bold text-zinc-100 pr-4">{task.desc}</h2>
@@ -89,8 +89,6 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
       </div>
 
       {/* Scrollable Details Section */}
-      {/* 3. This wrapper will grow to fill space and handle its own scrolling. */}
-      {/* `min-h-0` is a crucial flexbox trick to allow shrinking. */}
       <div className="flex-grow overflow-y-auto min-h-0 pr-2 -mr-2">
         <dl>
           <DetailRow
@@ -122,7 +120,7 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
               label="Active Human Directive"
               value={
                 <span className="bg-blue-900/50 text-blue-300 p-2 rounded-md block animate-pulse">
-                  {task.human_directive}
+                  {task.human_directive.instruction}
                 </span>
               }
             />
@@ -151,7 +149,7 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
         </dl>
       </div>
 
-      {/* Footer Command Palette Section (will not grow) */}
+      {/* Footer Command Palette Section */}
       <div className="flex-shrink-0">
         <CommandPalette
           taskId={task.id}
@@ -159,7 +157,6 @@ export const TaskInspector = ({ task }: { task: any | null }) => {
           currentQuestion={task.current_question}
         />
       </div>
-      {/* --- END OF FIX --- */}
     </div>
   );
 };

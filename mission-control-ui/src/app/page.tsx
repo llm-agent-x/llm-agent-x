@@ -10,6 +10,7 @@ import { NewTaskForm } from "./components/NewTaskForm";
 import { DAGView } from "./components/DAGView";
 import { McpServerManager, McpServer } from "./components/McpServerManager";
 import { DocumentManager } from "./components/DocumentManager";
+import {Task} from "@/lib/types";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -31,7 +32,7 @@ const LOCAL_STORAGE_KEY = "mcpServers";
 
 export default function MissionControl() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [tasks, setTasks] = useState<{ [key: string]: any }>({});
+  const [tasks, setTasks] = useState<{ [key: string]: Task }>({});
   const [isConnected, setIsConnected] = useState(false);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
 
@@ -160,7 +161,7 @@ export default function MissionControl() {
       console.log("Disconnected from gateway.");
       setIsConnected(false);
     };
-    const onTaskUpdate = (data: { task: any }) => {
+    const onTaskUpdate = (data: { task: Task }) => {
       if (data && data.task) {
         setTasks((prevTasks) => ({
           ...prevTasks,
