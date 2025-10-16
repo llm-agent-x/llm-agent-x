@@ -1,174 +1,195 @@
-# Python API Usage
+# Gateway API Reference
 
-LLM Agent X offers two distinct agent architectures for programmatic use, each suited for different kinds of tasks.
+When running in interactive mode, LLM Agent X exposes a **Gateway** service. This service provides a REST API for controlling the agent and managing documents, and a Socket.IO endpoint for receiving real-time state updates. This is the primary programmatic interface for the application.
 
-*   **`RecursiveAgent`**: A hierarchical agent that excels at tasks that can be broken down into a clear, tree-like structure. It operates by recursively decomposing a task into sub-tasks until they are simple enough to be executed directly. This is the original agent architecture and is ideal for straightforward, structured problems.
+## REST API
 
-*   **`DAGAgent`**: An evolution of the recursive model, the `DAGAgent` (Directed Acyclic Graph Agent) treats tasks as nodes in a graph. This allows for complex, non-linear dependencies where a task can depend on multiple other tasks, not just a single parent. It features a more sophisticated, multi-phase planning and execution process, making it suitable for complex problems that require adaptation and overcoming uncertainty.
-
-*   **`InteractiveDAGAgent`**: A specialized version of the `DAGAgent` designed to run as a persistent service. It communicates via a message queue to receive real-time commands and broadcast state updates, enabling human-in-the-loop control and monitoring. For details, see the **[Interactive Mode](./interactive_mode.md)** documentation.
-
-This guide covers the API for the `RecursiveAgent` and the standard `DAGAgent`.
-
-## `RecursiveAgent`
-
-The `RecursiveAgent` is the original hierarchical agent in LLM Agent X. It's ideal for tasks that can be neatly broken down into a tree of sub-tasks.
-
-### Core Concepts (`RecursiveAgent`)
-
--   **`RecursiveAgent`**: The main class that takes a task, decomposes it if necessary, and executes it.
--   **`RecursiveAgentOptions`**: A Pydantic model to configure the behavior of `RecursiveAgent`.
--   **Task Limits**: A configuration (`task_limits`) that defines how many subtasks can be created at each level of recursion, controlling the shape of the execution tree.
-
-### Getting Started (`RecursiveAgent`)
-
-Here's a basic example of how to use `RecursiveAgent`:
-
-```python
-import asyncio
-from llm_agent_x.agents.recursive_agent import RecursiveAgent, RecursiveAgentOptions, TaskLimit
-from pydantic_ai.models.openai import OpenAIModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from openai import AsyncOpenAI
-from llm_agent_x.tools.brave_web_search import brave_web_search
-
-async def main():
-    # 1. Configure the LLM
-    client = AsyncOpenAI()
-    llm = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
-
-    # 2. Define Agent Options
-    agent_options = RecursiveAgentOptions(
-        llm=llm,
-        tools=[brave_web_search],
-        tools_dict={"web_search": brave_web_search},
-        task_limits=TaskLimit.from_array([2, 1, 0]), # Max 2 subtasks, then 1, then 0
-    )
-
-    # 3. Create and Run the Agent
-    agent = RecursiveAgent(
-        task="Research the benefits of renewable energy sources and summarize them.",
-        u_inst="Focus on solar and wind power. Keep the summary concise.",
-        agent_options=agent_options,
-    )
-    result = await agent.run()
-    print(result)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-### `RecursiveAgentOptions`
-
-This Pydantic model holds the configuration for a `RecursiveAgent`. Key fields include:
--   `llm`, `tools`, `tools_dict`, `task_limits`.
--   `merger`: The strategy for merging results from subtasks (`LLMMerger`, `AppendMerger`).
--   `pre_task_executed`, `on_task_executed`: Callbacks for monitoring the agent's lifecycle.
+The Gateway's REST API is the entry point for creating tasks, managing documents, and sending commands (directives) to the agent swarm.
 
 ---
 
-## `DAGAgent`
+### Task Management
 
-The `DAGAgent` provides a more powerful and flexible approach to task execution by modeling the workflow as a Directed Acyclic Graph (DAG). This is ideal for complex scenarios where tasks have intricate dependencies.
+#### `GET /api/tasks`
 
-### Core Concepts (`DAGAgent`)
+-   **Description:** Retrieves a snapshot of the current state of all tasks and documents known to the Gateway.
+-   **Method:** `GET`
+-   **Response (200 OK):** A JSON object where keys are task IDs and values are the full task state objects.
+    ```json
+    {
+      "tasks": {
+        "TASK_ID_1": {
+          "id": "TASK_ID_1",
+          "desc": "Description of the task...",
+          "status": "running",
+          "..." : "..."
+        }
+      }
+    }
+    ```
 
--   **`TaskRegistry`**: The central hub for a `DAGAgent`'s operation. It holds all tasks, documents, and their states (e.g., pending, running, complete). You initialize a registry and populate it with initial data and root tasks.
--   **`Task`**: A Pydantic model representing a single node in the graph. Each task has a unique ID, a description, a status, and a set of dependencies on other tasks.
--   **Hybrid Planning**: The `DAGAgent` uses a two-stage planning process:
-    1.  **Initial Planning (Top-Down)**: When a task is marked with `needs_planning=True`, a "planner" agent creates an initial, high-level execution plan, breaking the root task into several sub-tasks with defined dependencies.
-    2.  **Adaptive Decomposition (Bottom-Up)**: During execution, a task can be flagged with `can_request_new_subtasks=True`. If such a task is still too complex, an "explorer" agent can propose a new set of more granular sub-tasks. These are then reviewed and integrated into the main graph.
+#### `POST /api/tasks`
 
-### Getting Started with `DAGAgent`
+-   **Description:** Creates a new root task for the agent to begin working on.
+-   **Method:** `POST`
+-   **Request Body:**
+    ```json
+    {
+      "desc": "The high-level objective for the agent.",
+      "mcp_servers": [] // Optional: configuration for MCP servers
+    }
+    ```
+-   **Response (200 OK):**
+    ```json
+    { "status": "new task submitted" }
+    ```
 
-Here is a typical workflow for using the `DAGAgent`:
+#### `POST /api/tasks/{task_id}/directive`
 
-```python
-import asyncio
-from llm_agent_x.agents.dag_agent import DAGAgent, TaskRegistry, Task
-from llm_agent_x.tools.brave_web_search import brave_web_search # Example tool
-
-async def run_dag_agent():
-    # 1. Initialize the Task Registry
-    registry = TaskRegistry()
-
-    # 2. Add Initial Data (Optional)
-    registry.add_document(
-        "Financial_Report_Q1",
-        "Q1 revenue was $1.2M with a profit of $200k."
-    )
-    registry.add_document(
-        "Market_Analysis_Q1",
-        "Competitor A launched a new product, impacting our market share by 5%."
-    )
-
-    # 3. Define the Root Task
-    root_task = Task(
-        id="ROOT_Q1_BRIEFING",
-        desc="Create a comprehensive investor briefing for Q1. First, plan to analyze financial reports and market data. Then, synthesize the findings into a summary.",
-        needs_planning=True,
-    )
-    registry.add_task(root_task)
-
-    # 4. Initialize and Configure the DAGAgent
-    agent = DAGAgent(
-        registry=registry,
-        llm_model="gpt-4o-mini",
-        tools=[brave_web_search]
-    )
-
-    # 5. Run the Agent
-    await agent.run()
-
-    # 6. Retrieve the Final Result
-    final_result_task = registry.tasks.get("ROOT_Q1_BRIEFING")
-    if final_result_task and final_result_task.status == 'complete':
-        print("\n--- Agent's Final Report ---")
-        print(final_result_task.result)
-    else:
-        print(f"Agent failed to complete the root task. Status: {final_result_task.status}")
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-### `TaskRegistry`
-
-The `TaskRegistry` is the cornerstone of the `DAGAgent`.
-
--   `registry.add_task(task: Task)`: Adds a new task to the registry.
--   `registry.add_document(name: str, content: dict) -> str`: Adds a data source as a completed task. Returns the unique ID of the document task.
--   `registry.add_dependency(task_id: str, dep_id: str)`: Manually creates a dependency between two tasks.
-
-### `Task` Model
-
-The `Task` model has several key fields for controlling execution:
-
--   `id` (str): A unique identifier for the task.
--   `desc` (str): The description of what needs to be done.
--   `deps` (Set[str]): A set of other task IDs that this task depends on.
--   `status` (str): The current lifecycle status (e.g., `pending`, `running`, `complete`, `failed`).
--   `result` (Optional[str]): The output of the task once completed.
--   `needs_planning` (bool): If `True`, the agent will first create a sub-plan to execute this task.
--   `can_request_new_subtasks` (bool): If `True`, the agent can propose new, more granular sub-tasks during execution if it deems it necessary.
+-   **Description:** Sends a specific control command (a "directive") to a running task.
+-   **Method:** `POST`
+-   **URL Parameter:** `task_id` - The ID of the task to control.
+-   **Request Body:**
+    ```json
+    {
+      "command": "DIRECTIVE_NAME",
+      "payload": "..." // Value depends on the command
+    }
+    ```
+-   **Response (200 OK):**
+    ```json
+    { "status": "directive sent" }
+    ```
 
 ---
 
-## Common Concepts
+### Document Management
 
-### Tools
+#### `GET /api/documents`
 
-Both `RecursiveAgent` and `DAGAgent` can be equipped with tools. Tools are standard Python functions that the agent can choose to execute to gather information or perform actions.
+-   **Description:** Retrieves a list of all current documents in the system.
+-   **Method:** `GET`
+-   **Response (200 OK):** An array of document objects.
+    ```json
+    [
+      {
+        "id": "DOC_ID_1",
+        "name": "My Report",
+        "content": "The content of the document..."
+      }
+    ]
+    ```
 
--   **Signature**: Tools should be well-documented with type hints and clear docstrings.
--   **Registration**:
-    -   For `RecursiveAgent`, provide tools to `RecursiveAgentOptions` via the `tools` list and `tools_dict`.
-    -   For `DAGAgent`, provide a list of tool functions to the constructor via the `tools` argument.
+#### `POST /api/documents`
 
-### Error Handling
+-   **Description:** Adds a new document to the agent's context.
+-   **Method:** `POST`
+-   **Request Body:**
+    ```json
+    {
+      "name": "New Document Name",
+      "content": "The text content of the document."
+    }
+    ```
+-   **Response (200 OK):**
+    ```json
+    { "status": "new document submitted" }
+    ```
 
-Both agents can fail. It's good practice to wrap the `agent.run()` call in a `try...except` block to handle any exceptions gracefully.
+#### `PUT /api/documents/{document_id}`
 
-### Tracing with OpenTelemetry
+-   **Description:** Updates the name and/or content of an existing document.
+-   **Method:** `PUT`
+-   **URL Parameter:** `document_id` - The ID of the document to update.
+-   **Request Body:**
+    ```json
+    {
+      "name": "Updated Document Name",
+      "content": "New and updated content."
+    }
+    ```
+-   **Response (200 OK):**
+    ```json
+    { "status": "update directive sent" }
+    ```
 
-Both agents are instrumented with OpenTelemetry. If you configure an OpenTelemetry tracer, you can visualize the execution flow in compatible systems like Jaeger or Arize Phoenix.
+#### `DELETE /api/documents/{document_id}`
+
+-   **Description:** Deletes a document from the agent's context. This is a destructive action.
+-   **Method:** `DELETE`
+-   **URL Parameter:** `document_id` - The ID of the document to delete.
+-   **Response (200 OK):**
+    ```json
+    { "status": "delete directive sent" }
+    ```
+
+---
+
+### State Management
+
+#### `GET /api/state/download`
+
+-   **Description:** Downloads the entire current graph state (all tasks and documents) as a JSON file.
+-   **Method:** `GET`
+-   **Response (200 OK):** A JSON file attachment containing the full `task_state_cache`.
+
+#### `POST /api/state/upload`
+
+-   **Description:** Uploads a JSON state file to completely reset and replace the agent's current graph.
+-   **Method:** `POST`
+-   **Request Body:** A multipart/form-data request with a single file field named `file`.
+-   **Response (200 OK):**
+    ```json
+    { "status": "State upload directive sent successfully." }
+    ```
+
+---
+
+### System Health
+
+#### `GET /health`
+
+-   **Description:** A simple health check endpoint to verify that the Gateway service is running.
+-   **Method:** `GET`
+-   **Response (200 OK):**
+    ```json
+    { "status": "healthy" }
+    ```
+
+---
+
+## Available Directives
+
+Directives are the core mechanism for interacting with an individual task. They are sent to the `/api/tasks/{task_id}/directive` endpoint.
+
+| Command              | Payload                                                     | Description                                                                                                                              |
+| -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `PAUSE`              | `null`                                                      | Pauses the execution of the specified task. The task's state is preserved.                                                               |
+| `RESUME`             | `null`                                                      | Resumes a task that was previously paused by a human operator.                                                                           |
+| `ANSWER_QUESTION`    | `string`                                                    | Provides an answer to a question the agent asked when it entered the `waiting_for_user_response` state. The agent will consume the answer and resume. |
+| `REDIRECT`           | `string`                                                    | Provides a new instruction or clarification to the task. This forces the agent to re-evaluate its approach.                              |
+| `MANUAL_OVERRIDE`    | `string`                                                    | Forces a task to be marked as `complete` and sets its result to the provided payload. This is useful for manually completing a step.    |
+| `CANCEL`             | `string` (optional reason)                                  | **Soft-deletes** a task by marking its status as `cancelled`. The task remains in the graph but is removed from the active execution flow. |
+| `PRUNE_TASK`         | `string` (optional reason)                                  | **Hard-deletes** a task by permanently removing it and all its children from the graph. This is a destructive action.              |
+| `TERMINATE`          | `string` (optional reason)                                  | Forcibly marks a task as `failed`.                                                                                                       |
+
+## Socket.IO Events
+
+The Gateway broadcasts state changes from the agent worker via Socket.IO, allowing a UI or other clients to update in real-time.
+
+-   **Event:** `task_update`
+-   **Description:** Emitted whenever a task's state changes. This is the primary event for monitoring the system.
+-   **Payload:** A JSON object containing the complete, updated state of a single task.
+    ```json
+    {
+      "task": {
+        "id": "TASK_ID",
+        "desc": "Task description",
+        "status": "running",
+        "result": null,
+        "children": ["CHILD_ID_1"],
+        // ... and all other fields from the Task model
+      }
+    }
+    ```
+Clients should listen for this event to receive the latest state of any task that has been modified by the agent worker.

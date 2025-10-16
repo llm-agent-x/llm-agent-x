@@ -2,33 +2,39 @@
 
 ## Overview
 
-LLM Agent X is a task execution framework that leverages language models to perform complex tasks by recursively decomposing them into subtasks and using tools like web search.
+LLM Agent X is an interactive, multi-agent framework for performing complex tasks with real-time human supervision. It uses a message-driven architecture to coordinate between a user interface, a gateway, and one or more agent workers, all managed within a Dockerized environment.
 
-This documentation provides a comprehensive guide to installing, using, and understanding LLM Agent X.
+## Core Concepts
+
+The application is composed of three primary services that work together:
+
+-   **Mission Control UI:** A web interface for launching new objectives, visualizing the agent's task graph, inspecting progress, and providing real-time commands and feedback to the agent.
+-   **Gateway:** A central API server that handles all communication. It exposes a REST API for commands and a Socket.IO endpoint for broadcasting real-time state updates from the agent.
+-   **Agent Worker:** The "brain" of the system. This service runs the `InteractiveDAGAgent`, which listens for tasks, executes its planning and action cycles, and publishes its state changes back to the Gateway.
 
 ## Key Features
 
-*   **Recursive Task Decomposition:** Breaks down complex tasks into smaller, manageable subtasks.
-*   **Tool Usage:** Can utilize external tools like web search (Brave Search) and Python code execution.
-*   **Configurable:** Offers various options to customize agent behavior, including LLM choice, task limits, and result merging strategies.
-*   **Extensible:** Designed to be integrated into other Python projects.
-*   **Optional Sandbox:** Provides an isolated Docker environment for safe Python code execution.
-*   **Real-time Tree View:** Offers a console-based visualization of the task execution flow.
+-   **Interactive DAG Agent**: A persistent agent that models tasks as a graph, allowing for adaptive planning and execution.
+-   **Real-time UI**: A web-based "Mission Control" for launching tasks, visualizing the task graph, and providing real-time guidance.
+-   **Dockerized Environment**: The entire application stack is containerized for easy setup and deployment with Docker Compose.
+-   **Human-in-the-Loop Control**: Operators can pause, resume, cancel, and redirect tasks, or answer questions posed by the agent.
+-   **REST & Socket.IO API**: The gateway provides programmatic access for custom integrations and real-time state monitoring.
 
 ## Getting Started
 
--   **[Installation](./installation.md):** Learn how to install LLM Agent X and set up your environment.
--   **[Command-Line Interface (CLI)](./cli.md):** Understand how to use the `llm-agent-x` command-line tool.
--   **[API Usage](./api.md):** Discover how to use LLM Agent X programmatically in your own projects.
--   **[Interactive Mode](./interactive_mode.md):** Learn how to run the agent as a persistent service with a UI.
--   **[Python Sandbox](./sandbox.md):** Find out more about the optional Python execution sandbox.
--   **[Examples](./examples.md):** See practical examples of how LLM Agent X can be used.
+The recommended way to use LLM Agent X is through its interactive mode, which provides a full user interface. Start here to get the application running in minutes.
 
-## Dependencies
+1.  **[Running the Application](./installation.md):** The primary guide to set up and run the entire LLM Agent X stack using Docker.
+2.  **[Usage Examples](./examples.md):** See practical examples of how to use the Mission Control UI to manage agents and documents.
 
-Project dependencies are managed with Poetry and are listed in the `pyproject.toml` file.
+## For Developers & Advanced Users
 
-> ⚠️ `torch` is optional in Poetry but **required** at runtime. You must install the correct version for your hardware manually using the appropriate `--index-url`.
+Once you have the application running, you may want to understand its architecture or integrate with it programmatically.
+
+-   **[Interactive Mode Architecture](./interactive_mode.md):** An in-depth look at how the services work together.
+-   **[Gateway API Reference](./api.md):** Detailed documentation for the REST and Socket.IO API for custom integrations.
+-   **[Python Sandbox](./sandbox.md):** Learn about the optional sandbox for safe code execution.
+-   **[Legacy CLI & Examples](./cli.md):** Documentation for the original, non-interactive command-line tool.
 
 ## License
 
