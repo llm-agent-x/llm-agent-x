@@ -1,104 +1,100 @@
-# Examples
+# Programmatic Usage Examples
 
-This page provides examples of how to use LLM Agent X, both from the command line and programmatically. For a more comprehensive set of examples, including sample outputs, please refer to the [`samples`](../samples/) directory in the repository.
+This page provides code examples for developers who want to integrate with or build upon the LLM Agent X framework.
 
-## Command-Line Interface (CLI) Examples
+For the best experience, it is recommended to run the full application stack via Docker Compose (see **[Running the Application](./installation.md)**) and interact with it through the Gateway API. Using the agent library directly is an advanced use case for custom implementations.
 
-These examples demonstrate common use cases for the `llm-agent-x` CLI tool. See the [CLI Documentation](./cli.md) for a full list of arguments.
+## 1. Interacting with the Gateway API (Recommended)
 
-### Recursive Agent
+These examples demonstrate how to create a Python client to communicate with the running Gateway service.
 
-The `recursive` agent is well-suited for tasks that can be broken down into a hierarchy of sub-tasks.
+### Example 1.1: Launching a New Task via REST API
 
-1.  **Basic Research Task:**
-    Ask the agent to research a topic. It will use its search tool and decompose the task as needed.
-    ```sh
-    llm-agent-x recursive "Research the impact of renewable energy on climate change mitigation."
-    ```
+This script sends a request to the Gateway to create a new root task.
 
-2.  **Controlling Task Decomposition:**
-    Use `--task_limit` to control how many subtasks can be generated at each level.
-    ```sh
-    llm-agent-x recursive "Develop a brief marketing plan for a new eco-friendly coffee shop." --task_limit "[2,2,0]"
-    ```
-    This allows 2 subtasks at the first level, 2 sub-subtasks for each of those, and no further decomposition.
+```python
+import requests
+import json
 
-3.  **Enabling Python Execution (with Sandbox):**
-    Allow the agent to write and execute Python code.
-    ```sh
-    llm-agent-x recursive "Write a Python script to calculate the factorial of 5 and explain the code." --enable-python-execution
-    ```
+GATEWAY_URL = "http://localhost:8000"
 
-### DAG Agent
+def launch_new_task(description: str):
+    """Sends a new task description to the agent gateway."""
+    try:
+        response = requests.post(
+            f"{GATEWAY_URL}/api/tasks",
+            json={"desc": description}
+        )
+        response.raise_for_status()  # Raises an exception for bad status codes
+        print("Successfully submitted new task:")
+        print(json.dumps(response.json(), indent=2))
+    except requests.exceptions.RequestException as e:
+        print(f"Error submitting task: {e}")
 
-The `dag` (Directed Acyclic Graph) agent excels at tasks with complex dependencies that don't fit a simple hierarchical structure.
+if __name__ == "__main__":
+    task_desc = "Investigate the current state of quantum computing hardware and create a summary report."
+    launch_new_task(task_desc)
+```
 
-1.  **Analysis from Pre-defined Documents:**
-    The `dag` agent often starts with a set of initial data sources. First, create a `docs.json` file:
-    ```json
-    [
-      {"name": "Q2_Revenue", "content": "Q2 2024 Revenue: $50M, Net Profit: $10M."},
-      {"name": "Q2_Sales_Report", "content": "The new product line accounted for 80% of sales growth."}
-    ]
-    ```
-    Then, run the agent, pointing to your documents:
-    ```sh
-    llm-agent-x dag "Analyze Q2 financial performance and create a summary." --dag-documents docs.json --output q2_summary.md
-    ```
+### Example 1.2: Monitoring State in Real-Time with Socket.IO
 
-2.  **Complex Research with Tool Use:**
-    The `dag` agent can also start without initial documents and rely entirely on tools. Here, we provide an empty list `[]` for the documents and enable web search (which is on by default).
-    ```sh
-    llm-agent-x dag "Investigate the supply chain of cobalt and its ethical implications." --dag-documents '[]'
-    ```
-
-## Python API Examples
-
-### RecursiveAgent API
-
-This example demonstrates a basic programmatic use of `RecursiveAgent`.
+This script connects to the Gateway's Socket.IO server to receive and print real-time `task_update` events.
 
 ```python
 import asyncio
-from llm_agent_x.agents.recursive_agent import RecursiveAgent, RecursiveAgentOptions, TaskLimit
-from pydantic_ai.models.openai import OpenAIModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from openai import AsyncOpenAI
-from llm_agent_x.tools.brave_web_search import brave_web_search
+import socketio
 
-async def run_recursive_agent():
-    client = AsyncOpenAI()
-    llm = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
+# Create a new Socket.IO client
+sio = socketio.AsyncClient()
+GATEWAY_URL = "http://localhost:8000"
 
-    agent_options = RecursiveAgentOptions(
-        llm=llm,
-        tools=[brave_web_search],
-        tools_dict={"web_search": brave_web_search},
-        task_limits=TaskLimit.from_array([2, 1, 0]),
-        allow_search=True,
-        allow_tools=True,
-        mcp_servers=[],
-    )
+@sio.event
+async def connect():
+    print("Successfully connected to the Gateway WebSocket.")
 
-    agent = RecursiveAgent(
-        task="Explore the pros and cons of remote work for software development teams.",
-        u_inst="Provide a balanced view with three points for each side.",
-        agent_options=agent_options
-    )
+@sio.event
+async def disconnect():
+    print("Disconnected from the Gateway WebSocket.")
 
-    print("--- Running RecursiveAgent ---")
-    result = await agent.run()
-    print("\n--- Agent's Final Report ---")
-    print(result)
-    print(f"\nEstimated Cost: ${agent.cost:.4f}")
+@sio.on("task_update")
+async def on_task_update(data):
+    """Handles incoming task_update events."""
+    task = data.get("task", {})
+    print(f"--- Task Update Received ---")
+    print(f"  ID:     {task.get('id')}")
+    print(f"  Status: {task.get('status')}")
+    print(f"  Desc:   {task.get('desc', '')[:70]}...")
+    print("-" * 26)
+
+
+async def main():
+    """Connects to the server and waits for events."""
+    try:
+        await sio.connect(GATEWAY_URL, socketio_path="/ws/socket.io")
+        print("Client is running. Press Ctrl+C to disconnect.")
+        await sio.wait()  # Wait indefinitely for events
+    except socketio.exceptions.ConnectionError as e:
+        print(f"Connection failed: {e}")
+    finally:
+        if sio.connected:
+            await sio.disconnect()
 
 if __name__ == "__main__":
-    asyncio.run(run_recursive_agent())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nClient shutting down.")
 ```
 
-### DAGAgent API
+---
 
-This example shows how to set up and run the `DAGAgent` programmatically.
+## 2. Using the Agent Library Directly (Advanced)
+
+These examples show how to import and run the agent classes directly within a Python script. This approach bypasses the Gateway/Worker architecture and is suitable for custom backends or standalone applications.
+
+### Example 2.1: Running the `DAGAgent`
+
+This shows the standard workflow for initializing and running the `DAGAgent` programmatically.
 
 ```python
 import asyncio
@@ -123,7 +119,7 @@ async def run_dag_agent():
     root_task = Task(
         id="ROOT_Q1_BRIEFING",
         desc="Create a comprehensive investor briefing for Q1. First, plan to analyze financial reports and market data. Then, synthesize the findings into a summary.",
-        needs_planning=True, # This tells the agent to start by creating a plan
+        needs_planning=True,
     )
     registry.add_task(root_task)
 
@@ -131,28 +127,71 @@ async def run_dag_agent():
     agent = DAGAgent(
         registry=registry,
         llm_model="gpt-4o-mini",
-        tools=[brave_web_search] # Provide tools for tasks that might need them
+        tools=[brave_web_search]
     )
 
+    # 5. Run the agent and wait for completion
     print("--- Running DAGAgent ---")
-    registry.print_status_tree() # Shows the initial state
-
     await agent.run()
 
+    # 6. Retrieve and print the final result
     print("\n--- DAG Execution Complete ---")
-    registry.print_status_tree() # Shows the final state
-
-    final_result = registry.tasks.get("ROOT_Q1_BRIEFING")
-    if final_result:
+    final_result_task = registry.tasks.get("ROOT_Q1_BRIEFING")
+    if final_result_task and final_result_task.status == 'complete':
         print("\n--- Agent's Final Report ---")
-        print(final_result.result)
-        total_cost = sum(t.cost for t in registry.tasks.values())
-        print(f"\nEstimated Cost: ${total_cost:.4f}")
+        print(final_result_task.result)
+    else:
+        print("Agent failed to complete the root task.")
 
 if __name__ == "__main__":
+    # Ensure OPENAI_API_KEY and BRAVE_API_KEY are set in your environment
     asyncio.run(run_dag_agent())
 ```
 
-## More Examples
+### Example 2.2: Running the `RecursiveAgent`
 
-For more detailed examples, including the structure of input tasks and the corresponding outputs generated by LLM Agent X, please see the files within the [`samples/`](../samples/) directory of the project repository.
+This example demonstrates a basic programmatic use of the legacy `RecursiveAgent`.
+
+```python
+import asyncio
+from llm_agent_x.agents.recursive_agent import RecursiveAgent, RecursiveAgentOptions, TaskLimit
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from openai import AsyncOpenAI
+from llm_agent_x.tools.brave_web_search import brave_web_search
+
+async def run_recursive_agent():
+    # 1. Configure the LLM and tools
+    client = AsyncOpenAI()
+    llm = OpenAIModel("gpt-4o-mini", provider=OpenAIProvider(openai_client=client))
+    tools_dict = {"web_search": brave_web_search}
+
+    # 2. Define Agent Options
+    agent_options = RecursiveAgentOptions(
+        llm=llm,
+        tools=[brave_web_search],
+        tools_dict=tools_dict,
+        task_limits=TaskLimit.from_array([2, 1, 0]),
+        allow_search=True,
+        allow_tools=True,
+        mcp_servers=[],
+    )
+
+    # 3. Create and Run the Agent
+    agent = RecursiveAgent(
+        task="Explore the pros and cons of remote work for software development teams.",
+        u_inst="Provide a balanced view with three points for each side.",
+        agent_options=agent_options
+    )
+
+    print("--- Running RecursiveAgent ---")
+    result = await agent.run()
+
+    # 4. Print the final result
+    print("\n--- Agent's Final Report ---")
+    print(result)
+
+if __name__ == "__main__":
+    # Ensure OPENAI_API_KEY and BRAVE_API_KEY are set in your environment
+    asyncio.run(run_recursive_agent())
+```
