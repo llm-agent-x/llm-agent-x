@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir poetry
 # Install tree for directory listing
 RUN apt-get update && apt-get install -y tree && apt-get clean
 
+COPY pyproject.toml poetry.lock ./
+
+RUN poetry lock
+
 # Copy all files first
 COPY . .
 

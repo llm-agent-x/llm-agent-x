@@ -1,0 +1,25 @@
+# Use an official Python runtime as a parent image
+FROM python:3.11-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Install poetry and dependencies
+RUN pip install poetry
+
+RUN poetry config virtualenvs.create false
+
+RUN poetry lock
+
+RUN poetry install --without dev --no-interaction --no-ansi --no-root
+
+# Copy the application code into the container
+COPY ./llm_agent_x ./llm_agent_x
+
+# No EXPOSE needed as the worker doesn't listen for external connections
+
+# Command to run the worker
+CMD ["poetry", "run", "llm-agent-x-worker"]

@@ -14,4 +14,67 @@ services:
         reservations:
           cpus: '0.5'
           memory: 2G
+  rabbitmq:
+    image: "rabbitmq:3.13-management" # Use the official image with the management UI
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"   # AMQP port for the services
+      - "15672:15672" # Management UI port for you to inspect queues
+    environment:
+      # Default user/pass is guest/guest. You can set them here for production.
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # The FastAPI + Socket.IO Gateway service
+  gateway:
+    build:
+      context: . # The root of your project
+      dockerfile: ./llm_agent_x/Dockerfile.gateway # Path to the gateway Dockerfile
+    container_name: gateway
+    ports:
+      - "8000:8000" # Map host port 8000 to container port 8000
+    environment:
+      - RABBITMQ_HOST=rabbitmq # IMPORTANT: Use the service name, not 'localhost'
+      - GATEWAY_RELOAD=false # Disable reload in Docker for stability
+    volumes:
+      # This is for development: it maps your local code into the container
+      # so you can see changes without rebuilding the image. Remove for production.
+      - ./llm_agent_x:/app/llm_agent_x
+    depends_on:
+      rabbitmq:
+        condition: service_healthy # Wait for RabbitMQ to be ready before starting
+
+  # The Agent Worker service
+  worker:
+    build:
+      context: .
+      dockerfile: ./llm_agent_x/Dockerfile.worker
+    container_name: worker
+    environment:
+      - RABBITMQ_HOST=rabbitmq # Also uses the service name
+      - OPENAI_API_KEY=${OPENAI_API_KEY} # Pass through environment variables from host
+      - BRAVE_API_KEY=${BRAVE_API_KEY}
+    volumes:
+      - ./llm_agent_x:/app/llm_agent_x # Also for development hot-reloading
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  # The Next.js UI service
+  ui:
+    build:
+      context: ./mission-control-ui # Build from the UI's directory
+      # You'll need a simple Dockerfile for the UI as well
+    container_name: ui
+    ports:
+      - "3000:3000"
+    environment:
+      # Ensures the Next.js app can talk to the gateway from the browser
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - gateway # Wait for the gateway to be up
