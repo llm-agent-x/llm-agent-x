@@ -1,0 +1,46 @@
+# ./Dockerfile.python
+
+# =====================================================================
+# Stage 1: "builder" - Our common dependency layer
+# This stage installs ALL python dependencies for the project.
+# =====================================================================
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install poetry, which is a build-time dependency
+RUN pip install poetry
+
+# Configure poetry to install dependencies into the system's python, not a venv
+RUN poetry config virtualenvs.create false
+
+# Copy ONLY the dependency definition files
+COPY pyproject.toml poetry.lock ./
+
+# Install all dependencies from the lock file.
+# This is the slowest step and will be cached aggressively by Docker.
+RUN poetry install --without dev --no-interaction --no-ansi --no-root
+
+
+# =====================================================================
+# Final Stages: One for each service
+# Each of these starts from our builder stage, which already has all dependencies.
+# =====================================================================
+
+# --- Gateway Image ---
+FROM builder AS gateway
+# All dependencies are already installed. Just copy the code.
+COPY ./llm_agent_x /app/llm_agent_x
+EXPOSE 8000
+CMD ["poetry", "run", "llm-agent-x-gateway"]
+
+# --- Worker Image ---
+FROM builder AS worker
+COPY ./llm_agent_x /app/llm_agent_x
+CMD ["poetry", "run", "llm-agent-x-worker"]
+
+# --- Sandbox Image ---
+FROM builder AS sandbox
+COPY ./sandbox /app/sandbox
+EXPOSE 5000
+CMD ["uvicorn", "sandbox.sandbox_api:app", "--host", "0.0.0.0", "--port", "5000"]

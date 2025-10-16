@@ -33,34 +33,33 @@ services:
   # The FastAPI + Socket.IO Gateway service
   gateway:
     build:
-      context: . # The root of your project
-      dockerfile: ./llm_agent_x/Dockerfile.gateway # Path to the gateway Dockerfile
+      context: .
+      dockerfile: Dockerfile.python # <-- Use the master Dockerfile
+      target: gateway              # <-- Build the "gateway" stage
     container_name: gateway
     ports:
-      - "8000:8000" # Map host port 8000 to container port 8000
+      - "8000:8000"
     environment:
-      - RABBITMQ_HOST=rabbitmq # IMPORTANT: Use the service name, not 'localhost'
-      - GATEWAY_RELOAD=false # Disable reload in Docker for stability
+      - RABBITMQ_HOST=rabbitmq
+      - GATEWAY_RELOAD=false
     volumes:
-      # This is for development: it maps your local code into the container
-      # so you can see changes without rebuilding the image. Remove for production.
       - ./llm_agent_x:/app/llm_agent_x
     depends_on:
       rabbitmq:
-        condition: service_healthy # Wait for RabbitMQ to be ready before starting
+        condition: service_healthy
 
-  # The Agent Worker service
   worker:
     build:
       context: .
-      dockerfile: ./llm_agent_x/Dockerfile.worker
+      dockerfile: Dockerfile.python # <-- Use the master Dockerfile
+      target: worker               # <-- Build the "worker" stage
     container_name: worker
     environment:
-      - RABBITMQ_HOST=rabbitmq # Also uses the service name
-      - OPENAI_API_KEY=${OPENAI_API_KEY} # Pass through environment variables from host
+      - RABBITMQ_HOST=rabbitmq
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - BRAVE_API_KEY=${BRAVE_API_KEY}
     volumes:
-      - ./llm_agent_x:/app/llm_agent_x # Also for development hot-reloading
+      - ./llm_agent_x:/app/llm_agent_x
     depends_on:
       rabbitmq:
         condition: service_healthy
