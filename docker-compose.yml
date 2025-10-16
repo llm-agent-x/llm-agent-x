@@ -67,13 +67,13 @@ services:
   # The Next.js UI service
   ui:
     build:
-      context: ./mission-control-ui # Build from the UI's directory
-      # You'll need a simple Dockerfile for the UI as well
+      context: ./mission-control-ui
+      # --- FIX: Simplified to just use the one correct Dockerfile ---
+      dockerfile: Dockerfile
     container_name: ui
     ports:
       - "3000:3000"
     environment:
-      # Ensures the Next.js app can talk to the gateway from the browser
       - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
-      - gateway # Wait for the gateway to be up
+      - gateway
