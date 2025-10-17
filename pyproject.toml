@@ -37,7 +37,10 @@ python-socketio = "^5.13.0"
 aio-pika = "^9.5.7"
 pydantic-ai-slim = {extras = ["mcp", "openai"], version = "^1.0.10"}
 
-# +++ ADD THIS NEW SECTION FOR DEVELOPMENT DEPENDENCIES +++
+# --- Dependencies from Sandbox ---
+fastapi = "^0.115.12"
+python-multipart = "*" # Needed for FastAPI file uploads
+
 [tool.poetry.group.dev.dependencies]
 black = "^25.1.0"
 

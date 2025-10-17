@@ -1,19 +1,19 @@
 services:
-  sandbox:
-    build:
-      context: ./sandbox
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./sandbox:/app
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 4G
-        reservations:
-          cpus: '0.5'
-          memory: 2G
+#  sandbox:
+#    build:
+#      context: ./sandbox
+#    ports:
+#      - "5000:5000"
+#    volumes:
+#      - ./sandbox:/app
+#    deploy:
+#      resources:
+#        limits:
+#          cpus: '1'
+#          memory: 4G
+#        reservations:
+#          cpus: '0.5'
+#          memory: 2G
   rabbitmq:
     image: "rabbitmq:3.13-management" # Use the official image with the management UI
     container_name: rabbitmq

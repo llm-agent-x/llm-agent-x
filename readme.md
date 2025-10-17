@@ -84,7 +84,6 @@ While the primary interface is the interactive UI, the underlying `llm-agent-x` 
 ## License
 
 This project is licensed under the MIT License.
-===== FILE: ./docs/api.md =====
 
 # Gateway API Reference
 
@@ -201,7 +200,6 @@ The Gateway broadcasts state changes from the agent worker via Socket.IO, allowi
     }
     ```
     Clients should listen for this event to receive the latest state of any task that has been modified by the agent worker.
-===== FILE: ./docs/cli.md =====
 
 # Legacy CLI
 
@@ -258,7 +256,6 @@ llm-agent-x <agent_type> "Your task description" [options]
     ```sh
     llm-agent-x dag "Analyze the Q2 financial performance and create a summary." --dag-documents documents.json --output q2_summary.md
     ```
-===== FILE: ./docs/examples.md =====
 
 # Usage Examples (Interactive Mode)
 
@@ -318,7 +315,6 @@ This example shows how to respond when an agent requires human input to proceed.
 5.  **Provide an Answer:** In the input box below the question, type your response:
     > `The brief is for the "QuantumLeap" product line. The target audience is enterprise-level CTOs.`
 6.  **Submit and Observe:** Click "Submit Answer". The agent will consume your response, and the task status will change back to `running` as it continues its work with the new information.
-===== FILE: ./docs/index.md =====
 
 # LLM Agent X Documentation
 
@@ -347,7 +343,6 @@ This documentation provides a comprehensive guide to running the application and
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](../LICENSE) file for details.
-===== FILE: ./docs/installation.md =====
 
 # Running the Application
 
@@ -422,7 +417,6 @@ You should see the Mission Control UI, ready to accept new tasks.
 ## Shutting Down
 
 To stop all the running services, press `Ctrl+C` in the terminal where `docker-compose` is running.
-===== FILE: ./docs/interactive_mode.md =====
 
 # Interactive Mode
 
