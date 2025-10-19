@@ -26,9 +26,6 @@ Dockerfile*
 
 # --- IGNORE ALL OTHER PROJECTS AND ASSETS ---
 
-# Ignore the entire Next.js UI project
-mission-control-ui/
-
 # Ignore the sandbox project
 sandbox/
 
