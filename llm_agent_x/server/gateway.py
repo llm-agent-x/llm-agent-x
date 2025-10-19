@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager  # <-- FIX: Import the async version
 from datetime import timezone, datetime
@@ -27,12 +28,25 @@ task_state_cache = {}
 main_event_loop = None
 pika_connection: BlockingConnection = None
 pika_connection_lock = threading.Lock()
+shutdown_event = threading.Event()
 
 DIRECTIVES_QUEUE = "directives_queue"
 
+def pika_heartbeat_thread():
+    """Periodically processes pika events to keep the publisher connection alive."""
+    while not shutdown_event.is_set():
+        try:
+            if pika_connection and pika_connection.is_open:
+                with pika_connection_lock:
+                    pika_connection.process_data_events()
+            time.sleep(10)  # Sleep for an interval shorter than the heartbeat
+        except Exception as e:
+            logger.error(f"Error in Gateway Pika heartbeat thread: {e}", exc_info=True)
+            break
+    logger.info("Gateway Pika heartbeat thread shutting down.")
 
 # --- FastAPI Lifespan Manager for Startup/Shutdown ---
-@asynccontextmanager  # <-- FIX: Use the async context manager decorator
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     global main_event_loop, pika_connection
     main_event_loop = asyncio.get_running_loop()
@@ -41,14 +55,20 @@ async def lifespan(app: FastAPI):
     listener_thread.start()
 
     try:
-        pika_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
+        # FIX: Add heartbeat=60 parameter to the connection
+        pika_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST, heartbeat=60))
         logger.info("Successfully established persistent RabbitMQ connection for publishing.")
+
+        # FIX: Start the heartbeat thread
+        heartbeat = threading.Thread(target=pika_heartbeat_thread, daemon=True)
+        heartbeat.start()
     except pika.exceptions.AMQPConnectionError as e:
         logger.critical(f"Failed to connect to RabbitMQ on startup: {e}")
         pika_connection = None
 
     yield
     # --- Code to run on shutdown ---
+    shutdown_event.set()
     if pika_connection and pika_connection.is_open:
         pika_connection.close()
         logger.info("Closed RabbitMQ publisher connection.")
