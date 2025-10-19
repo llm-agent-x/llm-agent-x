@@ -1,141 +1,46 @@
-# Interactive Mode
+# Interactive Mode Architecture
 
-LLM Agent X can be run as a persistent, interactive service. This mode is ideal for complex, long-running tasks that may require human supervision, intervention, or dynamic goal changes. It exposes a web server with a REST API and a real-time user interface for monitoring and controlling the agent's execution.
+LLM Agent X is designed to run as a persistent, interactive service. This mode is ideal for complex, long-running tasks that may require human supervision, intervention, or dynamic goal changes. The system is composed of several containerized services that work together, with a web UI for operator control.
 
 ## Architecture Overview
 
-The interactive mode operates on a distributed, two-component architecture:
+The interactive mode operates on a distributed, microservice-style architecture orchestrated with Docker Compose:
 
-1.  **Gateway Server (`gateway.py`):**
-    *   A lightweight **FastAPI** web server that acts as the primary entry point for all user interactions.
-    *   Exposes a **REST API** for creating tasks and sending control directives.
-    *   Hosts a **Socket.IO** server to broadcast real-time state updates to connected clients (like the Mission Control UI).
-    *   Communicates with the agent worker via a **RabbitMQ** message queue, publishing directives to be consumed by the worker.
+1.  **Mission Control UI:**
+    *   A **Next.js** web application that provides the main user interface.
+    *   Connects to the Gateway's API and Socket.IO server to display the task graph and allow the operator to send commands.
 
-2.  **Agent Worker (`worker.py`):**
-    *   A long-running process that initializes and runs the `InteractiveDAGAgent`.
+2.  **Gateway Server:**
+    *   A **FastAPI** web server that acts as the primary entry point for all user interactions.
+    *   Exposes a **REST API** for creating tasks and a **Socket.IO** server to broadcast real-time state updates.
+    *   Communicates with the agent worker by publishing directives to a **RabbitMQ** message queue.
+
+3.  **Agent Worker:**
+    *   A long-running process that runs the `InteractiveDAGAgent`.
     *   Listens for directives from the Gateway on a **RabbitMQ** queue.
     *   Executes the agent's lifecycle, including planning, task execution, and state changes.
-    *   Publishes comprehensive state updates back to a **RabbitMQ** exchange, which are then picked up by the Gateway and broadcast to the UI.
+    *   Publishes comprehensive state updates back to a **RabbitMQ** exchange, which are then picked up by the Gateway and broadcast to all connected clients.
+
+4.  **RabbitMQ:**
+    *   The message broker that decouples the Gateway and Worker, ensuring reliable and resilient communication between them.
 
 This separation ensures that the core agent logic is decoupled from the web interface, allowing for robust, scalable, and resilient operation.
 
 ## How to Run
 
-To run the system in interactive mode, you need to start three services: a RabbitMQ instance, the Gateway, and at least one Worker. Also, it is recommended that you use the provided frontend interface, although it is possibly to use without it.
+The entire application stack is managed via Docker Compose. To run the system in interactive mode, please follow the main installation guide, which covers cloning the repository, setting up your environment variables, and launching all services with a single command.
 
-### Prerequisites
+**➡️ [Running the Application](./installation.md)**
 
-*   Dependencies met
-*   An environment file (`.env`) configured.
+## Interacting with the Agent
 
-### Running with Docker Compose
+The primary way to interact with the agent is through the Mission Control UI, which uses the Gateway API behind the scenes. Once the application is running, you can:
 
-1.  **Install Dependencies**
-    From the root of the project, create a python environment, whether with `conda`, `poetry` (recommended), or `python-virtualenv`. From the root of the project, install `poetry` if it isn't already installed. Then, run `pip install -e .` and/or `poetry install`.
-    
-3.  **Start all services:**
-    From the root of the project, run:
-    ```sh
-    poetry run llm-agent-x-gateway
-    ```
-    In a separate terminal:
-    ```sh
-    poetry run llm-agent-x-worker
-    ```
-    In another separate terminal:
-    ```sh
-    cd mi* && npm run dev
-    ```
-4.  **Access the Mission Control UI:**
-    Once the services are running, open a web browser and navigate to the Mission Control UI (typically `http://localhost:3000` if you are running it locally).
-    <img width="2560" height="1279" alt="Screenshot 2025-10-12 at 18-28-24 " src="https://github.com/user-attachments/assets/20fa2b7a-2c5b-4af4-901e-b8a188985cad" />
-    <img width="2560" height="1279" alt="Screenshot 2025-10-12 at 18-30-10 " src="https://github.com/user-attachments/assets/b26cc3d1-6fc5-4dfb-ba83-7f7b427cf7f7" />
+-   **Launch New Tasks:** Use the form to define a high-level objective.
+-   **Manage Documents:** Add, edit, or delete documents that the agent can use as context.
+-   **Monitor Progress:** Watch the DAG View update in real-time as the agent creates and executes tasks.
+-   **Inspect Tasks:** Click on any task node to see its details, dependencies, and results in the inspector pane.
+-   **Issue Directives:** Use the command palette in the inspector to pause, cancel, redirect, or manually complete tasks.
+-   **Answer Questions:** If an agent needs clarification, the task will pause, and an input box will appear in the inspector for you to provide an answer.
 
-
-
-6.  **Shutting Down:**
-    Press `Ctrl+C` in the terminals.
-
-## Gateway API Endpoints
-
-The Gateway exposes the following REST endpoints:
-
-#### `GET /api/tasks`
-
--   **Description:** Retrieves a snapshot of the current state of all tasks known to the Gateway. The state is cached and updated in real-time via the worker's broadcasts.
--   **Response:**
-    ```json
-    {
-      "tasks": {
-        "TASK_ID_1": { "...task state object..." },
-        "TASK_ID_2": { "...task state object..." }
-      }
-    }
-    ```
-
-#### `POST /api/tasks`
-
--   **Description:** Creates a new root task for the agent to begin working on.
--   **Request Body:**
-    ```json
-    {
-      "desc": "The high-level objective for the agent.",
-      "mcp_servers": [] // Optional: configuration for MCP servers
-    }
-    ```
--   **Response:**
-    ```json
-    { "status": "new task submitted" }
-    ```
-
-#### `POST /api/tasks/{task_id}/directive`
-
--   **Description:** Sends a specific control command (a "directive") to a running task.
--   **URL Parameter:** `task_id` - The ID of the task to control.
--   **Request Body:**
-    ```json
-    {
-      "command": "DIRECTIVE_NAME",
-      "payload": "..." // Value depends on the command
-    }
-    ```
--   **Response:**
-    ```json
-    { "status": "directive sent" }
-    ```
-
-## Available Directives
-
-Directives are the core mechanism for interacting with the agent. They are sent to the `/api/tasks/{task_id}/directive` endpoint.
-
-| Command              | Payload                                                     | Description                                                                                                                              |
-| -------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `PAUSE`              | `null`                                                      | Pauses the execution of the specified task. The task's state is preserved.                                                               |
-| `RESUME`             | `null`                                                      | Resumes a task that was previously paused by a human operator.                                                                           |
-| `ANSWER_QUESTION`    | `string`                                                    | Provides an answer to a question the agent asked when it entered the `waiting_for_user_response` state. The agent will consume the answer and resume. |
-| `REDIRECT`           | `string`                                                    | Provides a new instruction or clarification to the task. This forces the agent to re-evaluate its approach.                              |
-| `MANUAL_OVERRIDE`    | `string`                                                    | Forces a task to be marked as `complete` and sets its result to the provided payload. This is useful for manually completing a step.    |
-| `CANCEL`             | `string` (optional reason)                                  | Marks a task as `cancelled`. The task is not deleted but is removed from the active execution flow.                                     |
-| `PRUNE_TASK`         | `string` (optional reason)                                  | Permanently removes a task and all its children from the graph. This is a destructive action used to clean up the task tree.              |
-| `TERMINATE`          | `string` (optional reason)                                  | Forcibly marks a task as `failed`.                                                                                                       |
-
-## Socket.IO Events
-
-The Gateway broadcasts state changes via Socket.IO, allowing a UI to update in real-time.
-
--   **Event:** `task_update`
--   **Payload:**
-    ```json
-    {
-      "task": {
-        "id": "TASK_ID",
-        "desc": "Task description",
-        "status": "running",
-        "result": null,
-        "children": ["CHILD_ID_1"],
-        // ... and all other fields from the Task model
-      }
-    }
-    ```
-    Clients should listen for this event to receive the latest state of any task that has been modified by the agent worker.
+For detailed information on the programmatic interface for custom integrations, see the **[Gateway API Reference](./api.md)**.
