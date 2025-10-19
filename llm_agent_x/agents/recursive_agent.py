@@ -19,7 +19,6 @@ from pydantic import BaseModel, Field, validator, ValidationError
 from llm_agent_x.backend.mergers.LLMMerger import MergeOptions, LLMMerger
 
 from llm_agent_x.backend.utils import ic_dev
-from llm_agent_x.complexity_model import TaskEvaluation, evaluate_prompt
 import logging
 from pydantic_ai.mcp import MCPServer
 
@@ -132,6 +131,9 @@ class verification(BaseModel):
     def get_successful(self):
         return self.score > 5
 
+class TaskEvaluation(BaseModel):
+    prompt_complexity_score: float = Field(description="How complex is the prompt, given 0 (very simple) to 1 (very complex)")
+    domain_knowledge: float = Field(description="How much domain knowledge is required to complete the task, given 0 (no domain knowledge) to 1 (extremely complex domain knowledge)")
 
 class SplitTask(BaseModel):
     needs_subtasks: bool
@@ -140,6 +142,8 @@ class SplitTask(BaseModel):
 
     def __bool__(self):
         return self.needs_subtasks
+
+
 
 
 class TaskContext(BaseModel):
@@ -425,6 +429,12 @@ class RecursiveAgent:
                 self._build_context_information(), "verification", subtask_results_map
             )
         )
+
+    async def evaluate_prompt(self, prompt):
+        evaluation_agent = Agent(system_prompt="Evaluate the given prompt.", output_type=TaskEvaluation)
+
+        result = await evaluation_agent.run(user_prompt=prompt)
+        return result.output
 
     async def run(self):
         self.status = "running"
@@ -966,7 +976,7 @@ Make sure to include citations [1] and a citations section at the end.
             if self.u_inst:
                 system_msg_content += f"\nUser instructions:\n{self.u_inst}"
 
-            evaluation = evaluate_prompt(f"Prompt: {self.task}")
+            evaluation = await self.evaluate_prompt(f"Prompt: {self.task}")
             if (
                 evaluation.prompt_complexity_score[0] < 0.1
                 and evaluation.domain_knowledge[0] > 0.8

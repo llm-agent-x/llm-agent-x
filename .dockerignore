@@ -1,14 +1,17 @@
+# .dockerignore
+
 # Git
 .git
 .gitignore
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Python - Use glob patterns to catch these everywhere
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
 .venv/
 venv/
+*.log
 
 # Docker
 .dockerignore
@@ -20,3 +23,23 @@ Dockerfile*
 *.swp
 *~
 .DS_Store
+
+# --- IGNORE ALL OTHER PROJECTS AND ASSETS ---
+
+# Ignore the entire Next.js UI project
+mission-control-ui/
+
+# Ignore the sandbox project
+sandbox/
+
+# Ignore documentation, outputs, and tools
+docs/
+output/
+output_eval/
+tools/
+
+# Ignore top-level project files not needed for the build
+*.md
+LICENSE
+.env
+.env.example

@@ -1552,7 +1552,7 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
         """
-        OVERRIDDEN: Implements the new "Plan Chains -> Merge Chains -> Commit Tasks" workflow
+        OVERRIDDEN: Implements the new "Plan Chains -> Commit Tasks" workflow
         for dynamic, bottom-up decomposition.
         """
         t = ctx.task
@@ -1561,7 +1561,7 @@ class InteractiveDAGAgent(DAGAgent):
             logger.warning(f"[{t.id}] Task graph is full. Adaptive decomposition is FROZEN.")
             t.status = "running"
             self._broadcast_state_update(t)
-            return True
+            return True  # Returning True indicates the phase was "frozen" or skipped
 
         # (Same prompt setup as before)
         t.dep_results = {d: self.registry.tasks[d].result for d in t.deps}
@@ -1583,45 +1583,35 @@ class InteractiveDAGAgent(DAGAgent):
             if not is_paused: logger.info(f"[{t.id}] Adaptive decomposer proposed no new tasks.")
             return False
 
-        logger.info(f"[{t.id}] Decomposer proposed {len(chained_plan.task_chains)} new chain(s). Consolidating...")
+        logger.info(f"[{t.id}] Decomposer proposed {len(chained_plan.task_chains)} new chain(s).")
 
-        # (Same consolidation logic as in _run_initial_planning)
-        final_task_descriptions = []
+        # <<< --- START OF THE FIX --- >>>
+        # This logic correctly processes each chain and its internal sequences.
         for chain_obj in chained_plan.task_chains:
-            if not chain_obj.chain: continue
-
-            # --- START OF LOGICAL FIX (IDENTICAL TO THE ONE ABOVE) ---
-            # Collect all unique dependencies from every task in the chain.
-            all_deps_in_chain = set()
+            previous_task_id_in_chain = None
             for task_desc in chain_obj.chain:
-                all_deps_in_chain.update(task_desc.deps)
-            # --- END OF LOGICAL FIX ---
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=task_desc.desc,
+                    parent=t.id,
+                    can_request_new_subtasks=task_desc.can_request_new_subtasks,
+                    mcp_servers=t.mcp_servers,
+                    # Apply dependencies on EXISTING tasks right away
+                    deps=set(task_desc.deps)
+                )
+                self.registry.add_task(new_task)
+                t.children.append(new_task.id)
+                self._broadcast_state_update(new_task)
 
-            if len(chain_obj.chain) == 1:
-                final_task_descriptions.append(chain_obj.chain[0])
-            else:
-                descriptions_to_merge = [td.desc for td in chain_obj.chain]
-                merger_prompt = f"Combine these steps into one task: {json.dumps(descriptions_to_merge)}"
-                merged_desc = await self._run_stateless_agent(self.task_merger, merger_prompt, ctx)
-                if merged_desc:
-                    should_decompose_further = any(td.can_request_new_subtasks for td in chain_obj.chain)
+                # This is the crucial part: link the new task to the previous one in the same chain.
+                if previous_task_id_in_chain:
+                    self.registry.add_dependency(new_task.id, previous_task_id_in_chain)
 
-                    # --- CRUCIAL CHANGE: Create the new TaskDescription with the aggregated dependencies.
-                    final_task_descriptions.append(
-                        TaskDescription(
-                            local_id=f"merged_{chain_obj.chain[0].local_id}",
-                            desc=merged_desc,
-                            can_request_new_subtasks=should_decompose_further,
-                            deps=list(all_deps_in_chain)  # Assign the collected deps here.
-                        )
-                    )
+                # Update the variable for the next task in this chain.
+                previous_task_id_in_chain = new_task.id
+        # <<< --- END OF THE FIX --- >>>
 
-        if final_task_descriptions:
-            logger.info(
-                f"[{t.id}] Committing {len(final_task_descriptions)} consolidated sub-tasks from decomposition.")
-            self._commit_task_descriptions(ctx, final_task_descriptions)
-
-        return False
+        return False  # Returning False indicates the phase completed normally
 
     def _commit_task_descriptions(self, ctx: TaskContext, task_descriptions: List[TaskDescription]):
         """
@@ -1642,7 +1632,7 @@ class InteractiveDAGAgent(DAGAgent):
             self.registry.add_task(new_task)
             t.children.append(new_task.id)
             # The parent task automatically depends on all its new children
-            # self.registry.add_dependency(t.id, new_task.id)
+            # self.registry.add_dependency(t.id, new_task.id) # This is usually handled by the parent waiting on children.
             self._broadcast_state_update(new_task)
 
     async def _run_task_execution(self, ctx: TaskContext):

@@ -28,7 +28,6 @@ from llm_agent_x.agents.dag_agent import (
 from llm_agent_x.backend import (
     AppendMerger,
     LLMMerger,
-    AlgorithmicMerger,
 )
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -158,7 +157,6 @@ def main():
                         merger={
                             "ai": LLMMerger,
                             "append": AppendMerger,
-                            "algorithmic": AlgorithmicMerger,
                         }[args.merger],
                     ),
                 )

@@ -76,7 +76,7 @@ recursive_group.add_argument(
     "--merger",
     type=str,
     default="ai",
-    choices=["ai", "append", "algorithmic"],
+    choices=["ai", "append"],
     help="[RECURSIVE-ONLY] Merger type for subtask results.",
 )
 recursive_group.add_argument(

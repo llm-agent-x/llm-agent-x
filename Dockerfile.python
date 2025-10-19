@@ -19,6 +19,7 @@ COPY pyproject.toml poetry.lock ./
 
 # Install all dependencies from the lock file.
 # This is the slowest step and will be cached aggressively by Docker.
+# This layer will now only be invalidated if pyproject.toml or poetry.lock changes.
 RUN poetry install --without dev --no-interaction --no-ansi --no-root
 
 
@@ -29,18 +30,24 @@ RUN poetry install --without dev --no-interaction --no-ansi --no-root
 
 # --- Gateway Image ---
 FROM builder AS gateway
-# All dependencies are already installed. Just copy the code.
+WORKDIR /app
+# All dependencies are already installed. Just copy the relevant source code.
+# This is the crucial fix: Be specific! Don't use `COPY . .`.
 COPY ./llm_agent_x /app/llm_agent_x
 EXPOSE 8000
 CMD ["poetry", "run", "llm-agent-x-gateway"]
 
 # --- Worker Image ---
 FROM builder AS worker
+WORKDIR /app
+# Same fix here: Only copy the source code directory.
 COPY ./llm_agent_x /app/llm_agent_x
 CMD ["poetry", "run", "llm-agent-x-worker"]
 
 # --- Sandbox Image ---
 FROM builder AS sandbox
+WORKDIR /app
+# The sandbox has its own code, so we copy that specifically.
 COPY ./sandbox /app/sandbox
 EXPOSE 5000
 CMD ["uvicorn", "sandbox.sandbox_api:app", "--host", "0.0.0.0", "--port", "5000"]

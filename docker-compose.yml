@@ -31,19 +31,20 @@ services:
       retries: 5
 
   # The FastAPI + Socket.IO Gateway service
+
   gateway:
     build:
       context: .
-      dockerfile: Dockerfile.python # <-- Use the master Dockerfile
-      target: gateway              # <-- Build the "gateway" stage
+      dockerfile: Dockerfile.python
+      target: gateway
     container_name: gateway
     ports:
       - "8000:8000"
     environment:
       - RABBITMQ_HOST=rabbitmq
+      # Set RELOAD to true for development in the override file
       - GATEWAY_RELOAD=false
-    volumes:
-      - ./llm_agent_x:/app/llm_agent_x
+    # <<< VOLUME IS REMOVED FROM HERE >>>
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -51,15 +52,14 @@ services:
   worker:
     build:
       context: .
-      dockerfile: Dockerfile.python # <-- Use the master Dockerfile
-      target: worker               # <-- Build the "worker" stage
+      dockerfile: Dockerfile.python
+      target: worker
     container_name: worker
     environment:
       - RABBITMQ_HOST=rabbitmq
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - BRAVE_API_KEY=${BRAVE_API_KEY}
-    volumes:
-      - ./llm_agent_x:/app/llm_agent_x
+    # <<< VOLUME IS REMOVED FROM HERE >>>
     depends_on:
       rabbitmq:
         condition: service_healthy
