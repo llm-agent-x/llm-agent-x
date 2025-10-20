@@ -23,31 +23,31 @@ def get_page_text_content(element):
 async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
     print("Running Brave Web Search...")
     print("Query:", query)
-    # Setup Redis
-    r = None
-    try:
-        if not redis_host or not redis_port or not redis_db:
-            raise Exception("Redis not used")
-        r = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
-        r.ping()
-        print("Redis connection successful.")
-    except redis.exceptions.ConnectionError as e:
-        print(f"Redis connection failed: {e}.  Caching disabled.")
-        r = None
-    except:
-        print("Redis not used")
-        r = None
 
+    redis_client = None
+    # Check if Redis is configured before attempting to connect.
+    if redis_host:
+        try:
+            redis_client = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+            await redis_client.ping()
+            print("Redis connection successful. Caching is enabled.")
+        except redis.exceptions.ConnectionError as e:
+            print(f"Redis connection failed: {e}. Caching is disabled for this run.")
+            redis_client = None # Ensure client is None on failure
+    else:
+        print("Redis is not configured. Caching is disabled.")
+
+    # Generate a cache key regardless, to check for it if Redis is available.
     cache_key = hashlib.md5(f"{query}_{num_results}".encode("utf-8")).hexdigest()
 
-    if r:
-        cached_result = r.get(cache_key)
+    if redis_client:
+        cached_result = redis_client.get(cache_key)
         if cached_result:
             try:
                 print("Cache hit!")
                 return json.loads(cached_result.decode("utf-8"))
             except json.JSONDecodeError:
-                print("Invalid cache JSON. Ignoring cache.")
+                print("Invalid data in cache. Ignoring and re-fetching.")
 
     api_key = os.getenv("BRAVE_API_KEY")
     if not api_key or api_key == "YOUR_ACTUAL_BRAVE_API_KEY_HERE":
@@ -104,7 +104,7 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
                         text = text.strip()
                         if len(text) > 5000:
                             print(f"Summarizing long text from {url}")
-                            content_for_llm = summarize(text)
+                            content_for_llm = await summarize(text) # Assuming summarize can be async
                         elif text:
                             content_for_llm = text
                     else:
@@ -119,12 +119,13 @@ async def _brave_web_search(query: str, num_results: int = 5) -> List[Dict[str, 
             extracted = await asyncio.gather(*tasks)
             extracted_results = [r for r in extracted if r]
 
-            if r and extracted_results:
+            # Only attempt to cache if Redis client was successfully created.
+            if redis_client and extracted_results:
                 try:
-                    r.setex(cache_key, redis_expiry, json.dumps(extracted_results))
-                    print("Result cached.")
+                    await redis_client.setex(cache_key, redis_expiry, json.dumps(extracted_results))
+                    print("Result cached in Redis.")
                 except Exception as e:
-                    print(f"Failed to cache: {e}")
+                    print(f"Failed to cache result: {e}")
 
             return extracted_results
 
