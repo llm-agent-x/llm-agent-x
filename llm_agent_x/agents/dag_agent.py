@@ -24,6 +24,9 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
 
+# --- NEW STATE MANAGER IMPORTS ---
+from llm_agent_x.state_manager import AbstractStateManager, InMemoryStateManager
+
 # --- Basic Setup ---
 load_dotenv(".env", override=True)
 logging.basicConfig(
@@ -393,7 +396,7 @@ class DAGAgent:
         global_proposal_limit: int = 5,
         max_grace_attempts: int = 1,
         min_question_priority: int = 1,
-        mcp_server_url: Optional[str] = None,  # NEW: MCP server URL parameter
+        mcp_server_url: Optional[str] = None,
     ):
         self.state_manager = state_manager or InMemoryStateManager()
         self.inflight = set()
@@ -406,18 +409,46 @@ class DAGAgent:
 
         self._tools_for_agents: List[Any] = tools or []
         self._agent_role_map: Dict[str, Agent] = {}
-        self.mcp_tool_schemas_str = "No remote tools are available for planning."  # NEW: To hold tool schemas for planner
+        self.mcp_tool_schemas_str = "No remote tools are available for planning."
 
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
-        self.mcp_servers = []  # For future use
+        self.mcp_servers = []
 
         self._setup_agent_roles()
+
+    def _print_status_tree(self):
+        logger.info("--- CURRENT TASK STATUS TREE ---")
+        tasks = self.state_manager.get_all_tasks()
+        root_nodes = [t for t in tasks.values() if not t.parent]
+        for root in root_nodes:
+            self._print_node(root, 0, tasks)
+        logger.info("------------------------------------")
+
+    def _print_node(self, task: Task, level: int, all_tasks: Dict[str, Task]):
+        prefix = "  " * level
+        status_color = {
+            "complete": "✅",
+            "failed": "❌",
+            "running": "⏳",
+            "planning": "📝",
+            "proposing": "💡",
+            "waiting_for_children": "⏸️",
+            "pending": "📋",
+            "paused_by_human": "🛑",
+            "waiting_for_user_response": "❓",
+        }
+        status_icon = status_color.get(task.status, "❓")
+        logger.info(
+            f"{prefix}- {status_icon} {task.id[:8]}: {task.status.upper()} | {task.desc[:60]}..."
+        )
+        for child_id in task.children:
+            if child_id in all_tasks:
+                self._print_node(all_tasks[child_id], level + 1, all_tasks)
 
     def _setup_agent_roles(self):
         """Initializes or reinitializes all agent roles."""
         llm_model = self.base_llm_model
 
-        # NEW: Create a dynamic system prompt for the planner
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
             "Structure your output as 'chains' of tasks. "
@@ -431,7 +462,7 @@ class DAGAgent:
         self.initial_planner = Agent(
             model=llm_model,
             system_prompt=planner_system_prompt,
-            output_type=ChainedExecutionPlan,  # MODIFIED
+            output_type=ChainedExecutionPlan,
             tools=[],
         )
 
@@ -444,7 +475,7 @@ class DAGAgent:
                 "Your final output MUST be the complete, corrected ExecutionPlan. If there are no cycles, return the original plan unchanged."
             ),
             output_type=ExecutionPlan,
-            tools=[],  # Planner-related agents should not have execution tools
+            tools=[],
         )
         self.adaptive_decomposer = Agent(
             model=llm_model,
@@ -452,17 +483,16 @@ class DAGAgent:
                 "You are an adaptive expert. Analyze the given task and results of its dependencies. If the task is still too complex, break it down into one or more 'chains' of new, more granular sub-tasks. "
                 "A 'chain' is a list of tasks that must be done sequentially. You can create multiple parallel chains for independent workstreams."
             ),
-            output_type=ChainedExecutionPlan,  # MODIFIED
+            output_type=ChainedExecutionPlan,
             tools=self._tools_for_agents,
         )
         self.conflict_resolver = Agent(
             model=llm_model,
             system_prompt=f"You are a ruthless but fair project manager. You have been given a list of proposed tasks that exceeds the budget. Analyze the list and their importance scores. You MUST prune the list by removing the LEAST critical tasks until the total number of tasks is no more than {self.global_proposal_limit}. Return only the final, approved list of tasks.",
             output_type=ProposalResolutionPlan,
-            tools=[],  # Planner-related agents should not have execution tools
+            tools=[],
             retries=3,
         )
-        # MODIFIED: Executor now gets the full list of tools, including the McpClient
         self.executor = Agent(
             model=llm_model,
             output_type=Union[str, UserQuestion],
@@ -483,7 +513,7 @@ class DAGAgent:
                 "If the scores are generally increasing, it is worth retrying. If scores are stagnant or decreasing, it is not. "
                 "You must provide a concrete and actionable 'next_step_suggestion' for the next autonomous attempt."
             ),
-            output_type=RetryDecision,  # It ONLY outputs a RetryDecision
+            output_type=RetryDecision,
             tools=self._tools_for_agents,
         )
         self._agent_role_map = {
@@ -497,12 +527,9 @@ class DAGAgent:
         }
 
     def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
-        """Adds LLM usage data to a span for a system-level operation without a task context."""
         if not span or not agent_res:
             return
         usage = agent_res.usage()
-        # We don't track cost here as there is no task to assign it to.
-        # This is a trade-off for keeping the system logic clean.
         span.set_attribute(
             SpanAttributes.LLM_TOKEN_COUNT_PROMPT, getattr(usage, "request_tokens", 0)
         )
@@ -593,10 +620,11 @@ class DAGAgent:
     async def run(self):
         with self.tracer.start_as_current_span("DAGAgent.run") as root_span:
             while True:
-                all_task_ids = set(self.state_manager.tasks.keys())
+                tasks = self.state_manager.get_all_tasks()
+                all_task_ids = set(tasks.keys())
                 completed_or_failed_or_paused = {
                     t.id
-                    for t in self.state_manager.tasks.values()
+                    for t in tasks.values()
                     if t.status
                     in (
                         "complete",
@@ -606,9 +634,10 @@ class DAGAgent:
                     )
                 }
                 for tid in all_task_ids - completed_or_failed_or_paused:
-                    task = self.state_manager.tasks[tid]
+                    task = self.state_manager.get_task(tid)
                     if any(
-                        self.state_manager.tasks.get(d, {}).status == "failed"
+                        (dep_task := self.state_manager.get_task(d))
+                        and dep_task.status == "failed"
                         for d in task.deps
                     ):
                         if task.status != "failed":
@@ -617,24 +646,34 @@ class DAGAgent:
                                 "Upstream dependency failed.",
                             )
                             task.last_llm_history, task.agent_role_paused = None, None
+
                 pending_tasks = all_task_ids - completed_or_failed_or_paused
                 ready_to_run_ids = {
                     tid
                     for tid in pending_tasks
-                    if self.state_manager.tasks[tid].status == "pending"
+                    if (task := self.state_manager.get_task(tid))
+                    and task.status == "pending"
                     and all(
-                        self.state_manager.tasks.get(d, {}).status == "complete"
-                        for d in self.state_manager.tasks[tid].deps
+                        (dep_task := self.state_manager.get_task(d))
+                        and dep_task.status == "complete"
+                        for d in task.deps
                     )
                 }
+
                 for tid in pending_tasks:
-                    task = self.state_manager.tasks[tid]
-                    if task.status == "waiting_for_children" and all(
-                        self.state_manager.tasks[c].status in ["complete", "failed"]
-                        for c in task.children
+                    task = self.state_manager.get_task(tid)
+                    if (
+                        task
+                        and task.status == "waiting_for_children"
+                        and all(
+                            (child_task := self.state_manager.get_task(c))
+                            and child_task.status in ["complete", "failed"]
+                            for c in task.children
+                        )
                     ):
                         if any(
-                            self.state_manager.tasks[c].status == "failed"
+                            (child_task := self.state_manager.get_task(c))
+                            and child_task.status == "failed"
                             for c in task.children
                         ):
                             task.status, task.result = (
@@ -645,10 +684,11 @@ class DAGAgent:
                         else:
                             ready_to_run_ids.add(tid)
                             task.status = "pending"
+
                 ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
                 if not ready and not self.inflight and pending_tasks:
                     logger.error("Stalled DAG!")
-                    self.state_manager.print_status_tree()
+                    self._print_status_tree()
                     root_span.set_status(trace.Status(StatusCode.ERROR, "DAG Stalled"))
                     break
                 if not pending_tasks and not self.inflight:
@@ -659,6 +699,7 @@ class DAGAgent:
                     self.task_futures[tid] = asyncio.create_task(
                         self._run_taskflow(tid)
                     )
+
                 if not self.task_futures:
                     continue
                 done, _ = await asyncio.wait(
@@ -679,22 +720,21 @@ class DAGAgent:
                             logger.info(f"Task [{tid}] was cancelled.")
                         except Exception as e:
                             logger.error(f"Task [{tid}] future failed: {e}")
-                            t = self.state_manager.tasks.get(tid)
+                            t = self.state_manager.get_task(tid)
                             if t and t.status != "failed":
                                 t.status = "failed"
                                 t.last_llm_history, t.agent_role_paused = None, None
+                                self.state_manager.upsert_task(t)
                 if self.proposed_tasks_buffer:
                     await self._run_global_resolution()
 
     async def _run_global_resolution(self):
-        # This is now a standalone system operation, not a task.
         with self.tracer.start_as_current_span("GlobalConflictResolution") as span:
             logger.info(
                 f"GLOBAL RESOLUTION: Evaluating {len(self.proposed_tasks_buffer)} proposed sub-tasks."
             )
             span.set_attribute("proposals.count", len(self.proposed_tasks_buffer))
 
-            # Use a try...finally block to guarantee the buffer is cleared
             try:
                 approved_proposals = [p[0] for p in self.proposed_tasks_buffer]
                 parent_map = {p[0].local_id: p[1] for p in self.proposed_tasks_buffer}
@@ -708,15 +748,10 @@ class DAGAgent:
                         f"local_id: {p.local_id}, importance: {p.importance}, desc: {p.desc}"
                         for p in approved_proposals
                     ]
-
-                    # Directly call the agent without a task context
                     resolver_res = await self.conflict_resolver.run(
                         user_prompt=f"Prune this list to {self.global_proposal_limit} items: {prompt_list}"
                     )
-
-                    # Manually handle telemetry and output
                     self._add_llm_data_to_system_span(span, resolver_res)
-
                     resolved_plan = resolver_res.output
                     if resolved_plan and isinstance(
                         resolved_plan, ProposalResolutionPlan
@@ -727,9 +762,8 @@ class DAGAgent:
                         )
                         span.set_status(StatusCode.OK)
                     else:
-                        # If the agent returns None or an invalid type, fail safely
                         logger.error(
-                            "Conflict resolver failed to return a valid plan. Discarding all proposals for this cycle."
+                            "Conflict resolver failed. Discarding all proposals for this cycle."
                         )
                         approved_proposals = []
                         span.set_status(
@@ -747,9 +781,7 @@ class DAGAgent:
                     logger.info(
                         "No proposals were approved or committed in this cycle."
                     )
-
             finally:
-                # This is critical to prevent infinite loops
                 self.proposed_tasks_buffer = []
 
     def _commit_proposals(
@@ -760,7 +792,7 @@ class DAGAgent:
         local_to_global_id_map = {}
         for proposal in approved_proposals:
             parent_id = proposal_to_parent_map.get(proposal.local_id)
-            if not parent_id:
+            if not parent_id or not self.state_manager.get_task(parent_id):
                 continue
             new_task = Task(
                 id=str(uuid.uuid4())[:8],
@@ -768,23 +800,33 @@ class DAGAgent:
                 parent=parent_id,
                 can_request_new_subtasks=False,
             )
-            self.state_manager.add_task(new_task)
-            self.state_manager.tasks[parent_id].children.append(new_task.id)
+            self.state_manager.upsert_task(new_task)
+
+            parent_task = self.state_manager.get_task(parent_id)
+            parent_task.children.append(new_task.id)
+            self.state_manager.upsert_task(parent_task)
+
             self.state_manager.add_dependency(parent_id, new_task.id)
             local_to_global_id_map[proposal.local_id] = new_task.id
+
         for proposal in approved_proposals:
             new_task_global_id = local_to_global_id_map.get(proposal.local_id)
             if not new_task_global_id:
                 continue
             for dep_local_id in proposal.deps:
                 dep_global_id = local_to_global_id_map.get(dep_local_id) or (
-                    dep_local_id if dep_local_id in self.state_manager.tasks else None
+                    dep_local_id if self.state_manager.get_task(dep_local_id) else None
                 )
                 if dep_global_id:
                     self.state_manager.add_dependency(new_task_global_id, dep_global_id)
 
     async def _run_taskflow(self, tid: str):
-        ctx, t = TaskContext(tid, self.state_manager), self.state_manager.tasks[tid]
+        t = self.state_manager.get_task(tid)
+        if not t:
+            logger.error(f"Taskflow started for non-existent task ID: {tid}")
+            return
+        ctx = TaskContext(tid, self.state_manager)
+
         with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}") as span:
             t.span, span.set_attribute("dag.task.id", t.id), span.set_attribute(
                 "dag.task.status", t.status
@@ -832,12 +874,13 @@ class DAGAgent:
             finally:
                 otel_context.detach(otel_ctx_token)
                 span.set_attribute("dag.task.status", t.status)
+                self.state_manager.upsert_task(t)
 
     async def _run_initial_planning(self, ctx: TaskContext):
         t = ctx.task
         completed_tasks = [
             tk
-            for tk in self.state_manager.tasks.values()
+            for tk in self.state_manager.get_all_tasks().values()
             if tk.status == "complete" and tk.id != t.id
         ]
         context = "\n".join(f"- ID: {tk.id} Desc: {tk.desc}" for tk in completed_tasks)
@@ -868,10 +911,6 @@ class DAGAgent:
     async def _process_chained_plan_output(
         self, ctx: TaskContext, plan: ChainedExecutionPlan
     ):
-        """
-        Processes a ChainedExecutionPlan by creating tasks and auto-linking them within each chain.
-        This is the simpler "Path A" implementation for the base agent.
-        """
         t = ctx.task
         if not plan.task_chains:
             return
@@ -885,17 +924,17 @@ class DAGAgent:
                     parent=t.id,
                     can_request_new_subtasks=task_desc.can_request_new_subtasks,
                 )
-                self.state_manager.add_task(new_task)
+                self.state_manager.upsert_task(new_task)
                 t.children.append(new_task.id)
                 self.state_manager.add_dependency(t.id, new_task.id)
 
-                # Auto-link to the previous task in the same chain
                 if previous_task_id_in_chain:
                     self.state_manager.add_dependency(
                         new_task.id, previous_task_id_in_chain
                     )
 
                 previous_task_id_in_chain = new_task.id
+        self.state_manager.upsert_task(t)
 
     async def _process_initial_planning_output(
         self, ctx: TaskContext, plan: ExecutionPlan
@@ -911,24 +950,30 @@ class DAGAgent:
                 parent=t.id,
                 can_request_new_subtasks=sub.can_request_new_subtasks,
             )
-            self.state_manager.add_task(new_task)
+            self.state_manager.upsert_task(new_task)
             t.children.append(new_task.id)
             self.state_manager.add_dependency(t.id, new_task.id)
             local_to_global_id_map[sub.local_id] = new_task.id
+
         for sub in plan.subtasks:
             new_global_id = local_to_global_id_map.get(sub.local_id)
             if not new_global_id:
                 continue
             for dep in sub.deps:
                 dep_global_id = local_to_global_id_map.get(dep.local_id) or (
-                    dep.local_id if dep.local_id in self.state_manager.tasks else None
+                    dep.local_id if self.state_manager.get_task(dep.local_id) else None
                 )
                 if dep_global_id:
                     self.state_manager.add_dependency(new_global_id, dep_global_id)
+        self.state_manager.upsert_task(t)
 
     async def _run_adaptive_decomposition(self, ctx: TaskContext):
         t = ctx.task
-        t.dep_results = {d: self.state_manager.tasks[d].result for d in t.deps}
+        t.dep_results = {
+            d: self.state_manager.get_task(d).result
+            for d in t.deps
+            if self.state_manager.get_task(d)
+        }
         prompt_parts = [
             f"Task: {t.desc}",
             f"\nResults from dependencies:\n{t.dep_results}",
@@ -951,7 +996,6 @@ class DAGAgent:
         )
         if is_paused or not plan:
             return
-        # Since this is the base agent, we don't buffer proposals. We just process them directly.
         if plan.task_chains:
             logger.info(
                 f"Task [{t.id}] is decomposing into {len(plan.task_chains)} new chain(s)."
@@ -963,14 +1007,16 @@ class DAGAgent:
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
         child_results = {
-            cid: self.state_manager.tasks[cid].result
+            cid: (child.result if (child := self.state_manager.get_task(cid)) else None)
             for cid in t.children
-            if self.state_manager.tasks[cid].status == "complete"
+            if (child := self.state_manager.get_task(cid))
+            and child.status == "complete"
         }
         dep_results = {
-            did: self.state_manager.tasks[did].result
+            did: (dep.result if (dep := self.state_manager.get_task(did)) else None)
             for did in t.deps
-            if self.state_manager.tasks[did].status == "complete"
+            if (dep := self.state_manager.get_task(did))
+            and dep.status == "complete"
             and did not in child_results
         }
 
@@ -980,19 +1026,19 @@ class DAGAgent:
                 "\nSynthesize the results from your sub-tasks into a final answer:\n"
             )
             for cid, res in child_results.items():
-                prompt_lines.append(
-                    f"- From sub-task '{self.state_manager.tasks[cid].desc}':\n{res}\n\n"
-                )
+                if child_task := self.state_manager.get_task(cid):
+                    prompt_lines.append(
+                        f"- From sub-task '{child_task.desc}':\n{res}\n\n"
+                    )
         elif dep_results:
             prompt_lines.append("\nUse data from dependencies to inform your answer:\n")
             for did, res in dep_results.items():
-                prompt_lines.append(
-                    f"- From dependency '{self.state_manager.tasks[did].desc}':\n{res}\n\n"
-                )
+                if dep_task := self.state_manager.get_task(did):
+                    prompt_lines.append(
+                        f"- From dependency '{dep_task.desc}':\n{res}\n\n"
+                    )
 
-        prompt_base_content = "".join(
-            prompt_lines
-        )  # FIXED: Use "" to join to avoid double newlines
+        prompt_base_content = "".join(prompt_lines)
 
         task_specific_mcp_clients = []
         task_specific_tools = list(self._tools_for_agents)
@@ -1048,7 +1094,7 @@ class DAGAgent:
                 )
                 t.human_directive = None
 
-            current_prompt = "".join(current_prompt_parts)  # FIXED: Use "" to join
+            current_prompt = "".join(current_prompt_parts)
 
             logger.info(f"[{t.id}] Attempt {current_attempt}: Calling executor LLM.")
             exec_res = await task_executor.run(
@@ -1073,6 +1119,7 @@ class DAGAgent:
                     t.max_fix_attempts + self.max_grace_attempts
                 ):
                     t.status = "failed"
+                    self.state_manager.upsert_task(t)
                     raise Exception(
                         f"Exceeded max attempts for task '{t.id}' after empty/invalid executor result."
                     )
@@ -1097,19 +1144,17 @@ class DAGAgent:
             logger.info(f"COMPLETED [{t.id}]")
             t.status = "complete"
             t.last_llm_history, t.agent_role_paused = None, None
+            self.state_manager.upsert_task(t)
             return
 
         t.fix_attempts += 1
 
-        # Consult the analyst only when max standard attempts are reached.
         if (
             t.fix_attempts >= t.max_fix_attempts
             and t.grace_attempts < self.max_grace_attempts
         ):
             analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nScore > 5 is a success. Should we retry autonomously?"
             decision_res = await self.retry_analyst.run(user_prompt=analyst_prompt)
-
-            # Here, we don't need the complex _handle_agent_output since this agent can't ask questions.
             decision = decision_res.output
 
             if decision and decision.should_retry:
@@ -1119,9 +1164,9 @@ class DAGAgent:
                 logger.info(
                     f"[{t.id}] Grace attempt granted. Next step: {decision.next_step_suggestion}"
                 )
-                return  # Return to the execution loop for the grace attempt.
+                self.state_manager.upsert_task(t)
+                return
 
-        # Final failure condition if grace attempt is denied or not applicable.
         if (t.fix_attempts + t.grace_attempts) >= (
             t.max_fix_attempts + self.max_grace_attempts
         ):
@@ -1129,13 +1174,14 @@ class DAGAgent:
             t.span.set_status(trace.Status(StatusCode.ERROR, error_msg))
             t.status = "failed"
             t.last_llm_history, t.agent_role_paused = None, None
+            self.state_manager.upsert_task(t)
             raise Exception(error_msg)
 
-        # Default action for standard retries.
         t.human_directive = f"Your last answer was insufficient. Reason: {verify_task_result.reason}\nRe-evaluate and try again."
         logger.info(
             f"[{t.id}] Retrying execution. Feedback: {verify_task_result.reason[:50]}..."
         )
+        self.state_manager.upsert_task(t)
 
     async def _verify_task(self, t: Task, candidate_result: str) -> verification:
         ver_prompt = f"Task: {t.desc}\nCandidate Result: {candidate_result}\n\nDoes the result fully and accurately complete the task? Be strict."
@@ -1171,29 +1217,45 @@ if __name__ == "__main__":
     logger.info(
         "==== BEGIN DEMO: HYBRID PLANNING AGENT (WITH RETRIES & CYCLE BREAKING) ===="
     )
-    reg = TaskRegistry()
-    doc_ids = [
-        reg.add_document(name, content)
-        for name, content in [
-            (
-                "Financials Q2 Revenue",
-                "Apple Inc. (AAPL) Q2 2024 Revenue: $94.5B. iPhones: $50.5B. Services: $22.0B.",
-            ),
-            (
-                "Financials Q2 Profit",
-                "Apple Inc. (AAPL) Q2 2024 Net Income: $25.1B. EPS: $1.55.",
-            ),
-            (
-                "Mgmt Outlook Q2",
-                "Guidance: Q3 revenue to decline slightly. Risks: Supply chain.",
-            ),
-            (
-                "Market Intel Q2",
-                "Analyst Rating: Strong Buy. Rationale: Bullish on services growth.",
-            ),
-            ("Irrelevant Memo", "The company picnic is next Friday."),
-        ]
-    ]
+
+    agent = DAGAgent(
+        llm_model="gpt-4o-mini",
+        tracer=trace.get_tracer("hybrid_dag_demo"),
+        global_proposal_limit=2,
+        max_grace_attempts=1,
+        mcp_server_url=getenv("MCP_SERVER_URL"),
+    )
+    state_manager = agent.state_manager
+
+    for name, content in [
+        (
+            "Financials Q2 Revenue",
+            "Apple Inc. (AAPL) Q2 2024 Revenue: $94.5B. iPhones: $50.5B. Services: $22.0B.",
+        ),
+        (
+            "Financials Q2 Profit",
+            "Apple Inc. (AAPL) Q2 2024 Net Income: $25.1B. EPS: $1.55.",
+        ),
+        (
+            "Mgmt Outlook Q2",
+            "Guidance: Q3 revenue to decline slightly. Risks: Supply chain.",
+        ),
+        (
+            "Market Intel Q2",
+            "Analyst Rating: Strong Buy. Rationale: Bullish on services growth.",
+        ),
+        ("Irrelevant Memo", "The company picnic is next Friday."),
+    ]:
+        doc_task = Task(
+            id=md5(f"{name}{content}".encode()).hexdigest(),
+            desc=f"Document: {name}",
+            status="complete",
+            result=content,
+            task_type="document",
+            counts_toward_limit=False,
+        )
+        state_manager.upsert_task(doc_task)
+
     root_task = Task(
         id="ROOT_INVESTOR_BRIEFING",
         desc=(
@@ -1203,28 +1265,22 @@ if __name__ == "__main__":
         ),
         needs_planning=True,
     )
-    reg.add_task(root_task)
-    agent = DAGAgent(
-        registry=reg,
-        llm_model="gpt-4o-mini",
-        tracer=trace.get_tracer("hybrid_dag_demo"),
-        global_proposal_limit=2,
-        max_grace_attempts=1,
-        mcp_server_url=getenv("MCP_SERVER_URL"),  # NEW: Pass the MCP server URL
-    )
+    state_manager.upsert_task(root_task)
 
     async def main():
         print("\n--- INITIAL TASK STATUS TREE ---")
-        reg.print_status_tree()
+        agent._print_status_tree()
         print("\n===== EXECUTING DAG AGENT =====\n")
         await agent.run()
         print("\n===== DAG EXECUTION COMPLETE =====\n")
         print("\n--- FINAL TASK STATUS TREE ---")
-        reg.print_status_tree()
+        agent._print_status_tree()
         print("\n--- Final Output for Root Task ---\n")
-        root_result = reg.tasks.get("ROOT_INVESTOR_BRIEFING")
+        root_result = state_manager.get_task("ROOT_INVESTOR_BRIEFING")
         if root_result:
             print(f"Final Result (Status: {root_result.status}):\n{root_result.result}")
-        print(f"\nTotal estimated cost: ${sum(t.cost for t in reg.tasks.values()):.4f}")
+        print(
+            f"\nTotal estimated cost: ${sum(t.cost for t in state_manager.get_all_tasks().values()):.4f}"
+        )
 
     asyncio.run(main())
