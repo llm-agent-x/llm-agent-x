@@ -10,3 +10,5 @@ llm_agent_x.log
 mcpconf.json
 tasks.json
 input/*
+.fleet/*
+project_prompt.txt
