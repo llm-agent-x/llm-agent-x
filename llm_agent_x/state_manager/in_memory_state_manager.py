@@ -1,5 +1,5 @@
 from typing import Dict, Optional, Callable
-from llm_agent_x.agents.dag_agent import Task
+from llm_agent_x.core import Task
 from llm_agent_x.state_manager.abstract_state_manager import AbstractStateManager
 
 class InMemoryStateManager(AbstractStateManager):

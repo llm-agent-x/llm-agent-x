@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Optional, Dict, List
 
-from llm_agent_x.agents.dag_agent import Task
+from llm_agent_x.core import Task
 
 class AbstractStateManager(ABC):
     """
