@@ -1,9 +1,10 @@
 */__pycache__/*
+*.pyc
+*.pyc.*
 venv/*
 .env
 output/*
 .vscode/*
-*.pyc
 .idea/*
 dist/
 llm_agent_x.log
@@ -12,3 +13,4 @@ tasks.json
 input/*
 .fleet/*
 project_prompt.txt
+*.exe
