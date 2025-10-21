@@ -9,6 +9,11 @@ from pydantic import BaseModel, Field
 
 # --- All Pydantic Models related to the Task graph structure go here ---
 
+class HumanInjectedDependency(BaseModel):
+    """Represents a dependency added by a human operator post-planning."""
+    source_task_id: str
+    depth: Literal["shallow", "deep"] = "shallow"
+
 class UserQuestion(BaseModel):
     """
 A specific output type for agents to ask clarifying questions to the human operator.
@@ -77,6 +82,9 @@ class Task(BaseModel):
 
 
     human_directive: Optional[str] = Field(None, description="A direct, corrective instruction from the operator.")
+
+    human_injected_deps: List[HumanInjectedDependency] = Field(default_factory=list, description="Dependencies manually injected by an operator during a pause.")
+    
     current_question: Optional[UserQuestion] = Field(None,
                                                      description="The question an agent is currently asking the human operator.")
     user_response: Optional[str] = Field(None, description="The human operator's response to an agent's question.")

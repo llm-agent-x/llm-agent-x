@@ -181,6 +181,10 @@ export default function MissionControl() {
     return Object.values(tasks).sort((a, b) => a.id.localeCompare(b.id));
   }, [tasks]);
 
+  const completedTasks = useMemo(() => {
+    return taskList.filter(task => task.status === 'complete');
+  }, [taskList]);
+
   const selectedTask = tasks[selectedTaskId!] || null;
 
   const handleSelectTask = useCallback((id: string) => {
@@ -268,7 +272,7 @@ export default function MissionControl() {
           />
         </div>
         <div className="lg:col-span-1 h-full">
-          <TaskInspector task={selectedTask} />
+          <TaskInspector task={selectedTask} completedTasks={completedTasks}/>
         </div>
       </div>
     </main>

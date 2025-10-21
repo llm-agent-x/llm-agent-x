@@ -65,7 +65,7 @@ const DocumentDetails = ({ task }: { task: Task }) => {
 };
 
 // --- CHANGE 3: Apply the strict `Task` type to the `task` prop in TaskInspector ---
-export const TaskInspector = ({ task }: { task: Task | null }) => {
+export const TaskInspector = ({ task, completedTasks }: { task: Task | null, completedTasks: Task[] }) => {
   if (!task) {
     return (
       <div className="flex items-center justify-center h-full bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 text-zinc-400">
@@ -155,6 +155,7 @@ export const TaskInspector = ({ task }: { task: Task | null }) => {
           taskId={task.id}
           taskStatus={task.status}
           currentQuestion={task.current_question}
+          completedTasks={completedTasks}
         />
       </div>
     </div>

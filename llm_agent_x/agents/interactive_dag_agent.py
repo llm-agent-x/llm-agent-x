@@ -719,6 +719,27 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 self._broadcast_state_update(task)
             return
 
+        if command == "INJECT_DEPENDENCY":
+            if task.status == "waiting_for_user_response":
+                source_task_id = payload.get("source_task_id")
+                depth = payload.get("depth", "shallow")
+                if source_task_id and (source_task := self.state_manager.get_task(source_task_id)):
+                    if source_task.status == 'complete':
+                        injected_dep = HumanInjectedDependency(source_task_id=source_task_id, depth=depth)
+                        task.human_injected_deps.append(injected_dep)
+                        task.status = "pending" # Reset to be picked up by scheduler
+                        task.current_question = None # Clear the question
+                        task.agent_role_paused = None
+                        logger.info(f"Injected dependency {source_task_id} into task {task_id}. Resetting to pending.")
+                    else:
+                        logger.warning(f"Cannot inject dependency from non-complete task {source_task_id}.")
+                else:
+                    logger.warning(f"Could not find source task {source_task_id} for dependency injection.")
+            else:
+                logger.warning(f"Cannot inject dependency into task {task_id} that is not waiting for user response.")
+            self.state_manager.upsert_task(task)
+            return
+
         if not task:
             logger.warning(f"Directive '{command}' for unknown task {task_id} ignored.")
             return
@@ -1028,6 +1049,32 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
         dep_results = {dep.desc: dep.result for did in pruned_dep_ids if (dep := self.state_manager.get_task(did)) and dep.status == 'complete' and dep.result}
 
         prompt_lines = [f"Your task is: {t.desc}\n"]
+
+        if t.human_injected_deps:
+            prompt_lines.append("\n--- CONTEXT MANUALLY PROVIDED BY OPERATOR ---\n")
+            logger.info(f"Task [{t.id}] has {len(t.human_injected_deps)} injected dependencies.")
+            for injected_dep in t.human_injected_deps:
+                source_task = self.state_manager.get_task(injected_dep.source_task_id)
+                if not source_task:
+                    continue
+
+                if injected_dep.depth == "shallow":
+                    prompt_lines.append(
+                        f"- From injected shallow dependency '{source_task.desc}':\n{source_task.result}\n"
+                    )
+                elif injected_dep.depth == "deep":
+                    history_str = json.dumps(source_task.executor_llm_history, indent=2) if source_task.executor_llm_history else "Not available."
+                    prompt_lines.append(
+                        f"- From injected DEEP dependency '{source_task.desc}':\n"
+                        f"  - Result: {source_task.result}\n"
+                        f"  - Execution History: {history_str}\n"
+                    )
+            prompt_lines.append("-------------------------------------------\n\n")
+            # Clear the injected dependencies after using them so they aren't reused on a retry
+            t.human_injected_deps = []
+            self.state_manager.upsert_task(t)
+
+
         if child_results:
             prompt_lines.append("\nSynthesize results from sub-tasks:\n" + "\n".join([f"- From '{desc}':\n{res}\n" for desc, res in child_results.items()]))
         if dep_results:
