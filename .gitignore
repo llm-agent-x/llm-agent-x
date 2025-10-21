@@ -1,12 +1,14 @@
 */__pycache__/*
+*.pyc
+*.pyc.*
 venv/*
 .env
 output/*
 .vscode/*
-*.pyc
 .idea/*
 dist/
 llm_agent_x.log
 mcpconf.json
 tasks.json
 input/*
+*.exe
