@@ -68,7 +68,11 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
 
+import heapq
+
 from llm_agent_x.backend.extract_json_from_text import extract_json
+from llm_agent_x.core.interrupts import HumanDirectiveInterrupt, Interrupt, AgentMessageInterrupt
+from llm_agent_x.core.types import HumanInjectedDependency
 from llm_agent_x.state_manager import InMemoryStateManager, AbstractStateManager
 
 load_dotenv(".env", override=True)
@@ -653,12 +657,20 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
     async def _handle_directive(self, directive: dict):
         command, task_id, payload = directive.get("command"), directive.get("task_id"), directive.get("payload")
 
+        # --- System-level commands (do not generate interrupts) ---
         if command == "ADD_ROOT_TASK":
             payload = directive.get("payload", {})
             if desc := payload.get("desc"):
-                new_task = Task(id=str(uuid.uuid4())[:8], desc=desc, needs_planning=payload.get("needs_planning", True), status="pending", mcp_servers=payload.get("mcp_servers", []))
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=desc,
+                    needs_planning=payload.get("needs_planning", True),
+                    status="pending",
+                    mcp_servers=payload.get("mcp_servers", []),
+                    tags=set(payload.get("tags", []))
+                )
                 self.state_manager.upsert_task(new_task)
-                logger.info(f"Added new root task from directive: {new_task.id} - {new_task.desc}")
+                logger.info(f"Added new root task from directive: {new_task.id} with tags {new_task.tags}")
             return
 
         if command == "ADD_DOCUMENT":
@@ -670,103 +682,145 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 logger.info(f"Added new document node: {new_doc_task.id} - {name}")
             return
 
-        task = self.state_manager.get_task(task_id)
-
-        if command == "UPDATE_DOCUMENT" and task and task.task_type == "document" and task.document_state:
-            if new_name := payload.get("name"):
-                task.desc = f"Document: {new_name}"
-            if (new_content := payload.get("content")) is not None and generate_hash(new_content) != task.document_state.content_hash:
-                task.document_state = DocumentState(content=new_content, version=task.document_state.version + 1)
-            self.state_manager.upsert_task(task)
-            return
-
-        if command == "DELETE_DOCUMENT" and task and task.task_type == "document":
-            await self._prune_specific_task(task_id, reason="Document deleted by operator.", new_status="pruned", override_critical=True)
-            return
-
-        if command == "CANCEL" and task:
-            task.status, task.result = "cancelled", f"Cancelled by operator: {payload or 'No reason given.'}"
-            if task_id in self.task_futures: self.task_futures[task_id].cancel()
-            self.state_manager.upsert_task(task)
-            await self._reset_downstream_tasks(task_id)
-            return
-
-        if command == "PRUNE_TASK":
-            await self._prune_specific_task(task_id, reason=payload or "Pruned by operator.", new_status="pruned")
-            await self._prune_orphaned_tasks()
-            return
-
         if command == "RESET_STATE":
             logger.warning("Received RESET_STATE directive. Wiping all tasks.")
             for future in self.task_futures.values(): future.cancel()
             self.task_futures.clear()
             self.inflight.clear()
-
-            # This is a bit brute-force for in-memory, but fine for now.
-            # A DB implementation would be a transaction.
             current_tasks = list(self.state_manager.get_all_tasks().keys())
             for tid in current_tasks:
                 self.state_manager.delete_task(tid)
-
             for tid, task_data in payload.items():
                 try:
                     self.state_manager.upsert_task(Task(**task_data))
                 except Exception as e:
                     logger.error(f"Failed to load task {tid} from state file: {e}")
-
-            logger.info(f"Successfully loaded {len(payload)} tasks. Broadcasting state.")
+            logger.info(f"Successfully loaded {len(payload)} tasks.")
             for task in self.state_manager.get_all_tasks().values():
                 self._broadcast_state_update(task)
             return
 
-        if command == "INJECT_DEPENDENCY":
-            if task.status == "waiting_for_user_response":
-                source_task_id = payload.get("source_task_id")
-                depth = payload.get("depth", "shallow")
-                if source_task_id and (source_task := self.state_manager.get_task(source_task_id)):
-                    if source_task.status == 'complete':
-                        injected_dep = HumanInjectedDependency(source_task_id=source_task_id, depth=depth)
-                        task.human_injected_deps.append(injected_dep)
-                        task.status = "pending" # Reset to be picked up by scheduler
-                        task.current_question = None # Clear the question
-                        task.agent_role_paused = None
-                        logger.info(f"Injected dependency {source_task_id} into task {task_id}. Resetting to pending.")
-                    else:
-                        logger.warning(f"Cannot inject dependency from non-complete task {source_task_id}.")
-                else:
-                    logger.warning(f"Could not find source task {source_task_id} for dependency injection.")
-            else:
-                logger.warning(f"Cannot inject dependency into task {task_id} that is not waiting for user response.")
+        # --- Task-specific commands (generate interrupts) ---
+        task = self.state_manager.get_task(task_id)
+
+        if command == "UPDATE_DOCUMENT" and task and task.task_type == "document":
+            if new_name := payload.get("name"):
+                task.desc = f"Document: {new_name}"
+            if (new_content := payload.get("content")) is not None and task.document_state and generate_hash(new_content) != task.document_state.content_hash:
+                task.document_state = DocumentState(content=new_content, version=task.document_state.version + 1)
             self.state_manager.upsert_task(task)
             return
 
         if not task:
-            logger.warning(f"Directive '{command}' for unknown task {task_id} ignored.")
+            logger.warning(f"Directive '{command}' for unknown task '{task_id}' ignored.")
             return
 
+        # For all other commands, create and enqueue a HumanDirectiveInterrupt.
+        # This centralizes task control flow through the PODA loop.
+        logger.info(f"Enqueuing '{command}' interrupt for task {task_id}.")
+
+        # Cancel any in-flight execution for this task to ensure the interrupt is processed promptly.
         if task_id in self.task_futures and not self.task_futures[task_id].done():
             self.task_futures[task_id].cancel()
 
-        reset_dependents = False
-        if command == "PAUSE": task.status = "paused_by_human"
-        elif command == "RESUME":
-            if task.status == "paused_by_human": task.status = "pending"
-        elif command == "TERMINATE":
-            task.status, task.result, reset_dependents = "failed", f"Terminated by operator: {payload}", True
-        elif command in ["REDIRECT", "MANUAL_OVERRIDE"]:
-            if command == "REDIRECT": task.human_directive = payload; task.status = "pending"
-            else: task.status, task.result = "complete", payload
-            task.fix_attempts = task.grace_attempts = 0
-            task.verification_scores, task.last_llm_history, task.execution_log = [], None, []
-            reset_dependents = True
-        elif command == "ANSWER_QUESTION" and task.status == "waiting_for_user_response":
-            task.user_response = str(payload)
-            task.current_question = task.agent_role_paused = None
+        interrupt = HumanDirectiveInterrupt(command=command, payload=payload)
+        heapq.heappush(task.interrupt_queue, interrupt)
 
-        if reset_dependents:
-            await self._reset_downstream_tasks(task_id)
+        # Set status to pending so scheduler picks it up, unless it's a pause command
+        if command != "PAUSE" and task.status in ["paused_by_human", "waiting_for_user_response"]:
+            task.status = "pending"
 
         self.state_manager.upsert_task(task)
+
+    async def _handle_interrupt(self, ctx: TaskContext, interrupt: Interrupt):
+        """Processes an Interrupt from the task's queue, modifying the task's state."""
+        t = ctx.task
+
+        # Handle Human Directives
+        if isinstance(interrupt, HumanDirectiveInterrupt):
+            command, payload = interrupt.command, interrupt.payload
+            logger.info(f"Task [{t.id}] is handling human interrupt: {command}")
+
+            reset_dependents = False
+
+            if command == "PAUSE":
+                t.status = "paused_by_human"
+
+            elif command == "RESUME":
+                if t.status == "paused_by_human":
+                    t.status = "pending"
+
+            elif command == "TERMINATE":
+                t.status = "failed"
+                t.result = f"Terminated by operator: {payload or 'No reason given.'}"
+                reset_dependents = True
+
+            elif command == "CANCEL":
+                t.status = "cancelled"
+                t.result = f"Cancelled by operator: {payload or 'No reason given.'}"
+                # Cancelling a task should also reset its dependents
+                reset_dependents = True
+
+            elif command == "PRUNE_TASK":
+                await self._prune_specific_task(t.id, reason=payload or "Pruned by operator.", new_status="pruned")
+                await self._prune_orphaned_tasks()
+                # Pruning removes the task, so we can stop processing for it.
+                return
+
+            elif command == "DELETE_DOCUMENT" and t.task_type == "document":
+                await self._prune_specific_task(t.id, reason="Document deleted by operator.", new_status="pruned", override_critical=True)
+                return
+
+            elif command == "REDIRECT":
+                # This is an informational interrupt. The main change is resetting the task state
+                # so it can re-evaluate with new context provided by the interrupt's prompt.
+                t.status = "pending"
+                t.result = None
+                t.fix_attempts = t.grace_attempts = 0
+                t.verification_scores, t.last_llm_history, t.execution_log = [], None, []
+                # We will inject the interrupt prompt in the next PODA loop iteration.
+                reset_dependents = True
+
+            elif command == "MANUAL_OVERRIDE":
+                t.status = "complete"
+                t.result = payload
+                t.fix_attempts = t.grace_attempts = 0
+                t.verification_scores, t.last_llm_history, t.execution_log = [], None, []
+                reset_dependents = True
+
+            elif command == "ANSWER_QUESTION":
+                if t.status == "waiting_for_user_response":
+                    t.status = "pending"
+                    # The answer (payload) is now part of the interrupt context.
+                    # Clear the question state so the agent knows it's been answered.
+                    t.current_question = None
+                    t.agent_role_paused = None
+
+            elif command == "INJECT_DEPENDENCY":
+                if t.status == "waiting_for_user_response":
+                    source_task_id = payload.get("source_task_id")
+                    depth = payload.get("depth", "shallow")
+                    source_task = self.state_manager.get_task(source_task_id)
+                    if source_task and source_task.status == 'complete':
+                        injected_dep = HumanInjectedDependency(source_task_id=source_task_id, depth=depth)
+                        t.human_injected_deps.append(injected_dep)
+                        t.status = "pending"
+                        t.current_question = None
+                        t.agent_role_paused = None
+                        logger.info(f"Injected dependency {source_task_id} into task {t.id}. Resetting to pending.")
+                    else:
+                        logger.warning(f"Cannot inject dependency from non-complete or non-existent task {source_task_id}.")
+
+            if reset_dependents:
+                await self._reset_downstream_tasks(t.id)
+
+        # Handle Agent Messages
+        elif isinstance(interrupt, AgentMessageInterrupt):
+            logger.info(f"Task [{t.id}] is handling an agent message from [{interrupt.source_task_id}]")
+            # For now, we don't have special state changes for agent messages.
+            # They are purely informational and will be injected into the next LLM prompt.
+            # The task will continue its normal flow, but with new information.
+            pass
 
     async def _reset_downstream_tasks(self, task_id: str):
         logger.info(f"Resetting downstream tasks of {task_id}")
