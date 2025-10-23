@@ -49,3 +49,10 @@ Adds a dependency between two tasks.
 This is a high-level graph operation that modifies two tasks.
         """
         pass
+
+
+class TaskContext:
+    def __init__(self, task_id: str, state_manager: AbstractStateManager):
+        self.task_id = task_id
+        self.state_manager = state_manager
+        self.task = self.state_manager.get_task(task_id)

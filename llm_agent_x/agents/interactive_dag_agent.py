@@ -34,31 +34,6 @@ from pydantic_ai.messages import ModelRequest
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.tools import ToolDefinition
 
-from llm_agent_x.core import Task, UserQuestion, DocumentState
-from llm_agent_x.agents.dag_agent import (
-    DAGAgent,
-    TaskContext,
-    ExecutionPlan,
-    ProposedSubtask,
-    verification,
-    RetryDecision,
-    ProposalResolutionPlan,
-    AdaptiveDecomposerResponse,
-    InformationNeedDecision,
-    DependencySelection,
-    PruningDecision,
-    TaskForMerging,
-    MergedTask,
-    MergingDecision,
-    NewSubtask,
-    ContextualAnswer,
-    RedundancyDecision,
-    ChainedExecutionPlan,
-    TaskChain,
-    TaskDescription,
-    generate_hash,
-)
-
 from dotenv import load_dotenv
 
 from opentelemetry import trace, context as otel_context
@@ -67,6 +42,36 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
+
+from llm_agent_x.agents.dag_agent import (
+    DAGAgent,
+)
+from llm_agent_x.backend.utils import generate_hash
+from llm_agent_x.core import (
+    Task,
+    UserQuestion,
+    DocumentState,
+    verification,
+    RetryDecision,
+    InformationNeedDecision,
+    PruningDecision,
+    DependencySelection,
+    NewSubtask,
+    ExecutionPlan,
+    ProposedSubtask,
+    AdaptiveDecomposerResponse,
+    TaskForMerging,
+    MergedTask,
+    MergingDecision,
+    ProposalResolutionPlan,
+    ContextualAnswer,
+    RedundancyDecision,
+    TaskDescription,
+    TaskChain,
+    ChainedExecutionPlan,
+    HumanInjectedDependency,
+)
+from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 
 from llm_agent_x.backend.extract_json_from_text import extract_json
 from llm_agent_x.state_manager import InMemoryStateManager, AbstractStateManager
