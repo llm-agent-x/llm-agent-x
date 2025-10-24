@@ -42,6 +42,14 @@ class DocumentState(BaseModel):
         if not self.content_hash:
             self.content_hash = generate_hash(self.content)
 
+class verification(BaseModel):
+    reason: str
+    message_for_user: str
+    score: float = Field(description="A numerical score from 1 (worst) to 10 (best).")
+
+    def get_successful(self):
+        return self.score > 5
+
 class Task(BaseModel):
     id: str
     desc: str
@@ -71,7 +79,8 @@ class Task(BaseModel):
     # --- RETRY & TRACING FIELDS ---
     fix_attempts: int = 0
     max_fix_attempts: int = 2
-    verification_scores: List[float] = Field(default_factory=list)
+
+    verification_history: List[verification] = Field(default_factory=list)
     grace_attempts: int = 0
 
     # We remove Span and Any to avoid complex imports in this core types file
@@ -104,15 +113,6 @@ class Task(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
-
-
-class verification(BaseModel):
-    reason: str
-    message_for_user: str
-    score: float = Field(description="A numerical score from 1 (worst) to 10 (best).")
-
-    def get_successful(self):
-        return self.score > 5
 
 
 class RetryDecision(BaseModel):

@@ -63,6 +63,8 @@ class DAGAgent:
         max_grace_attempts: int = 1,
         min_question_priority: int = 1,
         mcp_server_url: Optional[str] = None,
+        *args,
+        **kwargs,
     ):
         self.state_manager = state_manager or InMemoryStateManager()
         self.inflight = set()
@@ -80,7 +82,8 @@ class DAGAgent:
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
         self.mcp_servers = []
 
-        self._setup_agent_roles()
+        if kwargs.get("setup_agent_roles", True):
+            self._setup_agent_roles()
 
     def _print_status_tree(self):
         logger.info("--- CURRENT TASK STATUS TREE ---")
