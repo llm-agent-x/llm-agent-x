@@ -45,8 +45,6 @@ export default function MissionControl() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- Handlers for state management ---
-
   const handleDownloadState = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/state/download`);
@@ -112,7 +110,6 @@ export default function MissionControl() {
     }
   };
 
-  // --- useEffect hooks for initialization and socket connection ---
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -198,8 +195,8 @@ export default function MissionControl() {
   }, [tasks, selectedTaskId, taskList]);
 
   return (
-    <main className="bg-zinc-900 text-white min-h-screen p-4 md:p-6 lg:p-8 max-h-screen">
-      <header className="mb-6 flex justify-between items-center">
+    <main className="bg-zinc-900 text-white min-h-screen p-4 md:p-6 lg:p-8 max-h-screen flex flex-col">
+      <header className="flex-shrink-0 mb-6 flex justify-between items-center">
         <div>
           <h1 className="text-3xl font-bold text-zinc-100">
             Collaborative Intelligence Swarm
@@ -208,52 +205,77 @@ export default function MissionControl() {
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center p-1 bg-zinc-800 rounded-lg border border-zinc-700">
-            <button onClick={() => setMainView("graph")} className={`px-3 py-1 text-sm rounded-md flex items-center gap-2 ${mainView === "graph" ? "bg-blue-600 text-white" : "text-zinc-400 hover:bg-zinc-700"}`} title="Graph View">
+            <button
+              onClick={() => setMainView("graph")}
+              className={`px-3 py-1 text-sm rounded-md flex items-center gap-2 ${mainView === "graph" ? "bg-blue-600 text-white" : "text-zinc-400 hover:bg-zinc-700"}`}
+              title="Graph View"
+            >
               <LayoutGrid size={16} /> Graph
             </button>
-            <button onClick={() => setMainView("log")} className={`px-3 py-1 text-sm rounded-md flex items-center gap-2 ${mainView === "log" ? "bg-blue-600 text-white" : "text-zinc-400 hover:bg-zinc-700"}`} title="Execution Log View">
+            <button
+              onClick={() => setMainView("log")}
+              className={`px-3 py-1 text-sm rounded-md flex items-center gap-2 ${mainView === "log" ? "bg-blue-600 text-white" : "text-zinc-400 hover:bg-zinc-700"}`}
+              title="Execution Log View"
+            >
               <TerminalSquare size={16} /> Log
             </button>
           </div>
           <div className="w-px h-6 bg-zinc-700"></div>
           <div className="flex items-center gap-2 text-sm text-zinc-400">
             <span>Gateway Status</span>
-            <div className={`w-3 h-3 rounded-full transition-colors ${isConnected ? "bg-green-500 animate-pulse" : "bg-red-500"}`} title={isConnected ? "Connected" : "Disconnected"}></div>
+            <div
+              className={`w-3 h-3 rounded-full transition-colors ${isConnected ? "bg-green-500 animate-pulse" : "bg-red-500"}`}
+              title={isConnected ? "Connected" : "Disconnected"}
+            ></div>
           </div>
           <DocumentManager />
-          <McpServerManager servers={mcpServers} setServers={setMcpServers} defaultServers={DEFAULT_SERVERS} />
-          <button onClick={handleDownloadState} className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100" title="Download Graph State">
+          <McpServerManager
+            servers={mcpServers}
+            setServers={setMcpServers}
+            defaultServers={DEFAULT_SERVERS}
+          />
+          <button
+            onClick={handleDownloadState}
+            className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
+            title="Download Graph State"
+          >
             <Download className="h-5 w-5" />
           </button>
-          <button onClick={handleUploadClick} className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100" title="Upload Graph State">
+          <button
+            onClick={handleUploadClick}
+            className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
+            title="Upload Graph State"
+          >
             <Upload className="h-5 w-5" />
           </button>
-          <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".json" style={{ display: "none" }} />
+          <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileChange}
+            accept=".json"
+            style={{ display: "none" }}
+          />
         </div>
       </header>
 
-      {/* --- THE FIX: Main content area now grows and handles its height correctly --- */}
-      <div className="flex-grow min-h-0 grid grid-cols-1 lg:grid-cols-[auto_1fr] gap-6">
-        {/* Column 1: Task List & Form (Parent flex container) */}
+      <div className="flex-grow min-h-0 grid grid-cols-1 lg:grid-cols-[35rem_1fr] gap-6">
+        {/* Column 1: Task List & Form */}
         <div className="flex flex-col h-full">
-          {/* The scrollable child, now with min-h-0 */}
-          <div className="flex-grow overflow-y-auto min-h-0 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50 w-[35rem]">
+          <div className="flex-grow overflow-y-auto min-h-0 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50">
             <TaskList
               tasks={taskList}
               selectedTaskId={selectedTaskId}
               onSelectTask={handleSelectTask}
             />
           </div>
-          {/* The non-scrolling child */}
           <div className="flex-shrink-0">
             <NewTaskForm mcpServers={mcpServers} />
           </div>
         </div>
 
-        {/* Column 2: Conditional View (Parent grid cell) */}
+        {/* Column 2: Conditional View */}
         <div className="h-full min-w-0">
           {mainView === "graph" ? (
-             // Use a grid here so children can be h-full relative to it
             <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-6 h-full">
               <DAGView
                 tasks={taskList}
