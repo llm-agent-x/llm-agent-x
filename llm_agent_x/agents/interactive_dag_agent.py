@@ -1163,10 +1163,13 @@ class InteractiveDAGAgent(DAGAgent):
             logger.info(f"[{t.id}] Attempt {current_attempt}: Streaming executor actions...")
             exec_res, result = None, None
 
-            # --- START OF THE FIX ---
-            t.execution_log = []
+            attempt_marker = {
+                "type": "thought",
+                "content": f"--- Starting Execution Attempt #{current_attempt} ---"
+            }
+            self._broadcast_execution_log_update(t.id, attempt_marker)
             self.state_manager.upsert_task(t)
-            temp_execution_log = []
+            temp_execution_log = t.execution_log
             try:
                 async with task_executor.iter(user_prompt=current_prompt,
                                               message_history=t.last_llm_history) as agent_run:
