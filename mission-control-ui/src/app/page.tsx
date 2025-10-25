@@ -195,7 +195,7 @@ export default function MissionControl() {
   }, [tasks, selectedTaskId, taskList]);
 
   return (
-    <main className="bg-zinc-900 text-white min-h-screen p-4 md:p-6 lg:p-8 max-h-screen flex flex-col">
+    <main className="bg-zinc-900 text-white min-h-screen p-4 md:p-6 lg:p-8 h-screen flex flex-col">
       <header className="flex-shrink-0 mb-6 flex justify-between items-center">
         <div>
           <h1 className="text-3xl font-bold text-zinc-100">
@@ -261,7 +261,7 @@ export default function MissionControl() {
       <div className="flex-grow min-h-0 grid grid-cols-1 lg:grid-cols-[35rem_1fr] gap-6">
         {/* Column 1: Task List & Form */}
         <div className="flex flex-col h-full">
-          <div className="flex-grow overflow-y-auto min-h-0 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50 overflow-x-hidden">
+          <div className="flex-grow min-h-0 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50 h-0 overflow-y-scroll overflow-x-hidden">
             <TaskList
               tasks={taskList}
               selectedTaskId={selectedTaskId}
