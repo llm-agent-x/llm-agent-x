@@ -25,6 +25,14 @@ interface DocumentState {
   content_hash: string;
 }
 
+export interface ExecutionLogEntry {
+  type: 'thought' | 'tool_call' | 'tool_result' | 'final_answer' | 'error';
+  content?: string;
+  tool_name?: string;
+  args?: Record<string, unknown>;
+  result?: unknown; // More type-safe than any, but still flexible
+}
+
 export interface Task {
   id: string;
   desc: string;
@@ -37,4 +45,6 @@ export interface Task {
   task_type?: "task" | "document"; // The `?` makes it optional for regular tasks
   document_state?: DocumentState | null; // Optional and can be null
   parent?: string;
+
+  execution_log: ExecutionLogEntry[];
 }

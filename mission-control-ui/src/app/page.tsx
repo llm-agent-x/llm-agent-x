@@ -3,14 +3,20 @@
 
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { io, Socket } from "socket.io-client";
-import { Download, Upload } from "lucide-react"; // Import new icons
+import {
+  Download,
+  Upload,
+  LayoutGrid,
+  TerminalSquare,
+} from "lucide-react";
 import { TaskList } from "./components/TaskList";
 import { TaskInspector } from "./components/TaskInspector";
 import { NewTaskForm } from "./components/NewTaskForm";
 import { DAGView } from "./components/DAGView";
+import { ExecutionLogView } from "./components/ExecutionLogView";
 import { McpServerManager, McpServer } from "./components/McpServerManager";
 import { DocumentManager } from "./components/DocumentManager";
-import {Task} from "@/lib/types";
+import { Task } from "@/lib/types";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -35,8 +41,9 @@ export default function MissionControl() {
   const [tasks, setTasks] = useState<{ [key: string]: Task }>({});
   const [isConnected, setIsConnected] = useState(false);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [mainView, setMainView] = useState<"graph" | "log">("graph");
 
-  const fileInputRef = useRef<HTMLInputElement>(null); // Ref for the hidden file input
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- Handlers for state management ---
 
@@ -46,10 +53,8 @@ export default function MissionControl() {
       if (!response.ok) {
         throw new Error(`Failed to download state: ${response.statusText}`);
       }
-
-      // Extract filename from Content-Disposition header
       const disposition = response.headers.get("content-disposition");
-      let filename = "graph_state.json"; // Default filename
+      let filename = "graph_state.json";
       if (disposition && disposition.indexOf("attachment") !== -1) {
         const filenameRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/;
         const matches = filenameRegex.exec(disposition);
@@ -57,7 +62,6 @@ export default function MissionControl() {
           filename = matches[1].replace(/['"]/g, "");
         }
       }
-
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -74,7 +78,6 @@ export default function MissionControl() {
   };
 
   const handleUploadClick = () => {
-    // Trigger the hidden file input
     fileInputRef.current?.click();
   };
 
@@ -83,39 +86,33 @@ export default function MissionControl() {
   ) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
     const formData = new FormData();
     formData.append("file", file);
-
     try {
       const response = await fetch(`${API_BASE_URL}/api/state/upload`, {
         method: "POST",
         body: formData,
       });
-
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(
           `Failed to upload state: ${errorData.detail || response.statusText}`,
         );
       }
-
       alert(
         "State file uploaded successfully. The agent will now reset to the new state.",
       );
-      // The UI will automatically update via WebSocket broadcasts from the agent.
     } catch (error) {
       console.error("Error uploading state:", error);
       alert(`Error: ${(error as Error).message}`);
     } finally {
-      // Reset the file input so the same file can be uploaded again
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
     }
   };
 
-  // --- (No changes to the useEffect hooks for localStorage, servers, or sockets) ---
+  // --- useEffect hooks for initialization and socket connection ---
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -182,7 +179,7 @@ export default function MissionControl() {
   }, [tasks]);
 
   const completedTasks = useMemo(() => {
-    return taskList.filter(task => task.status === 'complete');
+    return taskList.filter((task) => task.status === "complete");
   }, [taskList]);
 
   const selectedTask = tasks[selectedTaskId!] || null;
@@ -210,6 +207,25 @@ export default function MissionControl() {
           <p className="text-zinc-400">Operator: Strategic Cortex</p>
         </div>
         <div className="flex items-center gap-4">
+          <div className="flex items-center p-1 bg-zinc-800 rounded-lg border border-zinc-700">
+            <button
+              onClick={() => setMainView("graph")}
+              className={`px-3 py-1 text-sm rounded-md flex items-center gap-2 ${mainView === "graph" ? "bg-blue-600 text-white" : "text-zinc-400 hover:bg-zinc-700"}`}
+              title="Graph View"
+            >
+              <LayoutGrid size={16} /> Graph
+            </button>
+            <button
+              onClick={() => setMainView("log")}
+              className={`px-3 py-1 text-sm rounded-md flex items-center gap-2 ${mainView === "log" ? "bg-blue-600 text-white" : "text-zinc-400 hover:bg-zinc-700"}`}
+              title="Execution Log View"
+            >
+              <TerminalSquare size={16} /> Log
+            </button>
+          </div>
+
+          <div className="w-px h-6 bg-zinc-700"></div>
+
           <div className="flex items-center gap-2 text-sm text-zinc-400">
             <span>Gateway Status</span>
             <div
@@ -225,8 +241,6 @@ export default function MissionControl() {
             setServers={setMcpServers}
             defaultServers={DEFAULT_SERVERS}
           />
-
-          {/* --- NEW BUTTONS --- */}
           <button
             onClick={handleDownloadState}
             className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
@@ -234,7 +248,6 @@ export default function MissionControl() {
           >
             <Download className="h-5 w-5" />
           </button>
-
           <button
             onClick={handleUploadClick}
             className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 h-10 w-10 p-0 border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:text-zinc-100"
@@ -251,9 +264,10 @@ export default function MissionControl() {
           />
         </div>
       </header>
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr_1fr] gap-6 h-[calc(100vh-120px)]">
-        <div className="flex flex-col h-[calc(100vh-120px)]">
-          <div className="flex-grow overflow-y-auto pr-2 bg-zinc-800/50 p-3 rounded-lg border border-zinc-700">
+      <div className="grid grid-cols-1 lg:grid-cols-[auto_1fr] gap-6 h-[calc(100vh-120px)]">
+        {/* Column 1: Task List & Form */}
+        <div className="flex flex-col h-full">
+          <div className="flex-grow overflow-y-auto pr-2 bg-zinc-800/50 p-3 rounded-lg border border-zinc-700 w-[35rem]">
             <TaskList
               tasks={taskList}
               selectedTaskId={selectedTaskId}
@@ -264,15 +278,24 @@ export default function MissionControl() {
             <NewTaskForm mcpServers={mcpServers} />
           </div>
         </div>
-        <div className="lg:col-span-1 h-full">
-          <DAGView
-            tasks={taskList}
-            selectedTaskId={selectedTaskId}
-            onSelectTask={handleSelectTask}
-          />
-        </div>
-        <div className="lg:col-span-1 h-full">
-          <TaskInspector task={selectedTask} completedTasks={completedTasks}/>
+
+        {/* Column 2: Conditional View (Graph+Inspector OR Log) */}
+        <div className="h-full min-w-0">
+          {mainView === "graph" ? (
+            <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-6 h-full">
+              <DAGView
+                tasks={taskList}
+                selectedTaskId={selectedTaskId}
+                onSelectTask={handleSelectTask}
+              />
+              <TaskInspector
+                task={selectedTask}
+                completedTasks={completedTasks}
+              />
+            </div>
+          ) : (
+            <ExecutionLogView task={selectedTask} />
+          )}
         </div>
       </div>
     </main>
