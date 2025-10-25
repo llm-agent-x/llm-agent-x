@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 from typing import List, Tuple, Union, Dict, Any, Optional, Callable
@@ -465,6 +466,15 @@ class InteractiveDAGAgent(DAGAgent):
                 channel.basic_publish(exchange=self.STATE_UPDATES_EXCHANGE, routing_key="", body=message)
         except Exception as e:
             logger.error(f"Failed to broadcast state update for task {task.id}: {e}", exc_info=False)
+
+    def _broadcast_execution_log_update(self, task_id: str, log_entry: Dict[str, Any]):
+        """Helper to broadcast a single execution log entry."""
+        task = self.state_manager.get_task(task_id)
+        if task:
+            task.execution_log.append(log_entry)
+            # We broadcast the whole task so the UI can update its state.
+            # This is more robust than sending partial updates.
+            self._broadcast_state_update(task)
 
     def _format_stream_node(self, node: Any) -> Optional[Dict[str, Any]]:
         def truncate(s: Any, length: int = 250) -> str:
@@ -1152,6 +1162,8 @@ class InteractiveDAGAgent(DAGAgent):
             exec_res, result = None, None
 
             # --- START OF THE FIX ---
+            t.execution_log = []
+            self.state_manager.upsert_task(t)
             temp_execution_log = []
             try:
                 async with task_executor.iter(user_prompt=current_prompt,
@@ -1159,11 +1171,12 @@ class InteractiveDAGAgent(DAGAgent):
                     async for node in agent_run:
                         if formatted_node := self._format_stream_node(node):
                             # Collect nodes in a temporary list instead of saving state immediately
-                            temp_execution_log.append(formatted_node)
+                            self._broadcast_execution_log_update(t.id, formatted_node)
                 exec_res = agent_run.result
             except Exception as e:
                 logger.error(f"[{t.id}] Exception during agent.iter: {e}", exc_info=True)
-                temp_execution_log.append({"type": "error", "content": f"Execution error: {e}"})
+                error_node = {type: "error", "content": f"Execution error: {str(e)}\n\nTraceback: {traceback.format_exc()}"}
+                self._broadcast_execution_log_update(t.id, error_node)
 
             # Now, update the state ONCE after the async iterator is finished
             t.execution_log = temp_execution_log
