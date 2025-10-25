@@ -17,7 +17,7 @@ from opentelemetry.trace import StatusCode
 from phoenix.trace.schemas import SpanAttributes
 from pydantic import BaseModel
 from pydantic_ai.agent import AgentRunResult, Agent, CallToolsNode, ModelRequestNode
-from pydantic_ai.mcp import MCPServerStreamableHTTP
+from pydantic_ai.mcp import MCPServerStreamableHTTP, MCPServerSSE
 from pydantic_ai.messages import (
     ToolCallPart,
     ToolReturnPart,
@@ -1133,6 +1133,8 @@ class InteractiveDAGAgent(DAGAgent):
                 try:
                     if server_config.get("type") == "streamable_http":
                         task_specific_mcp_clients.append(MCPServerStreamableHTTP(server_config["address"]))
+                    elif server_config.get("type") == "sse":
+                        task_specific_mcp_clients.append(MCPServerSSE(server_config["address"]))
                 except Exception as e:
                     logger.error(f"[{t.id}]: Failed to create MCP client for {server_config.get('name')}: {e}")
 
