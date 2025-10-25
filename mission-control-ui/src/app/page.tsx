@@ -261,7 +261,7 @@ export default function MissionControl() {
       <div className="flex-grow min-h-0 grid grid-cols-1 lg:grid-cols-[35rem_1fr] gap-6">
         {/* Column 1: Task List & Form */}
         <div className="flex flex-col h-full">
-          <div className="flex-grow overflow-y-auto min-h-0 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50">
+          <div className="flex-grow overflow-y-auto min-h-0 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50 overflow-x-hidden">
             <TaskList
               tasks={taskList}
               selectedTaskId={selectedTaskId}
@@ -274,7 +274,7 @@ export default function MissionControl() {
         </div>
 
         {/* Column 2: Conditional View */}
-        <div className="h-full min-w-0">
+        <div className="h-full max-h-full min-w-0 overflow-y-scroll">
           {mainView === "graph" ? (
             <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-6 h-full">
               <DAGView

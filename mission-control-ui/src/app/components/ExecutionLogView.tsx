@@ -5,7 +5,7 @@ import { ExecutionLog } from "./ExecutionLog";
 
 export const ExecutionLogView = ({ task }: { task: Task | null }) => {
   return (
-    <div className="bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 h-full flex flex-col">
+    <div className="bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 h-full flex flex-col overflow-y-scroll">
       <div className="flex-shrink-0 mb-4">
         <h2 className="text-xl font-bold text-zinc-100">Execution Log</h2>
         {task ? (
