@@ -28,7 +28,7 @@ export const TaskList = ({
   }
 
   return (
-    <div className="flex flex-col gap-2 h-[calc(100vh-520px] w-[35rem] overflow-y-auto">
+    <div className="flex flex-col gap-2 h-[calc(100vh-520px] w-[35rem] overflow-y-scroll overflow-x-hidden">
       <h2 className="text-lg font-bold text-zinc-300 px-2 mb-2">Task Swarm</h2>
       {/* No changes needed below, TypeScript now understands `task` is of type `Task` */}
       {tasks.map((task) => (

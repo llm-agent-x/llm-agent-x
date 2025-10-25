@@ -17,8 +17,14 @@ export const ExecutionLogView = ({ task }: { task: Task | null }) => {
           <p className="text-zinc-500">No task selected.</p>
         )}
       </div>
-      <div className="flex-grow overflow-y-auto pr-2">
-        {task && <ExecutionLog log={task.execution_log} />}
+      <div className="flex-grow overflow-y-auto min-h-0 pr-2">
+        {task ? (
+          <ExecutionLog log={task.execution_log} />
+        ) : (
+          <div className="text-center text-zinc-500 py-8">
+             No task selected.
+          </div>
+        )}
       </div>
     </div>
   );
