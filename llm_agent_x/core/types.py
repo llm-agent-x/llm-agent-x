@@ -6,6 +6,8 @@ from typing import Set, Dict, Any, Optional, List, Literal
 
 from pydantic import BaseModel, Field
 
+from llm_agent_x.core.interrupts import Interrupt
+
 
 # --- All Pydantic Models related to the Task graph structure go here ---
 
@@ -50,6 +52,31 @@ class verification(BaseModel):
     def get_successful(self):
         return self.score > 5
 
+
+class TokenBucket(BaseModel):
+    """Manages communication tokens for a task."""
+    tokens: float = 100.0
+    max_tokens: int = 100
+    refill_rate: float = 2.0  # Tokens per second
+    last_refilled_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def refill(self):
+        """Refills the bucket based on elapsed time."""
+        now = datetime.now(timezone.utc)
+        time_delta = (now - self.last_refilled_at).total_seconds()
+        if time_delta > 0:
+            new_tokens = self.tokens + (time_delta * self.refill_rate)
+            self.tokens = min(new_tokens, self.max_tokens)
+            self.last_refilled_at = now
+
+    def spend(self, amount: int) -> bool:
+        """Spends tokens if available. Returns True on success, False on failure."""
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+
 class Task(BaseModel):
     id: str
     desc: str
@@ -89,14 +116,15 @@ class Task(BaseModel):
     otel_context: Optional[Dict] = Field(None, exclude=True) # Stored as dict if needed, excluded from serialization
     span: Optional[Any] = Field(None, exclude=True) # Stored as Any, excluded from serialization
 
-
-    human_directive: Optional[str] = Field(None, description="A direct, corrective instruction from the operator.")
+    interrupt_queue: List[Interrupt] = Field(default_factory=list, exclude=True)
+    tags: Set[str] = Field(default_factory=set)
+    comm_token_bucket: TokenBucket = Field(default_factory=TokenBucket)
+    last_cycle_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     human_injected_deps: List[HumanInjectedDependency] = Field(default_factory=list, description="Dependencies manually injected by an operator during a pause.")
     
     current_question: Optional[UserQuestion] = Field(None,
                                                      description="The question an agent is currently asking the human operator.")
-    user_response: Optional[str] = Field(None, description="The human operator's response to an agent's question.")
 
     # --- NEW CONTEXT FIELDS ---
     last_llm_history: Optional[List[Dict[str, Any]]] = Field(None, exclude=True)
