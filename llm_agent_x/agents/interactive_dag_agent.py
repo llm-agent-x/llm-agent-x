@@ -148,16 +148,21 @@ class InteractiveDAGAgent(DAGAgent):
 
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
-            "You will be given the main objective and, crucially, a list of 'AVAILABLE DOCUMENTS' and their global IDs. These documents are your primary data sources."
-            "\n\n**YOUR DECISION PROCESS MUST FOLLOW THESE RULES:**"
-            "\n1. **CHECK DOCUMENTS FIRST:** Before creating any task, review the list of AVAILABLE DOCUMENTS. Ask yourself: 'Is the information needed for this step already present in one of these documents?'"
-            "\n2. **DEPEND, DON'T RE-CREATE:** If a task's primary purpose is to get information from an existing document, you MUST NOT create a new task to 'read' or 'analyze' it. Instead, create a task that USES the information and add the document's global ID directly to its `deps` list."
-            "\n3. **LINK SEQUENTIAL STEPS:** Structure your output as 'chains' of tasks. A 'chain' is a list of tasks that must be done sequentially. All chains will run in parallel."
+            "Crucially, you must also assign `tags` to each new task to define its capabilities and allow other agents to communicate with it."
+            "\n\n**TAGGING RULES:**"
+            "\n1. **Be Specific:** Tags should describe the task's function (e.g., 'research', 'writing', 'outreach')."
+            "\n2. **Group Related Tasks:** Tasks that need to collaborate or share information should have a common, unique tag (e.g., 'venue_selection', 'budget_approval_q2')."
+            "\n3. **Reuse Existing Tags:** A list of 'EXISTING TAGS' is provided. Reuse these where appropriate to maintain consistency."
+            "\n\n**PLANNING RULES:**"
+            "\n1. **Use Documents:** Check 'AVAILABLE DOCUMENTS' first. If a document provides needed info, create a task that USES it and add the document's ID to `deps`."
+            "\n2. **Create Chains:** Group sequential steps into a 'chain'. All chains run in parallel."
             "\n\n**EXAMPLE:**"
-            "\n- Objective: 'Create a summary of Q2 performance.'"
-            "\n- AVAILABLE DOCUMENTS: `[{'id': 'doc-abc', 'desc': 'Document: Q2 Financials'}]`"
-            "\n- **CORRECT ACTION:** Create a single task like `{'desc': 'Synthesize Q2 Financials into a summary', 'deps': ['doc-abc']}`."
-            "\n- **INCORRECT ACTION:** Creating a task like `{'desc': 'Read the Q2 Financials document', 'deps': []}`. This is redundant."
+            "\n- Objective: 'Plan the conference venue and marketing.'"
+            "\n- EXISTING TAGS: ['finance', 'planning']"
+            "\n- **CORRECT ACTION:** Create a plan with tasks like:"
+            "\n  - `{'desc': 'Research potential venues', 'tags': ['planning', 'venue_selection']}`"
+            "\n  - `{'desc': 'Finalize venue choice', 'tags': ['planning', 'venue_selection']}` (depends on the first task)"
+            "\n  - `{'desc': 'Draft marketing copy', 'tags': ['marketing', 'copywriting']}` (runs in parallel)"
         )
 
         self.initial_planner = Agent(
@@ -1037,7 +1042,11 @@ class InteractiveDAGAgent(DAGAgent):
 
         all_tasks = self.state_manager.get_all_tasks()
         context_str = "\n".join([f"- ID: {tk.id} Desc: {tk.desc}" for tk in all_tasks.values() if tk.status == "complete" and tk.id != t.id])
-        prompt_parts = [f"Objective: {t.desc}", f"\nAvailable completed data sources:\n{context_str}", f"\n--- Shared Notebook ---\n{self._format_notebook_for_llm(t)}"]
+
+        existing_tags = self._get_all_existing_tags()
+        tags_str = f"\nEXISTING TAGS (reuse these if possible:\n{', '.join(existing_tags)}" if existing_tags else "\nNo existing tags."
+
+        prompt_parts = [f"Objective: {t.desc}", tags_str, f"\nAvailable completed data sources:\n{context_str}", f"\n--- Shared Notebook ---\n{self._format_notebook_for_llm(t)}"]
         # self._inject_and_clear_user_response(prompt_parts, t)
 
         plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
