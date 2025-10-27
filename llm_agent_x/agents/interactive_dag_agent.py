@@ -137,6 +137,11 @@ class InteractiveDAGAgent(DAGAgent):
         self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
         self.proposed_tasks_buffer = []
         self.proposed_task_dependencies_buffer = []
+
+        self.comms_manager = CommunicationManager(
+            state_manager=self.state_manager,
+        )
+
         self.update_notebook_tool = self._create_notebook_tool(
             self.state_manager, self._broadcast_state_update
         )
@@ -266,14 +271,6 @@ class InteractiveDAGAgent(DAGAgent):
             tools=self._tools_for_agents,
             mcp_servers=self.mcp_servers,
         )
-
-        self.comms_manager = CommunicationManager(
-            agent=self.executor,
-            state_manager=self.state_manager,
-        )
-
-        self.comms_manager.setup_communication_handlers()
-
 
         self.verifier = Agent(
             model=llm_model,
@@ -1148,8 +1145,18 @@ class InteractiveDAGAgent(DAGAgent):
         child_results = {child.desc: child.result for cid in t.children if
                          (child := self.state_manager.get_task(cid)) and child.status == 'complete' and child.result}
         pruned_dep_ids = final_deps_to_use - children_ids
-        dep_results = {dep.desc: dep.result for did in pruned_dep_ids if
-                       (dep := self.state_manager.get_task(did)) and dep.status == 'complete' and dep.result}
+        dep_results = {}
+        for did in pruned_dep_ids:
+            dep_task = self.state_manager.get_task(did)
+            if not dep_task or dep_task.status != 'complete':
+                continue
+
+            # **THE FIX**: If the dependency is a document, use its content.
+            if dep_task.task_type == "document" and dep_task.document_state:
+                dep_results[dep_task.desc] = dep_task.document_state.content
+            # Otherwise, use its result field as normal.
+            elif dep_task.result is not None:
+                dep_results[dep_task.desc] = dep_task.result
 
         prompt_lines = [f"Your task is: {t.desc}\n"]
 
@@ -1193,8 +1200,15 @@ class InteractiveDAGAgent(DAGAgent):
                     logger.error(f"[{t.id}]: Failed to create MCP client for {server_config.get('name')}: {e}")
 
         # The executor is now a class member, pre-configured with communication tools.
-        task_executor = self.executor
-        task_executor.mcp_servers = task_specific_mcp_clients  # Dynamically assign MCP servers for this run
+        task_executor = Agent(
+            model=self.base_llm_model,
+            system_prompt=self.executor_system_prompt,
+            output_type=str,
+            tools=list(self._tools_for_agents),
+            mcp_servers=task_specific_mcp_clients,
+        )
+
+        self.comms_manager.apply_to_agent(task_executor)
 
         # --- Answer to your question: Log Clearing Logic ---
         # We clear the log *once* when this entire execution flow begins.
