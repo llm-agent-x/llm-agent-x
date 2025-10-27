@@ -31,6 +31,7 @@ export interface ExecutionLogEntry {
   tool_name?: string;
   args?: Record<string, unknown>;
   result?: unknown; // More type-safe than any, but still flexible
+  timestamp?: string;
 }
 
 export interface Task {

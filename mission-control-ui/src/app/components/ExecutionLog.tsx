@@ -2,13 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { ExecutionLogEntry } from "@/lib/types";
-import {
-  Cog,
-  Wrench,
-  ClipboardCheck,
-  Sparkles,
-  AlertTriangle,
-} from "lucide-react";
+import { Cog, Wrench, ClipboardCheck, Sparkles, AlertTriangle } from "lucide-react";
 
 const iconMap = {
   thought: <Cog size={16} className="text-zinc-400" />,
@@ -18,16 +12,31 @@ const iconMap = {
   error: <AlertTriangle size={16} className="text-red-400" />,
 };
 
-const LogEntry = ({ entry }: { entry: ExecutionLogEntry }) => {
+// Update the type to include the optional taskId
+interface LogEntryProps {
+    entry: ExecutionLogEntry & { taskId?: string };
+    showTaskId?: boolean;
+}
+
+const LogEntry = ({ entry, showTaskId }: LogEntryProps) => {
   const icon = iconMap[entry.type] || <Cog size={16} />;
 
   return (
     <div className="flex items-start gap-3 py-2 px-1 border-b border-zinc-800/50">
       <div className="flex-shrink-0 pt-1">{icon}</div>
       <div className="flex-grow min-w-0">
-        <p className="text-xs font-semibold capitalize text-zinc-300">
-          {entry.type.replace("_", " ")}
-        </p>
+        <div className="flex justify-between items-center">
+            <p className="text-xs font-semibold capitalize text-zinc-300">
+            {entry.type.replace("_", " ")}
+            </p>
+            {showTaskId && entry.taskId && (
+                <span className="font-mono text-xs bg-zinc-700/50 text-zinc-400 px-1.5 py-0.5 rounded">
+                    {entry.taskId}
+                </span>
+            )}
+        </div>
+
+        {/* The rest of the rendering logic remains the same */}
         {entry.type === "thought" && (
           <p className="text-sm text-zinc-400">{entry.content}</p>
         )}
@@ -62,7 +71,13 @@ const LogEntry = ({ entry }: { entry: ExecutionLogEntry }) => {
   );
 };
 
-export const ExecutionLog = ({ log }: { log: ExecutionLogEntry[] }) => {
+// Update props for ExecutionLog
+interface ExecutionLogProps {
+    log: (ExecutionLogEntry & { taskId?: string })[];
+    showTaskId?: boolean;
+}
+
+export const ExecutionLog = ({ log, showTaskId = false }: ExecutionLogProps) => {
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -72,7 +87,7 @@ export const ExecutionLog = ({ log }: { log: ExecutionLogEntry[] }) => {
   if (!log || log.length === 0) {
     return (
       <div className="text-center text-zinc-500 py-8">
-        No execution steps logged for this task yet.
+        No execution steps logged.
       </div>
     );
   }
@@ -80,7 +95,7 @@ export const ExecutionLog = ({ log }: { log: ExecutionLogEntry[] }) => {
   return (
     <div className="font-mono text-sm">
       {log.map((entry, index) => (
-        <LogEntry key={index} entry={entry} />
+        <LogEntry key={index} entry={entry} showTaskId={showTaskId} />
       ))}
       <div ref={logEndRef} />
     </div>

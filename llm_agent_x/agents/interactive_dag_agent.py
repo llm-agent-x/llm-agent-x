@@ -487,6 +487,8 @@ class InteractiveDAGAgent(DAGAgent):
         """Helper to broadcast a single execution log entry."""
         task = self.state_manager.get_task(task_id)
         if task:
+            log_entry['timestamp'] = datetime.now(timezone.utc).isoformat()
+
             task.execution_log.append(log_entry)
             # We broadcast the whole task so the UI can update its state.
             # This is more robust than sending partial updates.

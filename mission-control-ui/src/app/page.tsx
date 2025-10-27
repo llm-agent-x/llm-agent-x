@@ -175,6 +175,21 @@ export default function MissionControl() {
     return Object.values(tasks).sort((a, b) => a.id.localeCompare(b.id));
   }, [tasks]);
 
+  const globalLog = useMemo(() => {
+    const allEntries = Object.values(tasks).flatMap(task =>
+      task.execution_log.map(entry => ({ ...entry, taskId: task.id }))
+    );
+
+    allEntries.sort((a, b) => {
+      const aTime = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+      const bTime = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+
+      return aTime - bTime;
+    });
+
+    return allEntries;
+  }, [tasks])
+
   const completedTasks = useMemo(() => {
     return taskList.filter((task) => task.status === "complete");
   }, [taskList]);
@@ -288,7 +303,10 @@ export default function MissionControl() {
               />
             </div>
           ) : (
-            <ExecutionLogView task={selectedTask} />
+            <ExecutionLogView
+              selectedTask={selectedTask}
+              globalLog={globalLog}
+            />
           )}
         </div>
       </div>
