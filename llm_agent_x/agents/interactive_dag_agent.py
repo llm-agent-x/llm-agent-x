@@ -1366,6 +1366,8 @@ class InteractiveDAGAgent(DAGAgent):
 
     async def _verify_task(self, t: Task, candidate_result: str) -> Optional[verification]:
         prompt_parts = [f"Job: Verify if 'Candidate Result' completes 'Original Task'.", f"\n--- Original Task ---\n{t.desc}"]
+
+        prompt_parts.append(f"\n--- Candidate Internal Log ---\n{t.executor_llm_history}")
         if t.human_directive: prompt_parts.append(f"\n--- Operator's Directive ---\n{t.human_directive}")
         # if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
         prompt_parts.extend([f"\n--- Candidate Result ---\n{candidate_result}", "\n\nDoes the result, considering directives, complete the task? Be strict."])
