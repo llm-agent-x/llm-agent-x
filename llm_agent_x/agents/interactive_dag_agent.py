@@ -709,28 +709,72 @@ class InteractiveDAGAgent(DAGAgent):
             logger.info("Consumer thread exited.")
 
     async def _handle_directive(self, directive: dict):
-        command, task_id, payload = directive.get("command"), directive.get("task_id"), directive.get("payload")
+        command = directive.get("command")
+        task_id = directive.get("task_id")
+        payload = directive.get("payload")
+
+        logger.info(f"Dispatcher received command '{command}' for task '{task_id}'")
+
+        # --- System-Level Commands (Graph/State Manipulation) ---
+        # These are handled directly by the worker and do not go into the task's interrupt queue.
 
         if command == "ADD_ROOT_TASK":
             payload = directive.get("payload", {})
             if desc := payload.get("desc"):
-                new_task = Task(id=str(uuid.uuid4())[:8], desc=desc, needs_planning=payload.get("needs_planning", True), status="pending", mcp_servers=payload.get("mcp_servers", []))
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=desc,
+                    needs_planning=payload.get("needs_planning", True),
+                    status="pending",
+                    mcp_servers=payload.get("mcp_servers", []),
+                    tags=set(payload.get("tags", [])), # <-- Handle tags on creation
+                )
                 self.state_manager.upsert_task(new_task)
-                logger.info(f"Added new root task from directive: {new_task.id} - {new_task.desc}")
+                logger.info(f"Added new root task: {new_task.id} - {new_task.desc}")
             return
 
         if command == "ADD_DOCUMENT":
             payload = directive.get("payload", {})
             if (name := payload.get("name")) and (content := payload.get("content")) is not None:
                 doc_state = DocumentState(content=content)
-                new_doc_task = Task(id=str(uuid.uuid4())[:8], desc=f"Document: {name}", task_type="document", document_state=doc_state, status="complete", is_critical=True, counts_toward_limit=False)
+                new_doc_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=f"Document: {name}",
+                    task_type="document",
+                    document_state=doc_state,
+                    status="complete",
+                    is_critical=True,
+                    counts_toward_limit=False,
+                )
                 self.state_manager.upsert_task(new_doc_task)
                 logger.info(f"Added new document node: {new_doc_task.id} - {name}")
             return
 
-        task = self.state_manager.get_task(task_id)
+        if command == "RESET_STATE":
+            logger.warning("Received RESET_STATE directive. Wiping all tasks.")
+            for future in self.task_futures.values(): future.cancel()
+            self.task_futures.clear()
+            self.inflight.clear()
+            current_tasks = list(self.state_manager.get_all_tasks().keys())
+            for tid in current_tasks:
+                self.state_manager.delete_task(tid)
+            for tid, task_data in payload.items():
+                try:
+                    self.state_manager.upsert_task(Task(**task_data))
+                except Exception as e:
+                    logger.error(f"Failed to load task {tid} from state file: {e}")
+            logger.info(f"Successfully loaded {len(payload)} tasks. Broadcasting all.")
+            for task in self.state_manager.get_all_tasks().values():
+                self._broadcast_state_update(task)
+            return
 
-        if command == "UPDATE_DOCUMENT" and task and task.task_type == "document" and task.document_state:
+        # --- All subsequent commands require a valid task_id ---
+        task = self.state_manager.get_task(task_id)
+        if not task:
+            logger.warning(f"Directive '{command}' for unknown task '{task_id}' ignored.")
+            return
+
+        if command == "UPDATE_DOCUMENT" and task.task_type == "document" and task.document_state:
             if new_name := payload.get("name"):
                 task.desc = f"Document: {new_name}"
             if (new_content := payload.get("content")) is not None and generate_hash(new_content) != task.document_state.content_hash:
@@ -738,12 +782,32 @@ class InteractiveDAGAgent(DAGAgent):
             self.state_manager.upsert_task(task)
             return
 
-        if command == "DELETE_DOCUMENT" and task and task.task_type == "document":
+        if command == "DELETE_DOCUMENT" and task.task_type == "document":
             await self._prune_specific_task(task_id, reason="Document deleted by operator.", new_status="pruned", override_critical=True)
             return
 
-        if command == "CANCEL" and task:
+        if command == "PAUSE":
+            task.status = "paused_by_human"
+            if task_id in self.task_futures and not self.task_futures[task_id].done():
+                self.task_futures[task_id].cancel()
+            self.state_manager.upsert_task(task)
+            return
+
+        if command == "RESUME":
+            if task.status == "paused_by_human":
+                task.status = "pending" # Reset to be picked up by scheduler
+                self.state_manager.upsert_task(task)
+            return
+
+        if command == "CANCEL":
             task.status, task.result = "cancelled", f"Cancelled by operator: {payload or 'No reason given.'}"
+            if task_id in self.task_futures: self.task_futures[task_id].cancel()
+            self.state_manager.upsert_task(task)
+            await self._reset_downstream_tasks(task_id)
+            return
+
+        if command == "TERMINATE":
+            task.status, task.result = "failed", f"Terminated by operator: {payload}"
             if task_id in self.task_futures: self.task_futures[task_id].cancel()
             self.state_manager.upsert_task(task)
             await self._reset_downstream_tasks(task_id)
@@ -754,27 +818,13 @@ class InteractiveDAGAgent(DAGAgent):
             await self._prune_orphaned_tasks()
             return
 
-        if command == "RESET_STATE":
-            logger.warning("Received RESET_STATE directive. Wiping all tasks.")
-            for future in self.task_futures.values(): future.cancel()
-            self.task_futures.clear()
-            self.inflight.clear()
-
-            # This is a bit brute-force for in-memory, but fine for now.
-            # A DB implementation would be a transaction.
-            current_tasks = list(self.state_manager.get_all_tasks().keys())
-            for tid in current_tasks:
-                self.state_manager.delete_task(tid)
-
-            for tid, task_data in payload.items():
-                try:
-                    self.state_manager.upsert_task(Task(**task_data))
-                except Exception as e:
-                    logger.error(f"Failed to load task {tid} from state file: {e}")
-
-            logger.info(f"Successfully loaded {len(payload)} tasks. Broadcasting state.")
-            for task in self.state_manager.get_all_tasks().values():
-                self._broadcast_state_update(task)
+        if command == "MANUAL_OVERRIDE":
+            task.status, task.result = "complete", payload
+            if task_id in self.task_futures: self.task_futures[task_id].cancel()
+            task.fix_attempts = task.grace_attempts = 0
+            task.verification_history, task.last_llm_history, task.execution_log = [], None, []
+            self.state_manager.upsert_task(task)
+            await self._reset_downstream_tasks(task_id)
             return
 
         if command == "INJECT_DEPENDENCY":
@@ -783,48 +833,41 @@ class InteractiveDAGAgent(DAGAgent):
                 depth = payload.get("depth", "shallow")
                 if source_task_id and (source_task := self.state_manager.get_task(source_task_id)):
                     if source_task.status == 'complete':
-                        injected_dep = HumanInjectedDependency(source_task_id=source_task_id, depth=depth)
-                        task.human_injected_deps.append(injected_dep)
+                        task.human_injected_deps.append(HumanInjectedDependency(source_task_id=source_task_id, depth=depth))
                         task.status = "pending" # Reset to be picked up by scheduler
-                        task.current_question = None # Clear the question
-                        task.agent_role_paused = None
-                        logger.info(f"Injected dependency {source_task_id} into task {task_id}. Resetting to pending.")
+                        task.current_question = task.agent_role_paused = None
+                        logger.info(f"Injected dependency {source_task_id} into task {task_id}. Resetting.")
                     else:
-                        logger.warning(f"Cannot inject dependency from non-complete task {source_task_id}.")
+                        logger.warning(f"Cannot inject from non-complete task {source_task_id}.")
                 else:
-                    logger.warning(f"Could not find source task {source_task_id} for dependency injection.")
+                    logger.warning(f"Could not find source task {source_task_id}.")
+                self.state_manager.upsert_task(task)
             else:
-                logger.warning(f"Cannot inject dependency into task {task_id} that is not waiting for user response.")
+                logger.warning(f"Cannot inject dependency into task {task_id} not waiting for user response.")
+            return
+
+        # --- Task-Level Interrupts (Context for the Task's LLM) ---
+        # These are converted into Interrupt objects and placed in the task's queue.
+
+        if command in ["REDIRECT", "ANSWER_QUESTION"]:
+            if task.status in ["complete", "failed", "cancelled", "pruned"]:
+                logger.warning(f"Cannot send directive '{command}' to inactive task {task_id}.")
+                return
+
+            interrupt = HumanDirectiveInterrupt(command=command, payload=payload)
+            heapq.heappush(task.interrupt_queue, interrupt)
+            logger.info(f"Queued '{command}' interrupt for task {task_id}.")
+
+            # If the task was waiting for an answer, this new context unblocks it.
+            if task.status == "waiting_for_user_response":
+                task.status = "pending"
+                task.current_question = None
+                task.agent_role_paused = None
+
             self.state_manager.upsert_task(task)
             return
 
-        if not task:
-            logger.warning(f"Directive '{command}' for unknown task {task_id} ignored.")
-            return
-
-        if task_id in self.task_futures and not self.task_futures[task_id].done():
-            self.task_futures[task_id].cancel()
-
-        reset_dependents = False
-        if command == "PAUSE": task.status = "paused_by_human"
-        elif command == "RESUME":
-            if task.status == "paused_by_human": task.status = "pending"
-        elif command == "TERMINATE":
-            task.status, task.result, reset_dependents = "failed", f"Terminated by operator: {payload}", True
-        elif command in ["REDIRECT", "MANUAL_OVERRIDE"]:
-            if command == "REDIRECT": task.human_directive = payload; task.status = "pending"
-            else: task.status, task.result = "complete", payload
-            task.fix_attempts = task.grace_attempts = 0
-            task.verification, task.last_llm_history, task.execution_log = [], None, []
-            reset_dependents = True
-        elif command == "ANSWER_QUESTION" and task.status == "waiting_for_user_response":
-            task.user_response = str(payload)
-            task.current_question = task.agent_role_paused = None
-
-        if reset_dependents:
-            await self._reset_downstream_tasks(task_id)
-
-        self.state_manager.upsert_task(task)
+        logger.warning(f"Unknown or unhandled command '{command}' for task {task_id}.")
 
     async def _reset_downstream_tasks(self, task_id: str):
         logger.info(f"Resetting downstream tasks of {task_id}")
@@ -1011,7 +1054,7 @@ class InteractiveDAGAgent(DAGAgent):
         all_tasks = self.state_manager.get_all_tasks()
         context_str = "\n".join([f"- ID: {tk.id} Desc: {tk.desc}" for tk in all_tasks.values() if tk.status == "complete" and tk.id != t.id])
         prompt_parts = [f"Objective: {t.desc}", f"\nAvailable completed data sources:\n{context_str}", f"\n--- Shared Notebook ---\n{self._format_notebook_for_llm(t)}"]
-        self._inject_and_clear_user_response(prompt_parts, t)
+        # self._inject_and_clear_user_response(prompt_parts, t)
 
         plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, plan_res, ChainedExecutionPlan, "initial_planner")
@@ -1057,7 +1100,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         t.dep_results = {d: (dep.result if (dep := self.state_manager.get_task(d)) else None) for d in t.deps}
         prompt_parts = [f"Your complex task is: {t.desc}", f"\nDependency Results:\n{json.dumps(t.dep_results, indent=2)}", "\nBreak this down if necessary."]
-        self._inject_and_clear_user_response(prompt_parts, t)
+        # self._inject_and_clear_user_response(prompt_parts, t)
 
         proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, proposals_res, ChainedExecutionPlan, "adaptive_decomposer")
@@ -1185,7 +1228,7 @@ class InteractiveDAGAgent(DAGAgent):
             # Soon, this will be entirely replaced by the interrupt system.
             if t.human_directive:
                 current_prompt_parts.insert(0,
-                                            f"--- OPERATOR GUIDANCE ---\n{t.human_directive}\n------------------------\n\n")
+                                            f"--- HIGH PRIORITY CONTEXT ---\n{t.human_directive}\n------------------------\n\n")
                 t.human_directive = None
 
             current_prompt = "".join(current_prompt_parts)
@@ -1291,7 +1334,7 @@ class InteractiveDAGAgent(DAGAgent):
     async def _verify_task(self, t: Task, candidate_result: str) -> Optional[verification]:
         prompt_parts = [f"Job: Verify if 'Candidate Result' completes 'Original Task'.", f"\n--- Original Task ---\n{t.desc}"]
         if t.human_directive: prompt_parts.append(f"\n--- Operator's Directive ---\n{t.human_directive}")
-        if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
+        # if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
         prompt_parts.extend([f"\n--- Candidate Result ---\n{candidate_result}", "\n\nDoes the result, considering directives, complete the task? Be strict."])
 
         vout = await self._run_stateless_agent(self.verifier, "\n".join(prompt_parts), TaskContext(t.id, self.state_manager))
