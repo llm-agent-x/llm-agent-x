@@ -932,10 +932,30 @@ class InteractiveDAGAgent(DAGAgent):
                     for tid in pending_tasks_for_scheduling:
                         task = self.state_manager.get_task(tid)
                         if not task: continue
-                        if task.status == "pending" and all((dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in task.deps):
+
+                        # Condition 1: Is it a 'pending' task whose dependencies are met?
+                        if task.status == "pending" and all(
+                                (dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in
+                                task.deps):
                             ready_to_run_ids.add(tid)
-                        elif task.status == "pending" and all((dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in task.deps):
-                            ready_to_run_ids.add(tid)
+
+                        # --- THIS IS THE RESTORED BLOCK ---
+                        # Condition 2: Is it a parent task waiting for its children to finish?
+                        elif task.status == "waiting_for_children" and all(
+                                (child_task := self.state_manager.get_task(c)) and child_task.status in ["complete",
+                                                                                                         "failed"] for c
+                                in task.children):
+                            # Check if any child failed.
+                            if any((child_task := self.state_manager.get_task(c)) and child_task.status == "failed" for
+                                   c in task.children):
+                                if task.status != "failed":
+                                    task.status, task.result = "failed", "A child task failed, cannot synthesize results."
+                                    self.state_manager.upsert_task(task)
+                            else:
+                                # All children succeeded. Wake up the parent to run its own execution (synthesis).
+                                ready_to_run_ids.add(tid)
+                                task.status = "pending"  # Set to pending so it gets picked up to run.
+                                self.state_manager.upsert_task(task)
 
                     ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
 
