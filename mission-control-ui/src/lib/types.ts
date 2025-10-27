@@ -47,5 +47,6 @@ export interface Task {
   document_state?: DocumentState | null; // Optional and can be null
   parent?: string;
 
+  tags: string[];
   execution_log: ExecutionLogEntry[];
 }

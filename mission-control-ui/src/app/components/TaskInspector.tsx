@@ -88,7 +88,23 @@ export const TaskInspector = ({ task, completedTasks }: { task: Task | null, com
         <p className="font-mono text-xs text-zinc-500">{task.id}</p>
       </div>
 
-      {/* Scrollable Details Section */}
+      {task.tags && task.tags.length > 0 && (
+        <DetailRow
+          label="Tags"
+          value={
+            <div className="flex flex-wrap gap-2">
+              {task.tags.map((tag) => (
+                <span
+                  key={tag}
+                  className="px-2 py-0.5 text-xs font-mono rounded-full bg-zinc-700 text-zinc-300"
+                >
+                  #{tag}
+                </span>
+              ))}
+            </div>
+          }
+        />
+      )}
       <div className="flex-grow overflow-y-auto min-h-0 pr-2 -mr-2">
         <dl>
           <DetailRow

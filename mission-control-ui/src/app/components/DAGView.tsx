@@ -50,6 +50,7 @@ interface CustomTaskNodeData {
   status: string;
   human_directive: HumanDirective | null;
   current_question: CurrentQuestion | null;
+  tags: string[];
 }
 const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected: boolean }) => {
   return (
@@ -68,6 +69,15 @@ const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected
       <div className="text-zinc-100 text-sm whitespace-pre-wrap font-semibold">
         {data.desc}
       </div>
+      {data.tags && data.tags.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1">
+              {data.tags.map(tag => (
+                  <span key={tag} className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-zinc-700 text-zinc-300">
+                      #{tag}
+                  </span>
+              ))}
+          </div>
+      )}
       {data.human_directive?.instruction && (
         <div className="mt-2 text-xs text-blue-300 bg-blue-900/20 p-1 rounded-md">
           Directive: {data.human_directive.instruction.slice(0, 50)}...
@@ -141,6 +151,7 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
         status: task.status || '', // Provide default empty string if status is undefined
         human_directive: task.human_directive ?? null, // Convert undefined to null
         current_question: task.current_question ?? null, // Convert undefined to null
+        tags: task.tags || [],
       },
     }));
 
