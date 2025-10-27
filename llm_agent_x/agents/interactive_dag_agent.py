@@ -883,6 +883,13 @@ class InteractiveDAGAgent(DAGAgent):
                 # task_to_reset.human_directive = task_to_reset.user_response = task_to_reset.current_question = task_to_reset.last_llm_history = task_to_reset.agent_role_paused = None
                 self.state_manager.upsert_task(task_to_reset)
 
+    def _get_all_existing_tags(self) -> List[str]:
+        """Scans all tasks and returns a sorted list of unique tags."""
+        all_tags = set()
+        for task in self.state_manager.get_all_tasks().values():
+            all_tags.update(task.tags)
+        return sorted(list(all_tags))
+
     async def run(self):
         self._main_event_loop = asyncio.get_running_loop()
         self._consumer_thread = threading.Thread(target=self._listen_for_directives_target, daemon=True)
@@ -1047,7 +1054,7 @@ class InteractiveDAGAgent(DAGAgent):
             previous_task_global_id_in_chain = None
             for task_desc in chain_obj.chain:
                 all_new_task_descriptions.append(task_desc)
-                new_task = Task(id=str(uuid.uuid4())[:8], desc=task_desc.desc, parent=t.id, can_request_new_subtasks=task_desc.can_request_new_subtasks, mcp_servers=t.mcp_servers)
+                new_task = Task(id=str(uuid.uuid4())[:8], desc=task_desc.desc, parent=t.id, can_request_new_subtasks=task_desc.can_request_new_subtasks, mcp_servers=t.mcp_servers, tags=task_desc.tags)
                 self.state_manager.upsert_task(new_task)
                 t.children.append(new_task.id)
                 local_to_global_id_map[task_desc.local_id] = new_task.id

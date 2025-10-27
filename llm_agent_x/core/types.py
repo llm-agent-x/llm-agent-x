@@ -327,6 +327,11 @@ class TaskDescription(BaseModel):
         description="A list of GLOBAL IDs of existing tasks or documents this new task depends on.",
     )
 
+    tags: List[str] = Field(
+        default_factory=list,
+        description="A list of descriptive tags for grouping and targeting this task (e.g., 'planning', 'finance', 'outreach')."
+    )
+
 
 class TaskChain(BaseModel):
     """Represents a sequence of tasks that MUST be executed in a specific order."""
