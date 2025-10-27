@@ -553,7 +553,7 @@ class InteractiveDAGAgent(DAGAgent):
             error_msg = "All recovery options exhausted, and failed to formulate a question for the operator."
             t.status = "failed"
             t.result = error_msg
-            t.last_llm_history = t.agent_role_paused = None
+            t.agent_role_paused = None
 
         self.state_manager.upsert_task(t)
 
@@ -1339,7 +1339,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         if verify_task_result.get_successful():
             t.result, t.status = result, "complete"
-            t.last_llm_history = t.agent_role_paused = None
+            t.agent_role_paused = None
             self.state_manager.upsert_task(t)
             return
 
