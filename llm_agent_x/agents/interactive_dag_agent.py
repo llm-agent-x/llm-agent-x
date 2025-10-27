@@ -10,6 +10,7 @@ import time
 import traceback
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import List, Tuple, Union, Dict, Any, Optional, Callable
 
 import pika
@@ -416,18 +417,6 @@ class InteractiveDAGAgent(DAGAgent):
             if t:
                 t.span.record_exception(e)
             return None
-
-    def _inject_and_clear_user_response(self, prompt_parts: List[str], task: Task):
-        if task.user_response:
-            logger.info(f"Injecting user response into prompt for task [{task.id}]")
-            response_prompt = (
-                f"\n--- CRITICAL INFORMATION PROVIDED BY HUMAN OPERATOR ---\n"
-                f"{task.user_response}\n"
-                f"----------------------------------------------------------\n"
-            )
-            prompt_parts.insert(0, response_prompt)
-            task.user_response = None
-            self._broadcast_state_update(task)
 
     def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
         if not span or not agent_res:
@@ -891,7 +880,7 @@ class InteractiveDAGAgent(DAGAgent):
                 task_to_reset.result = None
                 task_to_reset.fix_attempts = task_to_reset.grace_attempts = 0
                 task_to_reset.verification_history = []
-                task_to_reset.human_directive = task_to_reset.user_response = task_to_reset.current_question = task_to_reset.last_llm_history = task_to_reset.agent_role_paused = None
+                # task_to_reset.human_directive = task_to_reset.user_response = task_to_reset.current_question = task_to_reset.last_llm_history = task_to_reset.agent_role_paused = None
                 self.state_manager.upsert_task(task_to_reset)
 
     async def run(self):
@@ -926,7 +915,7 @@ class InteractiveDAGAgent(DAGAgent):
                     all_task_ids = set(tasks.keys())
 
                     executable_statuses = {"pending", "running", "planning", "proposing", "waiting_for_children"}
-                    non_executable_tasks = {t.id for t in tasks.values() if t.status not in executable_statuses and not (t.status == "waiting_for_user_response" and t.user_response is not None)}
+                    non_executable_tasks = {t.id for t in tasks.values() if t.status not in executable_statuses and not (t.status == "waiting_for_user_response")}
 
                     pending_tasks_for_scheduling = all_task_ids - non_executable_tasks
                     ready_to_run_ids = set()
@@ -934,19 +923,10 @@ class InteractiveDAGAgent(DAGAgent):
                     for tid in pending_tasks_for_scheduling:
                         task = self.state_manager.get_task(tid)
                         if not task: continue
-                        if task.status == "waiting_for_user_response" and task.user_response is not None:
+                        if task.status == "pending" and all((dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in task.deps):
                             ready_to_run_ids.add(tid)
                         elif task.status == "pending" and all((dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in task.deps):
                             ready_to_run_ids.add(tid)
-                        elif task.status == "waiting_for_children" and all((child_task := self.state_manager.get_task(c)) and child_task.status in ["complete", "failed"] for c in task.children):
-                            if any((child_task := self.state_manager.get_task(c)) and child_task.status == "failed" for c in task.children):
-                                if task.status != "failed":
-                                    task.status, task.result = "failed", "A child task failed."
-                                    self.state_manager.upsert_task(task)
-                            else:
-                                ready_to_run_ids.add(tid)
-                                task.status = "pending"
-                                self.state_manager.upsert_task(task)
 
                     ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
 
@@ -995,7 +975,7 @@ class InteractiveDAGAgent(DAGAgent):
             span.set_attribute("dag.task.id", t.id)
             span.set_attribute("dag.task.status", t.status)
 
-            if t.status == "paused_by_human" or (t.status == "waiting_for_user_response" and t.user_response is None):
+            if t.status in ["paused_by_human", "waiting_for_user_response"]:
                 return
 
             try:
@@ -1005,11 +985,6 @@ class InteractiveDAGAgent(DAGAgent):
                     if t.status != new_status:
                         t.status = new_status
                         self.state_manager.upsert_task(t)
-
-                if t.status == "waiting_for_user_response" and t.user_response is not None:
-                    if t.agent_role_paused == "initial_planner": update_status("planning")
-                    elif t.agent_role_paused == "adaptive_decomposer": update_status("proposing")
-                    else: update_status("running")
 
                 if t.status == "waiting_for_children":
                     update_status("running")
@@ -1259,7 +1234,13 @@ class InteractiveDAGAgent(DAGAgent):
                 # ORIENT & DECIDE: What happened when the loop finished?
                 if processed_interrupt:
                     # The loop was broken by an interrupt.
-                    t.last_llm_history = agent_run.history()
+
+                    agent_state = getattr(agent_run, '_state', None)
+
+                    if agent_state and hasattr(agent_state, 'message_history'):
+                        # Convert the pydantic-ai message objects to dicts for storage.
+                        t.last_llm_history = [msg.model_dump() for msg in agent_state.message_history]
+
                     # We inject the interrupt's content as the *next* thing for the agent to consider.
                     t.human_directive = processed_interrupt.get_interrupt_prompt()
                     self.state_manager.upsert_task(t)

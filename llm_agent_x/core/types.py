@@ -122,9 +122,12 @@ class Task(BaseModel):
     last_cycle_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     human_injected_deps: List[HumanInjectedDependency] = Field(default_factory=list, description="Dependencies manually injected by an operator during a pause.")
-    
+
     current_question: Optional[UserQuestion] = Field(None,
                                                      description="The question an agent is currently asking the human operator.")
+
+    human_directive: Optional[str] = Field(None,
+                                           description="The human's response to the agent's question.")
 
     # --- NEW CONTEXT FIELDS ---
     last_llm_history: Optional[List[Dict[str, Any]]] = Field(None, exclude=True)
