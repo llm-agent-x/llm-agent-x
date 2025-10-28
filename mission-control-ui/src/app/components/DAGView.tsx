@@ -1,7 +1,7 @@
 // mission-control-ui/src/app/components/DAGView.tsx
 "use client";
 
-import React, { useEffect, useRef } from "react"; // Import useRef
+import React, { useEffect, useRef } from "react";
 import ReactFlow, {
     MiniMap,
     Controls,
@@ -18,12 +18,8 @@ import ReactFlow, {
 import dagre from "dagre";
 import "reactflow/dist/style.css";
 import {CurrentQuestion, HumanDirective, Task} from "@/lib/types";
+import { GitBranch } from "lucide-react";
 
-// ============================================================================
-// ** 1. ALL COMPONENTS AND CONSTANTS REMAIN AT THE TOP LEVEL **
-// ============================================================================
-
-// --- (StatusBadge, CustomTaskNode, nodeTypes, getLayoutedElements are unchanged)
 export const StatusBadge = ({ status }: { status: string }) => {
   const statusStyles: { [key: string]: string } = {
     running: "bg-blue-500/20 text-blue-300 border-blue-400/30",
@@ -51,15 +47,29 @@ interface CustomTaskNodeData {
   human_directive: HumanDirective | null;
   current_question: CurrentQuestion | null;
   tags: string[];
+  isHovered: boolean;
+  onFocus: (id: string) => void;
+  onHover: (id: string | null) => void;
 }
 const CustomTaskNode = ({ data, selected }: { data: CustomTaskNodeData, selected: boolean }) => {
+  const borderColor = data.isHovered ? "border-yellow-400" : selected ? "border-blue-500" : "border-zinc-700";
+
   return (
     <div
-      className={`px-4 py-2 shadow-md rounded-lg border-2 ${
-        selected ? "border-blue-500" : "border-zinc-700"
-      } bg-zinc-800 w-[250px]`}
+      className={`px-4 py-2 shadow-md rounded-lg border-2 ${borderColor} bg-zinc-800 w-[250px] transition-colors relative group`}
+      onMouseEnter={() => data.onHover(data.id)}
+      onMouseLeave={() => data.onHover(null)}
     >
       <Handle type="target" position={Position.Top} className="!bg-zinc-500" />
+
+      {/* --- FOCUS BUTTON --- */}
+      <button onClick={(e) => { e.stopPropagation(); data.onFocus(data.id); }}
+        className="absolute -top-2 -right-2 p-1.5 bg-zinc-700 text-zinc-300 rounded-full border-2 border-zinc-800 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-600 hover:text-white"
+        title="Focus on this task and its children in the log view"
+      >
+        <GitBranch size={14} />
+      </button>
+
       <div className="flex justify-between items-center mb-1">
         <div className="text-sm font-mono text-zinc-400 truncate max-w-[120px]">
           {data.id}
@@ -118,26 +128,22 @@ const getLayoutedElements = (nodes: Node[], edges: Edge[], direction = 'TB') => 
   return { nodes: layoutedNodes, edges };
 };
 
-// ============================================================================
-// ** 2. THE MAIN DAGVIEW COMPONENT WITH THE ROBUST `useRef` FIX **
-// ============================================================================
-
 interface DAGViewProps {
   tasks: Task[];
   selectedTaskId: string | null;
   onSelectTask: (id: string) => void;
+  hoveredTaskId: string | null;
+  onHoverTask: (id: string | null) => void;
+  onFocusTask: (id: string) => void;
 }
-export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelectTask }) => {
+export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelectTask, hoveredTaskId, onHoverTask, onFocusTask }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [layoutDirection, setLayoutDirection] = React.useState('TB');
-  // **THE FIX**: A ref to track if the current `tasks` have been laid out.
   const layouted = useRef(false);
 
-  // **PASS 1: Create initial nodes**
   useEffect(() => {
     if (!tasks) return;
-    // When the tasks change, reset the layout flag.
     layouted.current = false;
 
     const initialNodes: Node<CustomTaskNodeData>[] = tasks.map((task) => ({
@@ -147,32 +153,32 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
       type: "customTaskNode",
       data: {
         id: task.id,
-        desc: task.desc || '', // Provide default empty string if desc is undefined
-        status: task.status || '', // Provide default empty string if status is undefined
-        human_directive: task.human_directive ?? null, // Convert undefined to null
-        current_question: task.current_question ?? null, // Convert undefined to null
+        desc: task.desc || '',
+        status: task.status || '',
+        human_directive: task.human_directive ?? null,
+        current_question: task.current_question ?? null,
         tags: task.tags || [],
+        isHovered: task.id === hoveredTaskId,
+        onHover: onHoverTask,
+        onFocus: onFocusTask,
       },
     }));
 
-    // --- START OF LOGICAL FIX ---
     const initialEdges: Edge[] = [];
     const taskIds = new Set(tasks.map(t => t.id));
 
     tasks.forEach((task) => {
-      // 1. Create edges for parent -> child relationships (structural hierarchy)
       if (task.parent && taskIds.has(task.parent)) {
         initialEdges.push({
           id: `e-parent-${task.parent}-${task.id}`,
           source: task.parent,
           target: task.id,
           type: 'default',
-          markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" }, // Gray for hierarchy
-          style: { stroke: "#6b7280", strokeWidth: 1, strokeDasharray: '5 5' }, // Dashed for hierarchy
+          markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" },
+          style: { stroke: "#6b7280", strokeWidth: 1, strokeDasharray: '5 5' },
         });
       }
 
-      // 2. Create edges for dependency -> task relationships (data flow)
       if (task.deps && Array.isArray(task.deps)) {
         task.deps.forEach((depId: string) => {
           if (taskIds.has(depId)) {
@@ -181,8 +187,8 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
               source: depId,
               target: task.id,
               type: 'default',
-              markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" }, // Lighter for data flow
-              style: { stroke: "#a3a3a3", strokeWidth: 2 }, // Solid, thicker for data flow
+              markerEnd: { type: MarkerType.ArrowClosed, color: "#a3a3a3" },
+              style: { stroke: "#a3a3a3", strokeWidth: 2 },
             });
           }
         });
@@ -190,12 +196,9 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
     });
     setNodes(initialNodes);
     setEdges(initialEdges);
-  }, [tasks, setNodes, setEdges]);
+  }, [tasks, selectedTaskId, hoveredTaskId, setNodes, setEdges, onHoverTask, onFocusTask]);
 
-  // **PASS 2: Calculate layout after nodes are measured**
   useEffect(() => {
-    // GUARD CLAUSE: Only run layout if nodes exist, have been measured,
-    // and have NOT been laid out yet for this set of tasks.
     if (nodes.length === 0 || !nodes[0].width || layouted.current) {
       return;
     }
@@ -204,7 +207,6 @@ export const DAGView: React.FC<DAGViewProps> = ({ tasks, selectedTaskId, onSelec
     );
     setNodes(finalNodes);
     setEdges(finalEdges);
-    // Mark this set as laid out to break the loop.
     layouted.current = true;
   }, [nodes, edges, layoutDirection, setNodes, setEdges]);
 

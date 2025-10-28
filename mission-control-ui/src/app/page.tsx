@@ -43,6 +43,11 @@ export default function MissionControl() {
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [mainView, setMainView] = useState<"graph" | "log">("graph");
 
+  // --- NEW: State for cross-panel interactions ---
+  const [hoveredTaskId, setHoveredTaskId] = useState<string | null>(null);
+  const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
+
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDownloadState = async () => {
@@ -281,6 +286,8 @@ export default function MissionControl() {
               tasks={taskList}
               selectedTaskId={selectedTaskId}
               onSelectTask={handleSelectTask}
+              hoveredTaskId={hoveredTaskId}
+              onHoverTask={setHoveredTaskId}
             />
           </div>
           <div className="flex-shrink-0">
@@ -296,6 +303,9 @@ export default function MissionControl() {
                 tasks={taskList}
                 selectedTaskId={selectedTaskId}
                 onSelectTask={handleSelectTask}
+                hoveredTaskId={hoveredTaskId}
+                onHoverTask={setHoveredTaskId}
+                onFocusTask={setFocusedTaskId}
               />
               <TaskInspector
                 task={selectedTask}
@@ -304,8 +314,12 @@ export default function MissionControl() {
             </div>
           ) : (
             <ExecutionLogView
-              selectedTask={selectedTask}
+              tasks={taskList}
               globalLog={globalLog}
+              hoveredTaskId={hoveredTaskId}
+              onHoverTask={setHoveredTaskId}
+              focusedTaskId={focusedTaskId}
+              onFocusTask={setFocusedTaskId}
             />
           )}
         </div>

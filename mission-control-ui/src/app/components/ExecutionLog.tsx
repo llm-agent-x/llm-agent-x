@@ -13,25 +13,28 @@ const iconMap: Record<ExecutionLogEntry['type'], JSX.Element> = {
   error: <AlertTriangle size={16} className="text-red-400" />,
 };
 
-// --- MODIFIED: LogEntry Props ---
-// Update the type to include the optional taskId and a prop to control its visibility
 interface LogEntryProps {
     entry: ExecutionLogEntry & { taskId?: string };
     showTaskId?: boolean;
+    isHovered: boolean;
+    onHover: (id: string | null) => void;
 }
 
-const LogEntry = ({ entry, showTaskId }: LogEntryProps) => {
+const LogEntry = ({ entry, showTaskId, isHovered, onHover }: LogEntryProps) => {
   const icon = iconMap[entry.type] || <Cog size={16} className="text-zinc-400" />;
+  const backgroundClass = isHovered ? "bg-yellow-900/20" : "";
 
   return (
-    <div className="flex items-start gap-3 py-2 px-1 border-b border-zinc-800/50 last:border-b-0">
+    <div className={`flex items-start gap-3 py-2 px-1 border-b border-zinc-800/50 last:border-b-0 rounded-md ${backgroundClass}`}
+        onMouseEnter={() => entry.taskId && onHover(entry.taskId)}
+        onMouseLeave={() => onHover(null)}
+    >
       <div className="flex-shrink-0 pt-1">{icon}</div>
       <div className="flex-grow min-w-0">
         <div className="flex justify-between items-center">
             <p className="text-xs font-semibold capitalize text-zinc-300">
               {entry.type.replace(/_/g, " ")}
             </p>
-            {/* --- NEW: Conditionally render the Task ID --- */}
             {showTaskId && entry.taskId && (
                 <span className="font-mono text-xs bg-zinc-700/50 text-zinc-400 px-1.5 py-0.5 rounded">
                     {entry.taskId}
@@ -73,13 +76,14 @@ const LogEntry = ({ entry, showTaskId }: LogEntryProps) => {
   );
 };
 
-// --- MODIFIED: ExecutionLog Props ---
 interface ExecutionLogProps {
     log: (ExecutionLogEntry & { taskId?: string })[];
     showTaskId?: boolean;
+    hoveredTaskId: string | null;
+    onHoverTask: (id: string | null) => void;
 }
 
-export const ExecutionLog = ({ log, showTaskId = false }: ExecutionLogProps) => {
+export const ExecutionLog = ({ log, showTaskId = false, hoveredTaskId, onHoverTask }: ExecutionLogProps) => {
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -97,7 +101,13 @@ export const ExecutionLog = ({ log, showTaskId = false }: ExecutionLogProps) => 
   return (
     <div className="font-mono text-sm">
       {log.map((entry, index) => (
-        <LogEntry key={index} entry={entry} showTaskId={showTaskId} />
+        <LogEntry
+            key={index}
+            entry={entry}
+            showTaskId={showTaskId}
+            isHovered={hoveredTaskId === entry.taskId}
+            onHover={onHoverTask}
+        />
       ))}
       <div ref={logEndRef} />
     </div>

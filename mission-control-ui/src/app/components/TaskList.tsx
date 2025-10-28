@@ -1,21 +1,23 @@
 // app/components/TaskList.tsx
 
 import { StatusBadge } from "./StatusBadge";
-// --- CHANGE 1: Import the shared Task interface from TaskInspector ---
 import { Task } from "@/lib/types";
 
-// --- CHANGE 2: Create a specific props interface for clarity ---
 interface TaskListProps {
   tasks: Task[];
   selectedTaskId: string | null;
   onSelectTask: (id: string) => void;
+  hoveredTaskId: string | null;
+  onHoverTask: (id: string | null) => void;
 }
 
 export const TaskList = ({
   tasks,
   selectedTaskId,
   onSelectTask,
-}: TaskListProps) => { // --- CHANGE 3: Apply the new props interface ---
+  hoveredTaskId,
+  onHoverTask,
+}: TaskListProps) => {
   if (tasks.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-zinc-500 text-center p-4 max-w-[20rem]">
@@ -28,34 +30,43 @@ export const TaskList = ({
   }
 
   return (
-    <div className="flex flex-col gap-2 h-[calc(100vh-520px] w-[35rem] overflow-y-scroll overflow-x-hidden">
+    <div className="flex flex-col gap-2 h-full w-full">
       <h2 className="text-lg font-bold text-zinc-300 px-2 mb-2">Task Swarm</h2>
-      {/* No changes needed below, TypeScript now understands `task` is of type `Task` */}
-      {tasks.map((task) => (
-        <button
-          key={task.id}
-          onClick={() => onSelectTask(task.id)}
-          className={`w-full text-left p-2.5 rounded-lg transition-colors border border-transparent ${
-            selectedTaskId === task.id
-              ? "bg-blue-600/30 border-blue-500"
-              : "hover:bg-zinc-700/70"
-          } whitespace-pre-wrap `}
-          style={{
-            overflowWrap: "break-word",
-            wordWrap: "break-word",
-          }}
-        >
-          <div className="flex justify-between items-center mb-1">
-            <p className="font-mono text-sm text-zinc-400 truncate">
-              {task.id}
+      {tasks.map((task) => {
+        const isSelected = selectedTaskId === task.id;
+        const isHovered = hoveredTaskId === task.id;
+
+        let backgroundClass = "hover:bg-zinc-700/70";
+        if (isSelected) {
+            backgroundClass = "bg-blue-600/30";
+        } else if (isHovered) {
+            backgroundClass = "bg-yellow-900/30";
+        }
+
+        return (
+          <button
+            key={task.id}
+            onClick={() => onSelectTask(task.id)}
+            onMouseEnter={() => onHoverTask(task.id)}
+            onMouseLeave={() => onHoverTask(null)}
+            className={`w-full text-left p-2.5 rounded-lg transition-colors border ${isSelected ? "border-blue-500" : isHovered ? "border-yellow-700/50" : "border-transparent"} ${backgroundClass}`}
+            style={{
+              overflowWrap: "break-word",
+              wordWrap: "break-word",
+            }}
+          >
+            <div className="flex justify-between items-center mb-1">
+              <p className="font-mono text-sm text-zinc-400 truncate">
+                {task.id}
+              </p>
+              <StatusBadge status={task.status} />
+            </div>
+            <p className="text-zinc-200 text-sm whitespace-nowrap overflow-hidden text-ellipsis">
+              {task.desc}
             </p>
-            <StatusBadge status={task.status} />
-          </div>
-          <p className="text-zinc-200 text-sm whitespace-nowrap overflow-hidden text-ellipsis">
-            {task.desc}
-          </p>
-        </button>
-      ))}
+          </button>
+        );
+      })}
     </div>
   );
 };
