@@ -1136,9 +1136,9 @@ class InteractiveDAGAgent(DAGAgent):
         t = ctx.task
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
-        # --- Dependency and Prompt Setup (Your code is perfect here) ---
-        # This entire section for pruning dependencies and building the initial
-        # prompt_base_content remains exactly as you wrote it.
+        # --- 1. CONSTRUCT BASE PROMPT (UNCHANGED) ---
+        # This section builds the initial context from dependencies and sub-tasks.
+        # It runs only once at the beginning of the execution flow.
         children_ids = set(t.children)
         prunable_deps_ids = t.deps - children_ids
         final_deps_to_use = children_ids.copy()
@@ -1170,11 +1170,8 @@ class InteractiveDAGAgent(DAGAgent):
             dep_task = self.state_manager.get_task(did)
             if not dep_task or dep_task.status != 'complete':
                 continue
-
-            # **THE FIX**: If the dependency is a document, use its content.
             if dep_task.task_type == "document" and dep_task.document_state:
                 dep_results[dep_task.desc] = dep_task.document_state.content
-            # Otherwise, use its result field as normal.
             elif dep_task.result is not None:
                 dep_results[dep_task.desc] = dep_task.result
 
@@ -1206,20 +1203,16 @@ class InteractiveDAGAgent(DAGAgent):
                 [f"- From '{desc}':\n{res}\n" for desc, res in dep_results.items()]))
         prompt_base_content = "".join(prompt_lines)
 
-        # --- MCP Client Setup (From your code, adjusted slightly for clarity) ---
+        # --- 2. SETUP EXECUTOR AGENT (UNCHANGED) ---
         task_specific_mcp_clients = []
         if t.mcp_servers:
             for server_config in t.mcp_servers:
                 try:
                     if server_config.get("type") == "streamable_http":
                         task_specific_mcp_clients.append(MCPServerStreamableHTTP(server_config["address"]))
-                    # Add other types like sse if you implement them
-                    # elif server_config.get("type") == "sse":
-                    #     task_specific_mcp_clients.append(MCPServerSSE(server_config["address"]))
                 except Exception as e:
                     logger.error(f"[{t.id}]: Failed to create MCP client for {server_config.get('name')}: {e}")
 
-        # The executor is now a class member, pre-configured with communication tools.
         task_executor = Agent(
             model=self.base_llm_model,
             system_prompt=self.executor_system_prompt,
@@ -1227,78 +1220,57 @@ class InteractiveDAGAgent(DAGAgent):
             tools=list(self._tools_for_agents),
             mcp_servers=task_specific_mcp_clients,
         )
-
         self.comms_manager.apply_to_agent(task_executor)
 
-        # --- Answer to your question: Log Clearing Logic ---
-        # We clear the log *once* when this entire execution flow begins.
-        # This is for a "full rerun" of the task (e.g., after a REDIRECT directive or when it becomes runnable again).
-        # We will NOT clear it between retries within the `while True` loop.
-        t.execution_log = []
-        self.state_manager.upsert_task(t)
+        # --- 3. SMARTLY CLEAR LOGS ---
+        # **FIX**: Only clear logs on a true "cold start" (no previous LLM history), not on every retry.
+        if not t.last_llm_history:
+            t.execution_log = []
+            self.state_manager.upsert_task(t)
 
+        # --- 4. MAIN EXECUTION & RETRY LOOP ---
         while True:
-            # Refill communication tokens at the start of each attempt/cycle.
             t.comm_token_bucket.refill()
-            self.state_manager.upsert_task(t)  # Save refilled state
+            self.state_manager.upsert_task(t)
 
             current_attempt = t.fix_attempts + t.grace_attempts + 1
             t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
-
-            # Add a marker to the log for this attempt, but don't clear the whole log.
             attempt_marker = {"type": "thought", "content": f"--- Starting Execution Attempt #{current_attempt} ---"}
             self._broadcast_execution_log_update(t.id, attempt_marker)
 
             current_prompt_parts = [prompt_base_content]
 
-            # This is where we handle the DEPRECATED human_directive/user_response fields.
-            # Soon, this will be entirely replaced by the interrupt system.
-            if t.human_directive:
+            # **FIX**: Process interrupts from the queue to form the next prompt's context.
+            if t.interrupt_queue:
+                interrupt = heapq.heappop(t.interrupt_queue)
+                logger.info(f"Task [{t.id}] processing interrupt (Priority: {interrupt.priority}).")
+                current_prompt_parts.insert(0, f"{interrupt.get_interrupt_prompt()}\n\n")
+                # This clears the queue for this turn and is persisted
+                self.state_manager.upsert_task(t)
+
+            # Legacy support for the old directive system
+            elif t.human_directive:
                 current_prompt_parts.insert(0,
                                             f"--- HIGH PRIORITY CONTEXT ---\n{t.human_directive}\n------------------------\n\n")
                 t.human_directive = None
 
             current_prompt = "".join(current_prompt_parts)
-
             logger.info(f"[{t.id}] Attempt {current_attempt}: Streaming executor actions...")
             exec_res, result = None, None
-            processed_interrupt = None
 
             try:
-                # The `deps=ctx` argument is crucial for our dynamic instructions.
-                async with task_executor.iter(user_prompt=current_prompt,
-                                              message_history=t.last_llm_history,
-                                              deps=ctx) as agent_run:
+                # **FIX**: The agent now runs with the memory of its last attempt.
+                async with task_executor.iter(
+                        user_prompt=current_prompt,
+                        message_history=t.last_llm_history,
+                        deps=ctx
+                ) as agent_run:
                     async for node in agent_run:
-                        # PERCEIVE: Check for high-priority interrupts on each step.
-                        if t.interrupt_queue:
-                            processed_interrupt = heapq.heappop(t.interrupt_queue)
-                            logger.info(
-                                f"Task [{t.id}] INTERRUPTED by event with priority {processed_interrupt.priority}.")
-                            self.state_manager.upsert_task(t)
-                            break  # Exit the agent.iter loop immediately.
-
                         if formatted_node := self._format_stream_node(node):
                             self._broadcast_execution_log_update(t.id, formatted_node)
 
-                # ORIENT & DECIDE: What happened when the loop finished?
-                if processed_interrupt:
-                    # The loop was broken by an interrupt.
-
-                    agent_state = getattr(agent_run, '_state', None)
-
-                    if agent_state and hasattr(agent_state, 'message_history'):
-                        # Convert the pydantic-ai message objects to dicts for storage.
-                        t.last_llm_history = [msg.model_dump() for msg in agent_state.message_history]
-
-                    # We inject the interrupt's content as the *next* thing for the agent to consider.
-                    t.human_directive = processed_interrupt.get_interrupt_prompt()
-                    self.state_manager.upsert_task(t)
-                    # Loop back to the start of `while True` to run again with new context.
-                    continue
-                else:
-                    # The agent run completed normally.
-                    exec_res = agent_run.result
+                # If the loop completes without exception, the run was successful.
+                exec_res = agent_run.result
 
             except Exception as e:
                 logger.error(f"[{t.id}] Exception during agent.iter: {e}", exc_info=True)
@@ -1306,25 +1278,31 @@ class InteractiveDAGAgent(DAGAgent):
                               "content": f"Execution error: {str(e)}\n\nTraceback: {traceback.format_exc()}"}
                 self._broadcast_execution_log_update(t.id, error_node)
 
-            # ACT: This block only runs if the loop completed without an interrupt.
+            # **FIX**: ALWAYS capture the latest history, no matter the outcome.
             if exec_res:
+                t.last_llm_history = exec_res.all_messages()
+                self.state_manager.upsert_task(t)  # Persist the memory
+
                 is_paused, output = await self._handle_agent_output(ctx, exec_res, Union[str, UserQuestion], "executor")
                 if is_paused:
-                    return
+                    return  # Exit if a question was asked
                 result = output
 
-            # Verification and retry logic (only runs on normal completion).
             if result is None:
-                t.human_directive = "Last attempt failed or produced no output. Re-evaluate."
+                # This path is taken if exec_res was None (due to an error) or if the agent returned nothing.
+                t.human_directive = "Your last attempt failed or produced no output. Please re-evaluate your approach and try again, paying close attention to the original goal and provided context."
                 t.fix_attempts += 1
                 self.state_manager.upsert_task(t)
                 if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
                     await self._escalate_to_human_question(ctx, "Executor returned no valid output after all retries.")
                     if t.status in ["failed", "waiting_for_user_response"]:
                         return
-                continue  # Go to next attempt
+                continue  # Retry, carrying over the last_llm_history.
 
+            # If we have a result, proceed to verification.
             await self._process_executor_output_for_verification(ctx, result)
+
+            # If verification passed or the task failed/paused, exit the loop.
             if t.status in ["complete", "failed", "paused_by_human", "waiting_for_user_response"]:
                 return
 
