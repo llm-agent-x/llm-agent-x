@@ -93,14 +93,11 @@ class CommunicationManager:
                 self.state_manager.upsert_task(target_task)
                 return f"Direct message sent successfully to active task '{target_task_id}'."
 
-            # --- ROUTE 2: Target is COMPLETED (The "Séance" Logic) ---
+
             elif target_task.status == "complete":
                 logger.info(f"Querying completed task '{target_task_id}' on behalf of task '{task.id}'.")
                 prompt = (
-                    f"You are the spirit of a completed task. Your original goal was: '{target_task.desc}'.\n"
-                    f"Your final result was: '{target_task.result}'.\n\n"
                     f"An active agent is now asking you a question based on your work. "
-                    f"Using only your final state, answer the question concisely.\n\n"
                     f"Question: {message}"
                 )
 
@@ -128,33 +125,70 @@ class CommunicationManager:
             all_tasks = self.state_manager.get_all_tasks().values()
             current_task_id = ctx.deps.task.id
 
-            active_tasks = [
+            # --- START OF THE REFINED FIX ---
+
+            # An "interruptible" task is one that is in an active reasoning state
+            # or is explicitly waiting for external input.
+            # `waiting_for_children` is explicitly excluded as it is a passive wait state.
+            interruptible_statuses = {
+                "running",
+                "proposing",
+                "planning",
+                "paused_by_human",
+                "waiting_for_user_response"  # <-- As you correctly identified.
+            }
+
+            # A "queryable" task is one that has a final, successful result.
+            queryable_statuses = {"complete"}
+
+            # The rest of the logic remains the same...
+
+            active_interruptible_tasks = [
                 t for t in all_tasks
-                if t.id != current_task_id and t.status not in ["failed", "cancelled", "pruned"]
+                if t.id != current_task_id and t.status in interruptible_statuses
             ]
 
-            # 1. Collect all unique tags from active tasks
+            active_queryable_tasks = [
+                t for t in all_tasks
+                if t.id != current_task_id and t.status in queryable_statuses
+            ]
+
+            # 1. Collect all unique tags ONLY from active, interruptible tasks.
             all_tags = set()
-            for task in active_tasks:
-                if task.status != "complete":  # only active tasks contribute tags for broadcast
-                    all_tags.update(task.tags)
+            for task in active_interruptible_tasks:
+                all_tags.update(task.tags)
 
             prompt_parts = ["\n--- AVAILABLE COMMUNICATION TARGETS ---"]
+            prompt_parts.append(
+                "Use `send_direct_message(target_task_id, message)` to communicate with another task."
+            )
 
-            # 2. Format the tags section
+            # 2. Format the tags section for broadcasting to active tasks.
             if all_tags:
                 tags_list_str = ", ".join(f"'{tag}'" for tag in sorted(list(all_tags)))
-                prompt_parts.append(f"You can BROADCAST to tasks with tags: {tags_list_str}")
+                prompt_parts.append(f"\nYou can BROADCAST to groups of ACTIVE tasks using tags: {tags_list_str}")
             else:
-                prompt_parts.append("No active tags available for broadcast.")
+                prompt_parts.append("\nNo active tags are available for broadcast.")
 
-            # 3. Format the direct message targets section (now includes active AND completed)
-            if active_tasks:
+            # 3. Format the direct message targets section, separating active and completed tasks.
+            if active_interruptible_tasks:
                 targets_str = "\n".join(
-                    f"- ID: '{t.id}' (Status: {t.status}), Description: '{t.desc[:60]}...'" for t in active_tasks)
-                prompt_parts.append(f"You can send a DIRECT MESSAGE to these tasks:\n{targets_str}")
-            else:
-                prompt_parts.append("No other tasks are available for direct messages.")
+                    f"- ID: '{t.id}' (Status: {t.status}), Description: '{t.desc[:60]}...'" for t in
+                    active_interruptible_tasks)
+                prompt_parts.append(
+                    f"\n\nYou can send a DIRECT MESSAGE (interrupt) to these ACTIVE tasks:\n{targets_str}")
+
+            if active_queryable_tasks:
+                targets_str = "\n".join(
+                    f"- ID: '{t.id}' (Status: {t.status}), Description: '{t.desc[:60]}...'" for t in
+                    active_queryable_tasks)
+                prompt_parts.append(
+                    f"\n\nYou can send a DIRECT MESSAGE (query) to these COMPLETED tasks to ask questions about their results:\n{targets_str}")
+
+            if not active_interruptible_tasks and not active_queryable_tasks:
+                prompt_parts.append("\nNo other tasks are available for communication right now.")
+
+            # --- END OF THE REFINED FIX ---
 
             prompt_parts.append("---------------------------------------")
             return "\n".join(prompt_parts)
