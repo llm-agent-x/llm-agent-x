@@ -11,6 +11,29 @@ import { LayoutGrid, LayoutList, XCircle } from "lucide-react";
 
 type GlobalLogEntry = ExecutionLogEntry & { taskId: string };
 
+// --- NEW HELPER FUNCTION ---
+const findTopMostVisibleAncestor = (
+  taskId: string,
+  taskMap: Map<string, Task>,
+  visibleIds: Set<string>
+): string | null => {
+  const task = taskMap.get(taskId);
+  if (!task?.parent || !visibleIds.has(task.parent)) {
+    return null; // No visible parent, so it's a root of a group or standalone
+  }
+
+  let current = task;
+  let topMostParent = null;
+
+  while (current.parent && visibleIds.has(current.parent)) {
+    topMostParent = current.parent;
+    current = taskMap.get(current.parent)!;
+  }
+
+  return topMostParent;
+};
+
+
 interface ExecutionLogViewProps {
   tasks: Task[];
   globalLog: GlobalLogEntry[];
@@ -53,7 +76,7 @@ export const ExecutionLogView = ({
     taskIdToColumn,
     groups,
     standaloneColumns,
-    timestampToRowMap, // <-- The key to the new logic
+    timestampToRowMap,
   } = useMemo(() => {
     // Step 1: Apply focus and text filters (correct)
     let logToProcess = globalLog;
@@ -62,36 +85,45 @@ export const ExecutionLogView = ({
       const queue = [focusedTaskId];
       while (queue.length > 0) {
         const currentId = queue.shift()!;
-        tasks.filter((t) => t.parent === currentId).forEach((child) => {
-          if (!descendantIds.has(child.id)) {
-            descendantIds.add(child.id);
-            queue.push(child.id);
-          }
-        });
+        tasks
+          .filter((t) => t.parent === currentId)
+          .forEach((child) => {
+            if (!descendantIds.has(child.id)) {
+              descendantIds.add(child.id);
+              queue.push(child.id);
+            }
+          });
       }
-      logToProcess = globalLog.filter((entry) => descendantIds.has(entry.taskId));
+      logToProcess = globalLog.filter((entry) =>
+        descendantIds.has(entry.taskId),
+      );
     }
     const lowerCaseFilter = filterText.toLowerCase();
     const finalFilteredLog = lowerCaseFilter
       ? logToProcess.filter((entry) => {
-        const task = tasks.find((t) => t.id === entry.taskId);
-        const tagsMatch = task?.tags?.some((tag) => `#${tag}`.includes(lowerCaseFilter)) ?? false;
-        return entry.taskId.toLowerCase().includes(lowerCaseFilter) || tagsMatch;
-      })
+          const task = tasks.find((t) => t.id === entry.taskId);
+          const tagsMatch =
+            task?.tags?.some((tag) => `#${tag}`.includes(lowerCaseFilter)) ??
+            false;
+          return entry.taskId.toLowerCase().includes(lowerCaseFilter) || tagsMatch;
+        })
       : logToProcess;
 
-    // Step 2: Determine columns to show based on visibility filters (correct)
     const allIds = Array.from(new Set(finalFilteredLog.map((e) => e.taskId)));
-    const columnsToShow = visibleTaskIds ? allIds.filter((id) => visibleTaskIds.has(id)) : allIds;
+    const columnsToShow = visibleTaskIds
+      ? allIds.filter((id) => visibleTaskIds.has(id))
+      : allIds;
 
-    // Step 3: Grouping logic (correct)
+    const columnsToShowSet = new Set(columnsToShow);
+
+    // --- FIX: REVISED GROUPING LOGIC ---
     const taskMap = new Map(tasks.map((t) => [t.id, t]));
     const parentToChildren = new Map<string, string[]>();
     columnsToShow.forEach((id) => {
-      const task = taskMap.get(id);
-      if (task?.parent && columnsToShow.includes(task.parent)) {
-        if (!parentToChildren.has(task.parent)) parentToChildren.set(task.parent, []);
-        parentToChildren.get(task.parent)!.push(id);
+      const topMostParent = findTopMostVisibleAncestor(id, taskMap, columnsToShowSet);
+      if (topMostParent) {
+        if (!parentToChildren.has(topMostParent)) parentToChildren.set(topMostParent, []);
+        parentToChildren.get(topMostParent)!.push(id);
       }
     });
 
@@ -100,21 +132,24 @@ export const ExecutionLogView = ({
     const unpinned = columnsToShow.filter((id) => !pinnedTaskIds.has(id)).sort();
     const sortedColumns = [...pinned, ...unpinned];
 
+    // Children within groups also need to be sorted to maintain order
+    parentToChildren.forEach((children) => children.sort());
+
     const finalDisplayedColumns = sortedColumns.filter((id) => {
-      const task = taskMap.get(id);
-      return !(task?.parent && collapsedGroups.has(task.parent));
+        const topMostParent = findTopMostVisibleAncestor(id, taskMap, columnsToShowSet);
+        return !(topMostParent && collapsedGroups.has(topMostParent));
     });
 
     const map = new Map<string, number>();
     finalDisplayedColumns.forEach((id, index) => map.set(id, index + 1));
 
     const childIdsInGroups = new Set([...parentToChildren.values()].flat());
-    const finalStandaloneColumns = finalDisplayedColumns.filter((id) => !childIdsInGroups.has(id));
+    const finalStandaloneColumns = finalDisplayedColumns.filter(
+      (id) => !childIdsInGroups.has(id),
+    );
 
-    // --- FIX: Create the timestamp-to-row mapping ---
     const uniqueTimestamps = Array.from(new Set(finalFilteredLog.map(e => e.timestamp))).sort();
     const tsMap = new Map<string, number>();
-    // Headers will occupy rows 1 and 2, so logs start on row 3
     uniqueTimestamps.forEach((ts, index) => ts && tsMap.set(ts, index + 3));
 
     return {
@@ -133,7 +168,12 @@ export const ExecutionLogView = ({
       {/* Header Bar is correct */}
       <div className="flex-shrink-0 mb-4 flex justify-between items-center gap-4">
         <h2 className="text-xl font-bold text-zinc-100">Execution Log</h2>
-        {focusedTaskId && ( <div /* ... */ ></div> )}
+        {focusedTaskId && ( <div className="flex items-center gap-2 bg-blue-900/50 text-blue-300 border border-blue-700/50 rounded-full px-3 py-1 text-sm">
+            <span>Focusing on subtree: {focusedTaskId}</span>
+            <button onClick={() => onFocusTask(null)} className="p-0.5 rounded-full hover:bg-blue-700" title="Clear focus">
+                <XCircle size={16} />
+            </button>
+        </div> )}
         <div className="flex-grow">
           <LogFilterBar filterText={filterText} onFilterChange={setFilterText} />
         </div>
@@ -171,12 +211,22 @@ export const ExecutionLogView = ({
                 gridTemplateColumns: `repeat(${displayedColumns.length}, minmax(300px, 1fr))`,
               }}
             >
-              {/* --- Layer 1: Group Headers --- */}
               {Array.from(groups.entries()).map(([parentId, children]) => {
-                const startCol = taskIdToColumn.get(parentId);
-                if (!startCol) return null;
-                const visibleChildren = children.filter(childId => taskIdToColumn.has(childId));
-                const spanCount = 1 + visibleChildren.length;
+                const parentColIdx = taskIdToColumn.get(parentId);
+                if (!parentColIdx) return null;
+
+                // Find the columns of the visible children to calculate the span
+                const childCols = children
+                    .map(childId => taskIdToColumn.get(childId))
+                    .filter((c): c is number => c !== undefined)
+                    .sort((a,b) => a - b);
+
+                if (childCols.length === 0 && !collapsedGroups.has(parentId)) return null;
+
+                const startCol = parentColIdx;
+                // Span should be the distance from the parent to the last child in the group
+                const endCol = childCols.length > 0 ? Math.max(...childCols) : startCol;
+                const spanCount = endCol - startCol + 1;
 
                 return (
                   <div key={`group-header-${parentId}`} className="sticky top-0 bg-zinc-800 z-20 pt-1" style={{ gridColumn: `${startCol} / span ${spanCount}`, gridRow: 1 }}>
@@ -185,7 +235,6 @@ export const ExecutionLogView = ({
                 );
               })}
 
-              {/* --- Layer 2: Individual Task Headers --- */}
               {standaloneColumns.map((taskId) => {
                 const col = taskIdToColumn.get(taskId);
                 if (!col) return null;
@@ -204,7 +253,6 @@ export const ExecutionLogView = ({
                 );
               })}
 
-              {/* --- Layer 3: Log Entries --- */}
               {filteredLog.map((entry, logIndex) => {
                 const columnIndex = taskIdToColumn.get(entry.taskId);
                 const rowIndex = entry.timestamp ? timestampToRowMap.get(entry.timestamp) : undefined;
