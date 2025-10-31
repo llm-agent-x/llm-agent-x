@@ -65,7 +65,7 @@ const DocumentDetails = ({ task }: { task: Task }) => {
 };
 
 // --- CHANGE 3: Apply the strict `Task` type to the `task` prop in TaskInspector ---
-export const TaskInspector = ({ task }: { task: Task | null }) => {
+export const TaskInspector = ({ task, completedTasks }: { task: Task | null, completedTasks: Task[] }) => {
   if (!task) {
     return (
       <div className="flex items-center justify-center h-full bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 text-zinc-400">
@@ -88,7 +88,23 @@ export const TaskInspector = ({ task }: { task: Task | null }) => {
         <p className="font-mono text-xs text-zinc-500">{task.id}</p>
       </div>
 
-      {/* Scrollable Details Section */}
+      {task.tags && task.tags.length > 0 && (
+        <DetailRow
+          label="Tags"
+          value={
+            <div className="flex flex-wrap gap-2">
+              {task.tags.map((tag) => (
+                <span
+                  key={tag}
+                  className="px-2 py-0.5 text-xs font-mono rounded-full bg-zinc-700 text-zinc-300"
+                >
+                  #{tag}
+                </span>
+              ))}
+            </div>
+          }
+        />
+      )}
       <div className="flex-grow overflow-y-auto min-h-0 pr-2 -mr-2">
         <dl>
           <DetailRow
@@ -155,6 +171,7 @@ export const TaskInspector = ({ task }: { task: Task | null }) => {
           taskId={task.id}
           taskStatus={task.status}
           currentQuestion={task.current_question}
+          completedTasks={completedTasks}
         />
       </div>
     </div>

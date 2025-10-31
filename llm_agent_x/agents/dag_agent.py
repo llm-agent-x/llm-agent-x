@@ -1,14 +1,10 @@
 import asyncio
-import hashlib
 import uuid
 import logging
-from collections import defaultdict, deque
-from datetime import datetime, timezone
 from hashlib import md5
 from os import getenv
-import json  # NEW: For pretty-printing tool schemas
-from typing import Set, Dict, Any, Optional, List, Tuple, Union, Callable, Literal
-from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional, List, Tuple, Union
+from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.agent import AgentRunResult
 from pydantic_ai.mcp import (
@@ -18,15 +14,15 @@ from dotenv import load_dotenv
 
 # --- OpenTelemetry Imports ---
 from opentelemetry import trace, context as otel_context
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
 
+from llm_agent_x.core.types import verification, RetryDecision, ExecutionPlan, ProposedSubtask, ProposalResolutionPlan, \
+    ChainedExecutionPlan
+from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 # --- NEW STATE MANAGER IMPORTS ---
 from llm_agent_x.state_manager import AbstractStateManager, InMemoryStateManager
-from llm_agent_x.core import Task, UserQuestion, DocumentState
+from llm_agent_x.core import Task, UserQuestion
 
 # --- Basic Setup ---
 load_dotenv(".env", override=True)
@@ -48,229 +44,12 @@ def get_cost(usage) -> float:
 
 
 # --- Pydantic Models ---
-class verification(BaseModel):
-    reason: str
-    message_for_user: str
-    score: float = Field(description="A numerical score from 1 (worst) to 10 (best).")
-
-    def get_successful(self):
-        return self.score > 5
-
-
-class RetryDecision(BaseModel):
-    """The decision on whether to attempt another fix for a failing task."""
-
-    should_retry: bool = Field(
-        description="Set to true if the trend of scores suggests success is likely."
-    )
-    reason: str = Field(
-        description="A brief explanation for the decision, citing the score trend."
-    )
-    next_step_suggestion: str = Field(
-        description="A specific, actionable suggestion for the next attempt to improve the result."
-    )
-
-
-class InformationNeedDecision(BaseModel):
-    """The decision on whether a task's failure is due to a critical lack of information."""
-
-    is_needed: bool = Field(
-        description="Set to true ONLY if the task is fundamentally impossible to complete without specific external information from a human."
-    )
-    reason: str = Field(
-        description="A brief explanation for the decision, justifying why the information gap is or is not the root cause."
-    )
-
-
-class TaskToPrune(BaseModel):
-    """A task that is a candidate for pruning."""
-
-    task_id: str = Field(description="The unique ID of the task to be pruned.")
-    reason: str = Field(
-        description="A brief justification for why this task is the least critical."
-    )
-
-
-class PruningDecision(BaseModel):
-    """The final decision on which tasks to prune from the graph."""
-
-    tasks_to_prune: List[TaskToPrune] = Field(
-        description="A list of tasks that have been selected for removal."
-    )
 
 
 # Models for Initial, Top-Down Planning (The "Architect")
-class Dependency(BaseModel):
-    reason: str
-    local_id: str
-
-
-class DependencySelection(BaseModel):
-    """The decision on which dependencies are most critical for a task."""
-
-    reasoning: str = Field(description="A brief explanation of the selection strategy.")
-    approved_dependency_ids: List[str] = Field(
-        description="A list of the most critical dependency task IDs to use."
-    )
-
-
-class NewSubtask(BaseModel):
-    local_id: str
-    desc: str
-    deps: List[Dependency] = Field(default_factory=list)
-    can_request_new_subtasks: bool = Field(
-        False,
-        description="Set to true ONLY for complex, integrative, or uncertain tasks that might need further dynamic decomposition later.",
-    )
-
-
-class ExecutionPlan(BaseModel):
-    needs_subtasks: bool
-    subtasks: List[NewSubtask] = Field(default_factory=list)
 
 
 # Models for Adaptive, Bottom-Up Decomposition (The "Explorer")
-class ProposedSubtask(BaseModel):
-    local_id: str
-    desc: str
-    importance: int = Field(
-        description="An integer score from 1 (least critical) to 100 (most critical) representing this task's necessity.",
-        ge=1,
-        le=100,
-    )
-    deps: List[str] = Field(
-        default_factory=list,
-        description="A list of local_ids of other PROPOSED tasks that this one depends on.",
-    )
-
-
-class AdaptiveDecomposerResponse(BaseModel):
-    """
-    The structured response from the adaptive_decomposer agent.
-    It can propose new tasks to be created and/or request dependencies on existing tasks.
-    """
-
-    tasks: List[ProposedSubtask] = Field(
-        default_factory=list,
-        description="A list of new, granular sub-tasks to be created to achieve the parent objective.",
-    )
-    dep_requests: List[str] = Field(
-        default_factory=list,
-        description="A list of IDs of EXISTING tasks whose results are needed as new dependencies for the current task.",
-    )
-
-
-class TaskForMerging(BaseModel):
-    """Represents a single task in a plan being evaluated for merging."""
-
-    local_id: str
-    desc: str
-    deps: List[str] = Field(description="List of local_ids this task depends on.")
-
-
-class MergedTask(BaseModel):
-    """Represents a new, consolidated task that replaces one or more original tasks."""
-
-    new_local_id: str = Field(
-        description="A new, descriptive local ID for the merged task (e.g., 'plan_and_book_venue')."
-    )
-    new_desc: str = Field(
-        description="A new, comprehensive description for the merged task."
-    )
-    subsumed_task_ids: List[str] = Field(
-        description="A list of the original local_ids that this new task replaces."
-    )
-
-
-class MergingDecision(BaseModel):
-    """The plan for merging overly granular or redundant tasks."""
-
-    merged_tasks: List[MergedTask] = Field(
-        description="A list of new tasks that consolidate others."
-    )
-    kept_task_ids: List[str] = Field(
-        description="A list of local_ids for tasks that were NOT merged and should be kept as-is."
-    )
-
-
-class ProposalResolutionPlan(BaseModel):
-    """The final, pruned list of approved sub-tasks."""
-
-    approved_tasks: List[ProposedSubtask]
-
-
-class ContextualAnswer(BaseModel):
-    """The result of searching internal task history for an answer."""
-
-    is_found: bool = Field(
-        description="True if a definitive answer was found in the provided context."
-    )
-    answer: Optional[str] = Field(
-        None, description="The answer found in the context, if any."
-    )
-    source_task_id: Optional[str] = Field(
-        None, description="The ID of the task that contained the answer."
-    )
-    reasoning: str = Field(
-        description="A brief explanation of why the context is or is not sufficient to answer the question."
-    )
-
-
-class RedundancyDecision(BaseModel):
-    """The decision on which proposed tasks are not redundant and should proceed."""
-
-    non_redundant_tasks: List[ProposedSubtask] = Field(
-        description="A list of the tasks from the proposal that are unique and not covered by existing work."
-    )
-
-
-class TaskDescription(BaseModel):
-    """A single, discrete step in a plan."""
-
-    local_id: str = Field(
-        description="A temporary, unique identifier for this task within the current plan."
-    )
-    desc: str = Field(description="A clear and concise description of the task.")
-    can_request_new_subtasks: bool = Field(
-        False,
-        description="Set to true ONLY for complex, integrative, or uncertain tasks that might need further dynamic decomposition later.",
-    )
-    deps: List[str] = Field(
-        default_factory=list,
-        description="A list of GLOBAL IDs of existing tasks or documents this new task depends on.",
-    )
-
-
-class TaskChain(BaseModel):
-    """Represents a sequence of tasks that MUST be executed in a specific order."""
-
-    chain: List[TaskDescription] = Field(
-        description="An ordered list of tasks forming a sequential chain."
-    )
-
-
-class ChainedExecutionPlan(BaseModel):
-    """
-    The full execution plan, composed of one or more parallel chains of tasks.
-    Each chain represents a sequence of dependent tasks. Different chains can be executed in parallel.
-    """
-
-    task_chains: List[TaskChain] = Field(
-        description="A list of task chains. All chains can run in parallel."
-    )
-
-
-def generate_hash(content: str) -> str:
-    """Generates a SHA256 hash for a string."""
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-# The main Task model, enhanced for the new architecture
-class TaskContext:
-    def __init__(self, task_id: str, state_manager: AbstractStateManager):
-        self.task_id = task_id
-        self.state_manager = state_manager
-        self.task = self.state_manager.get_task(task_id)
 
 
 class DAGAgent:
@@ -284,6 +63,8 @@ class DAGAgent:
         max_grace_attempts: int = 1,
         min_question_priority: int = 1,
         mcp_server_url: Optional[str] = None,
+        *args,
+        **kwargs,
     ):
         self.state_manager = state_manager or InMemoryStateManager()
         self.inflight = set()
@@ -301,7 +82,8 @@ class DAGAgent:
         self.proposed_tasks_buffer: List[Tuple[ProposedSubtask, str]] = []
         self.mcp_servers = []
 
-        self._setup_agent_roles()
+        if kwargs.get("setup_agent_roles", True):
+            self._setup_agent_roles()
 
     def _print_status_tree(self):
         logger.info("--- CURRENT TASK STATUS TREE ---")
@@ -437,35 +219,6 @@ class DAGAgent:
             getattr(usage, "response_tokens", 0),
         )
         task.cost += cost
-
-    def _format_notebook_for_llm(self, task: Task, max_len_per_entry: int = 200) -> str:
-        if not task.shared_notebook:
-            return "The shared notebook is currently empty."
-        formatted_entries = []
-        for key, value in task.shared_notebook.items():
-            truncated_value = str(value)
-            if len(truncated_value) > max_len_per_entry:
-                truncated_value = truncated_value[: max_len_per_entry - 3] + "..."
-            formatted_entries.append(f"- {key}: {truncated_value}")
-        return "\n".join(formatted_entries)
-
-    def _get_notebook_tool_guidance(self, task: Task, agent_role_name: str) -> str:
-        just_talked_to_human = (
-            task.status == "pending" and task.user_response is not None
-        )
-        is_executor_phase = agent_role_name == "executor"
-        can_update_this_turn = is_executor_phase or (
-            just_talked_to_human
-            and agent_role_name in ["initial_planner", "adaptive_decomposer"]
-        )
-        if can_update_this_turn:
-            return (
-                f"\n\n--- Shared Notebook Update Guidance ---\n"
-                f"To record critical information permanently for Task {task.id}, use `update_notebook_tool`.\n"
-                f"Call it like: `await update_notebook_tool(task_id='{task.id}', updates={{'Key Name': 'Value'}})`\n"
-                f"Set value to `None` to delete a key.\n-------------------------------------"
-            )
-        return ""
 
     async def _handle_agent_output(
         self,

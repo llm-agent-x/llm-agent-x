@@ -35,6 +35,34 @@ export async function addTask(desc: string, mcp_servers: McpServer[]) {
   }
 }
 
+export async function injectDependencyDirective(
+  targetTaskId: string,
+  sourceTaskId: string,
+  depth: "shallow" | "deep",
+) {
+  try {
+    const payload = { source_task_id: sourceTaskId, depth };
+    const response = await fetch(
+      `${API_BASE_URL}/api/tasks/${targetTaskId}/directive`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: "INJECT_DEPENDENCY", payload }),
+      },
+    );
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Failed to send inject directive: ${response.status} ${errorText}`,
+      );
+    }
+    return await response.json();
+  } catch (error) {
+    console.error("Error sending inject directive:", error);
+    alert(`Error: ${(error as Error).message}`);
+  }
+}
+
 export interface Document {
   id: string;
   name: string;

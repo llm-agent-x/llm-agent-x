@@ -1,37 +1,19 @@
 // app/components/CommandPalette.tsx
 
-// --- CHANGE 1: Import ChangeEvent for typing input events ---
 import { useState, ChangeEvent } from "react";
-import { sendDirective } from "@/lib/api";
+import { sendDirective, injectDependencyDirective } from "@/lib/api";
 import {
   Play,
   Pause,
   X,
   Send,
   MessageSquareQuoteIcon,
+  GitMerge, // <-- ADDED ICON
 } from "lucide-react";
 import { StatusBadge } from "./StatusBadge";
-import {CurrentQuestion} from "@/lib/types";
+import { CurrentQuestion, Task } from "@/lib/types"; // <-- CORRECTED IMPORTS
 
-// --- CHANGE 2: Define strict types for your data structures ---
-interface UserQuestion {
-  priority: number;
-  question: string;
-  details: Record<string, unknown>; // Use `unknown` for better type safety than `any`
-}
-
-interface Task {
-  id: string;
-  desc: string;
-  status: string;
-  deps: string[];
-  result: string | null;
-  human_directive: string | null;
-  current_question: CurrentQuestion | null;
-  user_response: string | null;
-}
-
-// --- DetailRow component remains the same, its types are already good ---
+// --- DetailRow component ---
 const DetailRow = ({
   label,
   value,
@@ -45,8 +27,14 @@ const DetailRow = ({
   </div>
 );
 
-// --- CHANGE 3: Apply the strict `Task` type to the `task` prop ---
-export const TaskInspector = ({ task }: { task: Task | null }) => {
+// --- TaskInspector component ---
+export const TaskInspector = ({
+  task,
+  completedTasks, // <-- ADDED PROP
+}: {
+  task: Task | null;
+  completedTasks: Task[]; // <-- ADDED PROP
+}) => {
   if (!task) {
     return (
       <div className="flex items-center justify-center h-full bg-zinc-800/50 p-4 rounded-lg border border-zinc-700 text-zinc-400">
@@ -55,7 +43,6 @@ export const TaskInspector = ({ task }: { task: Task | null }) => {
     );
   }
 
-  // No change needed here, this is a safe type guard
   const depsArray = Array.isArray(task.deps) ? task.deps : [];
 
   return (
@@ -90,7 +77,7 @@ export const TaskInspector = ({ task }: { task: Task | null }) => {
             label="Active Human Directive"
             value={
               <span className="bg-blue-900/50 text-blue-300 p-2 rounded-md block animate-pulse">
-                {task.human_directive}
+                {task.human_directive.instruction}
               </span>
             }
           />
@@ -122,32 +109,41 @@ export const TaskInspector = ({ task }: { task: Task | null }) => {
         taskId={task.id}
         taskStatus={task.status}
         currentQuestion={task.current_question}
+        completedTasks={completedTasks} // <-- PASS PROP
       />
     </div>
   );
 };
 
-// --- CHANGE 4: Define a specific props interface for CommandPalette ---
+// --- CommandPalette Props Interface ---
 interface CommandPaletteProps {
   taskId: string;
   taskStatus: string;
   currentQuestion: CurrentQuestion | null;
+  completedTasks: Task[];
 }
 
+// --- CommandPalette component ---
 export const CommandPalette = ({
   taskId,
   taskStatus,
   currentQuestion,
+  completedTasks, // <-- DESTRUCTURE PROP
 }: CommandPaletteProps) => {
   const [redirectInput, setRedirectInput] = useState("");
-  const [overrideInput, setOverrideInput] = useState("");
   const [answerInput, setAnswerInput] = useState("");
+  const [depToInject, setDepToInject] = useState<string>("");
 
   const handleCommand = async (command: string, payload?: string) => {
     await sendDirective(taskId, command, payload);
     setRedirectInput("");
-    setOverrideInput("");
     setAnswerInput("");
+  };
+
+  const handleInject = async (depth: "shallow" | "deep") => {
+    if (!depToInject) return;
+    await injectDependencyDirective(taskId, depToInject, depth);
+    setDepToInject(""); // Reset dropdown
   };
 
   return (
@@ -157,38 +153,89 @@ export const CommandPalette = ({
       </h3>
 
       {taskStatus === "waiting_for_user_response" && currentQuestion ? (
-        <div className="bg-orange-900/30 border border-orange-700 p-3 rounded-md mb-4 animate-pulse">
-          <div className="flex items-center gap-2 mb-2 text-orange-200">
-            <MessageSquareQuoteIcon size={18} />
-            <span className="font-semibold">
-              Agent Question (Priority: {currentQuestion.priority}/10)
-            </span>
+        // --- START: UI FOR QUESTION STATE ---
+        <>
+          {/* Section 1: Answer the question directly */}
+          <div className="bg-orange-900/30 border border-orange-700 p-3 rounded-md mb-4">
+            <div className="flex items-center gap-2 mb-2 text-orange-200">
+              <MessageSquareQuoteIcon size={18} />
+              <span className="font-semibold">
+                Agent Question (Priority: {currentQuestion.priority}/10)
+              </span>
+            </div>
+            <p className="text-sm text-orange-100 mb-3">
+              {currentQuestion.question}
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={answerInput}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setAnswerInput(e.target.value)
+                }
+                placeholder="Type your answer here..."
+                className="w-full bg-zinc-800 border border-orange-600 rounded-md p-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none"
+                required
+              />
+              <button
+                onClick={() => handleCommand("ANSWER_QUESTION", answerInput)}
+                disabled={!answerInput.trim()}
+                className="flex items-center gap-2 p-2 bg-orange-600 hover:bg-orange-700 rounded-md disabled:bg-zinc-600 shrink-0"
+              >
+                <Send size={16} />
+                Submit Answer
+              </button>
+            </div>
           </div>
-          <p className="text-sm text-orange-100 mb-3">
-            {currentQuestion.question}
-          </p>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={answerInput}
-              // --- CHANGE 5: Type the `onChange` event handler ---
-              onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                setAnswerInput(e.target.value)
-              }
-              placeholder="Type your answer here..."
-              className="w-full bg-zinc-800 border border-orange-600 rounded-md p-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none"
-              required
-            />
-            <button
-              onClick={() => handleCommand("ANSWER_QUESTION", answerInput)}
-              disabled={!answerInput.trim()}
-              className="p-2 bg-orange-600 hover:bg-orange-700 rounded-md disabled:bg-zinc-600 shrink-0"
-            >
-              <Send size={16} /> Submit Answer
-            </button>
+
+          {/* Section 2: Inject a dependency as an alternative */}
+          <div className="bg-zinc-800/50 border border-zinc-700 p-3 rounded-md">
+            <div className="flex items-center gap-2 mb-2 text-zinc-300">
+              <GitMerge size={18} />
+              <span className="font-semibold">
+                Inject Context from Completed Task
+              </span>
+            </div>
+            <p className="text-xs text-zinc-400 mb-3">
+              Provide the result of another task as additional context to help
+              the agent.
+            </p>
+            <div className="flex gap-2">
+              <select
+                value={depToInject}
+                onChange={(e) => setDepToInject(e.target.value)}
+                className="w-full bg-zinc-800 border border-zinc-600 rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+              >
+                <option value="">-- Select a completed task --</option>
+                {completedTasks.map((task) => (
+                  <option key={task.id} value={task.id}>
+                    {task.id} - {task.desc.slice(0, 50)}...
+                  </option>
+                ))}
+              </select>
+            </div>
+            {depToInject && (
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={() => handleInject("shallow")}
+                  className="flex-1 p-2 bg-blue-600 hover:bg-blue-700 rounded-md text-sm"
+                >
+                  Inject Shallow (Result Only)
+                </button>
+                <button
+                  onClick={() => handleInject("deep")}
+                  className="flex-1 p-2 bg-purple-600 hover:bg-purple-700 rounded-md text-sm"
+                >
+                  Inject Deep (Result + History)
+                </button>
+              </div>
+            )}
           </div>
-        </div>
+        </>
       ) : (
+        // --- END: UI FOR QUESTION STATE ---
+
+        // --- START: UI FOR OTHER STATES ---
         <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-4">
           {taskStatus === "paused_by_human" ? (
             <button
@@ -222,8 +269,9 @@ export const CommandPalette = ({
           </button>
         </div>
       )}
+      {/* --- END: UI FOR OTHER STATES --- */}
 
-      <div className="space-y-2 mb-4">
+      <div className="space-y-2 mt-4">
         <label className="text-sm font-medium text-zinc-400">
           Redirect (Corrective Guidance)
         </label>
@@ -231,7 +279,6 @@ export const CommandPalette = ({
           <input
             type="text"
             value={redirectInput}
-            // --- CHANGE 6: Type the `onChange` event handler ---
             onChange={(e: ChangeEvent<HTMLInputElement>) =>
               setRedirectInput(e.target.value)
             }

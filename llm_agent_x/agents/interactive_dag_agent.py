@@ -1,13 +1,16 @@
 # llm_agent_x/agents/interactive_dag_agent.py
 
 import asyncio
+import heapq
 import json
 import logging
 import os
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import List, Tuple, Union, Dict, Any, Optional, Callable
 
 import pika
@@ -16,7 +19,7 @@ from opentelemetry.trace import StatusCode
 from phoenix.trace.schemas import SpanAttributes
 from pydantic import BaseModel
 from pydantic_ai.agent import AgentRunResult, Agent, CallToolsNode, ModelRequestNode
-from pydantic_ai.mcp import MCPServerStreamableHTTP
+from pydantic_ai.mcp import MCPServerStreamableHTTP, MCPServerSSE
 from pydantic_ai.messages import (
     ToolCallPart,
     ToolReturnPart,
@@ -33,31 +36,7 @@ from pydantic_ai.direct import model_request
 from pydantic_ai.messages import ModelRequest
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.tools import ToolDefinition
-
-from llm_agent_x.core import Task, UserQuestion, DocumentState
-from llm_agent_x.agents.dag_agent import (
-    DAGAgent,
-    TaskContext,
-    ExecutionPlan,
-    ProposedSubtask,
-    verification,
-    RetryDecision,
-    ProposalResolutionPlan,
-    AdaptiveDecomposerResponse,
-    InformationNeedDecision,
-    DependencySelection,
-    PruningDecision,
-    TaskForMerging,
-    MergedTask,
-    MergingDecision,
-    NewSubtask,
-    ContextualAnswer,
-    RedundancyDecision,
-    ChainedExecutionPlan,
-    TaskChain,
-    TaskDescription,
-    generate_hash,
-)
+from pydantic_ai import RunContext
 
 from dotenv import load_dotenv
 
@@ -67,6 +46,41 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Tracer, Span, StatusCode
 from openinference.semconv.trace import SpanAttributes
+
+from llm_agent_x.agents.dag_agent import (
+    DAGAgent,
+)
+from llm_agent_x.backend.utils import generate_hash
+from llm_agent_x.core import (
+    Task,
+    UserQuestion,
+    DocumentState,
+    verification,
+    RetryDecision,
+    InformationNeedDecision,
+    PruningDecision,
+    DependencySelection,
+    NewSubtask,
+    ExecutionPlan,
+    ProposedSubtask,
+    AdaptiveDecomposerResponse,
+    TaskForMerging,
+    MergedTask,
+    MergingDecision,
+    ProposalResolutionPlan,
+    ContextualAnswer,
+    RedundancyDecision,
+    TaskDescription,
+    TaskChain,
+    ChainedExecutionPlan,
+    HumanInjectedDependency,
+    Interrupt,
+    HumanDirectiveInterrupt,
+    AgentMessageInterrupt,
+)
+from llm_agent_x.managers import CommunicationManager
+from llm_agent_x.managers.notebook_manager import NotebookManager
+from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 
 from llm_agent_x.backend.extract_json_from_text import extract_json
 from llm_agent_x.state_manager import InMemoryStateManager, AbstractStateManager
@@ -105,7 +119,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         state_manager = InMemoryStateManager(broadcast_callback=self._broadcast_state_update)
 
-        super().__init__(*args, state_manager=state_manager, **kwargs)
+        super().__init__(*args, state_manager=state_manager, setup_agent_roles=False, **kwargs)
 
         self.directives_queue = asyncio.Queue()
         self._publisher_connection: Optional[pika.BlockingConnection] = None
@@ -124,9 +138,14 @@ class InteractiveDAGAgent(DAGAgent):
         self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
         self.proposed_tasks_buffer = []
         self.proposed_task_dependencies_buffer = []
-        self.update_notebook_tool = self._create_notebook_tool(
-            self.state_manager, self._broadcast_state_update
+
+        self.comms_manager = CommunicationManager(
+            state_manager=self.state_manager,
         )
+        self.notebook_manager = NotebookManager(
+            state_manager=self.state_manager,
+        )
+
         self._setup_agent_roles()
 
     def _setup_agent_roles(self):
@@ -135,16 +154,21 @@ class InteractiveDAGAgent(DAGAgent):
 
         planner_system_prompt = (
             "You are a master project planner. Your job is to break down a complex objective into a series of smaller, actionable sub-tasks. "
-            "You will be given the main objective and, crucially, a list of 'AVAILABLE DOCUMENTS' and their global IDs. These documents are your primary data sources."
-            "\n\n**YOUR DECISION PROCESS MUST FOLLOW THESE RULES:**"
-            "\n1. **CHECK DOCUMENTS FIRST:** Before creating any task, review the list of AVAILABLE DOCUMENTS. Ask yourself: 'Is the information needed for this step already present in one of these documents?'"
-            "\n2. **DEPEND, DON'T RE-CREATE:** If a task's primary purpose is to get information from an existing document, you MUST NOT create a new task to 'read' or 'analyze' it. Instead, create a task that USES the information and add the document's global ID directly to its `deps` list."
-            "\n3. **LINK SEQUENTIAL STEPS:** Structure your output as 'chains' of tasks. A 'chain' is a list of tasks that must be done sequentially. All chains will run in parallel."
+            "Crucially, you must also assign `tags` to each new task to define its capabilities and allow other agents to communicate with it."
+            "\n\n**TAGGING RULES:**"
+            "\n1. **Be Specific:** Tags should describe the task's function (e.g., 'research', 'writing', 'outreach')."
+            "\n2. **Group Related Tasks:** Tasks that need to collaborate or share information should have a common, unique tag (e.g., 'venue_selection', 'budget_approval_q2')."
+            "\n3. **Reuse Existing Tags:** A list of 'EXISTING TAGS' is provided. Reuse these where appropriate to maintain consistency."
+            "\n\n**PLANNING RULES:**"
+            "\n1. **Use Documents:** Check 'AVAILABLE DOCUMENTS' first. If a document provides needed info, create a task that USES it and add the document's ID to `deps`."
+            "\n2. **Create Chains:** Group sequential steps into a 'chain'. All chains run in parallel."
             "\n\n**EXAMPLE:**"
-            "\n- Objective: 'Create a summary of Q2 performance.'"
-            "\n- AVAILABLE DOCUMENTS: `[{'id': 'doc-abc', 'desc': 'Document: Q2 Financials'}]`"
-            "\n- **CORRECT ACTION:** Create a single task like `{'desc': 'Synthesize Q2 Financials into a summary', 'deps': ['doc-abc']}`."
-            "\n- **INCORRECT ACTION:** Creating a task like `{'desc': 'Read the Q2 Financials document', 'deps': []}`. This is redundant."
+            "\n- Objective: 'Plan the conference venue and marketing.'"
+            "\n- EXISTING TAGS: ['finance', 'planning']"
+            "\n- **CORRECT ACTION:** Create a plan with tasks like:"
+            "\n  - `{'desc': 'Research potential venues', 'tags': ['planning', 'venue_selection']}`"
+            "\n  - `{'desc': 'Finalize venue choice', 'tags': ['planning', 'venue_selection']}` (depends on the first task)"
+            "\n  - `{'desc': 'Draft marketing copy', 'tags': ['marketing', 'copywriting']}` (runs in parallel)"
         )
 
         self.initial_planner = Agent(
@@ -240,6 +264,7 @@ class InteractiveDAGAgent(DAGAgent):
             "You are the executor. Your job is to run the given task and return the result. If this task has MCP servers associated with it, you must use them to run the task. If no MCP servers are associated with a task, you must use the base tools.",
         )
 
+
         self.executor = Agent(
             model=llm_model,
             system_prompt=self.executor_system_prompt,
@@ -247,6 +272,12 @@ class InteractiveDAGAgent(DAGAgent):
             tools=self._tools_for_agents,
             mcp_servers=self.mcp_servers,
         )
+
+        # This isn't actually a functional change, but it does make the code more consistent
+        self.comms_manager.apply_to_agent(self.executor)
+        self.notebook_manager.apply_instructions(self.executor)
+        self.notebook_manager.apply_tools(self.executor)
+
         self.verifier = Agent(
             model=llm_model,
             system_prompt="You are a meticulous quality assurance verifier. Your job is to check if the provided 'Candidate Result' accurately and completely addresses the 'Task', considering the history and user instructions. Output JSON matching the 'verification' schema. Be strict.",
@@ -317,6 +348,17 @@ class InteractiveDAGAgent(DAGAgent):
             "question_formulator": self.question_formulator,
             "internal_context_researcher": self.internal_context_researcher,
         }
+
+        agents_to_receive_notebook = [
+            "initial_planner",
+            "adaptive_decomposer",
+            "verifier",
+        ]
+
+        for agent_name in agents_to_receive_notebook:
+            agent = self._agent_role_map.get(agent_name)
+            if agent:
+                self.notebook_manager.apply_instructions(agent)
 
     async def _run_stateless_agent(
             self, agent: Agent, user_prompt: str, ctx: TaskContext
@@ -395,18 +437,6 @@ class InteractiveDAGAgent(DAGAgent):
                 t.span.record_exception(e)
             return None
 
-    def _inject_and_clear_user_response(self, prompt_parts: List[str], task: Task):
-        if task.user_response:
-            logger.info(f"Injecting user response into prompt for task [{task.id}]")
-            response_prompt = (
-                f"\n--- CRITICAL INFORMATION PROVIDED BY HUMAN OPERATOR ---\n"
-                f"{task.user_response}\n"
-                f"----------------------------------------------------------\n"
-            )
-            prompt_parts.insert(0, response_prompt)
-            task.user_response = None
-            self._broadcast_state_update(task)
-
     def _add_llm_data_to_system_span(self, span: Span, agent_res: AgentRunResult):
         if not span or not agent_res:
             return
@@ -414,38 +444,10 @@ class InteractiveDAGAgent(DAGAgent):
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, getattr(usage, "request_tokens", 0))
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
 
-    def _create_notebook_tool(self, state_manager: AbstractStateManager, broadcast_callback: Callable):
-        def update_notebook_tool_instance(task_id: str, updates: Dict[str, Any]) -> str:
-            """
-Updates the shared notebook for a given task.
-Provide key-value pairs in the 'updates' dictionary.
-Set a value to 'null' (Python `None`) to delete a key from the notebook.
-            """
-            task = state_manager.get_task(task_id)
-            if not task:
-                return f"Error: Task {task_id} not found."
-
-            updated_keys, deleted_keys = [], []
-            for key, value in updates.items():
-                if value is None:
-                    if key in task.shared_notebook:
-                        del task.shared_notebook[key]
-                        deleted_keys.append(key)
-                else:
-                    task.shared_notebook[key] = value
-                    updated_keys.append(key)
-
-            state_manager.upsert_task(task)
-
-            result_msg = f"Notebook for task {task_id} updated. Updated: {', '.join(updated_keys) or 'None'}. Deleted: {', '.join(deleted_keys) or 'None'}."
-            logger.info(result_msg)
-            return result_msg
-        return update_notebook_tool_instance
-
     def _get_publisher_channel(self) -> pika.adapters.blocking_connection.BlockingChannel:
         if self._publisher_connection is None or self._publisher_connection.is_closed:
             logger.info("Establishing new publisher RabbitMQ connection and channel.")
-            self._publisher_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST))
+            self._publisher_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST, heartbeat=60))
             self._publish_channel = self._publisher_connection.channel()
             self._publish_channel.exchange_declare(exchange=self.STATE_UPDATES_EXCHANGE, exchange_type="fanout")
         return self._publish_channel
@@ -458,6 +460,17 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 channel.basic_publish(exchange=self.STATE_UPDATES_EXCHANGE, routing_key="", body=message)
         except Exception as e:
             logger.error(f"Failed to broadcast state update for task {task.id}: {e}", exc_info=False)
+
+    def _broadcast_execution_log_update(self, task_id: str, log_entry: Dict[str, Any]):
+        """Helper to broadcast a single execution log entry."""
+        task = self.state_manager.get_task(task_id)
+        if task:
+            log_entry['timestamp'] = datetime.now(timezone.utc).isoformat()
+
+            task.execution_log.append(log_entry)
+            # We broadcast the whole task so the UI can update its state.
+            # This is more robust than sending partial updates.
+            self._broadcast_state_update(task)
 
     def _format_stream_node(self, node: Any) -> Optional[Dict[str, Any]]:
         def truncate(s: Any, length: int = 250) -> str:
@@ -481,7 +494,8 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 return {"type": "final_answer", "content": node.data.output}
         return None
 
-    async def _handle_agent_output(self, ctx: TaskContext, agent_res: AgentRunResult, expected_output_type: Any, agent_role_name: str) -> Tuple[bool, Any]:
+    async def _handle_agent_output(self, ctx: TaskContext, agent_res: AgentRunResult, expected_output_type: Any,
+                                   agent_role_name: str) -> Tuple[bool, Any]:
         t = ctx.task
         self._add_llm_data_to_span(t.span, agent_res, t)
         t.last_llm_history = agent_res.all_messages()
@@ -490,21 +504,45 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
         actual_output = agent_res.output
 
         if isinstance(actual_output, UserQuestion):
-            if agent_role_name == "question_formulator":
-                logger.info(f"Task [{t.id}] escalating to human with question: {actual_output.question[:80]}...")
-                t.current_question = actual_output
-                t.agent_role_paused = agent_role_name
-                t.status = "waiting_for_user_response"
-                self._broadcast_state_update(t)
-                return True, actual_output
-            else:
-                logger.warning(f"Agent '{agent_role_name}' for task [{t.id}] attempted to ask a question. Treating as invalid output.")
-                pass
+            logger.info(
+                f"Task [{t.id}] agent '{agent_role_name}' is asking a human question: {actual_output.question[:80]}...")
+            t.current_question = actual_output
+            t.agent_role_paused = agent_role_name
+            t.status = "waiting_for_user_response"
+            self._broadcast_state_update(t)
+            return True, actual_output  # Return True to indicate the task is paused
 
         if not isinstance(actual_output, (BaseModel, str)):
-            logger.warning(f"Task [{t.id}] received unexpected output from '{agent_role_name}'. Expected {expected_output_type}, got {type(actual_output).__name__}.")
+            logger.warning(
+                f"Task [{t.id}] received unexpected output from '{agent_role_name}'. Expected {expected_output_type}, got {type(actual_output).__name__}.")
 
         return False, actual_output
+
+    async def _escalate_to_human_question(self, ctx: TaskContext, final_failure_reason: str):
+        """Handles the final escalation path when all autonomous attempts are exhausted."""
+        t = ctx.task
+        logger.warning(
+            f"[{t.id}] All autonomous attempts exhausted. Escalating to human. Reason: {final_failure_reason}")
+
+        # Use the last verification result if available for better context
+        last_reason = t.verification_history[-1].reason if t.verification_history else final_failure_reason
+
+        scores_only = [v.score for v in t.verification_history]
+
+        formulator_prompt = f"Context: Task '{t.desc}' failed with scores {scores_only}. Final failure reason: '{last_reason}'. Formulate the SINGLE most critical question for the human operator to unblock this."
+        question_output = await self._run_stateless_agent(self.question_formulator, formulator_prompt, ctx)
+
+        if isinstance(question_output, UserQuestion):
+            t.current_question = question_output
+            t.agent_role_paused = "question_formulator"
+            t.status = "waiting_for_user_response"
+        else:
+            error_msg = "All recovery options exhausted, and failed to formulate a question for the operator."
+            t.status = "failed"
+            t.result = error_msg
+            t.agent_role_paused = None
+
+        self.state_manager.upsert_task(t)
 
     async def _prune_task_graph_if_needed(self, required_space: int = 0):
         tasks = self.state_manager.get_all_tasks()
@@ -651,28 +689,72 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             logger.info("Consumer thread exited.")
 
     async def _handle_directive(self, directive: dict):
-        command, task_id, payload = directive.get("command"), directive.get("task_id"), directive.get("payload")
+        command = directive.get("command")
+        task_id = directive.get("task_id")
+        payload = directive.get("payload")
+
+        logger.info(f"Dispatcher received command '{command}' for task '{task_id}'")
+
+        # --- System-Level Commands (Graph/State Manipulation) ---
+        # These are handled directly by the worker and do not go into the task's interrupt queue.
 
         if command == "ADD_ROOT_TASK":
             payload = directive.get("payload", {})
             if desc := payload.get("desc"):
-                new_task = Task(id=str(uuid.uuid4())[:8], desc=desc, needs_planning=payload.get("needs_planning", True), status="pending", mcp_servers=payload.get("mcp_servers", []))
+                new_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=desc,
+                    needs_planning=payload.get("needs_planning", True),
+                    status="pending",
+                    mcp_servers=payload.get("mcp_servers", []),
+                    tags=set(payload.get("tags", [])), # <-- Handle tags on creation
+                )
                 self.state_manager.upsert_task(new_task)
-                logger.info(f"Added new root task from directive: {new_task.id} - {new_task.desc}")
+                logger.info(f"Added new root task: {new_task.id} - {new_task.desc}")
             return
 
         if command == "ADD_DOCUMENT":
             payload = directive.get("payload", {})
             if (name := payload.get("name")) and (content := payload.get("content")) is not None:
                 doc_state = DocumentState(content=content)
-                new_doc_task = Task(id=str(uuid.uuid4())[:8], desc=f"Document: {name}", task_type="document", document_state=doc_state, status="complete", is_critical=True, counts_toward_limit=False)
+                new_doc_task = Task(
+                    id=str(uuid.uuid4())[:8],
+                    desc=f"Document: {name}",
+                    task_type="document",
+                    document_state=doc_state,
+                    status="complete",
+                    is_critical=True,
+                    counts_toward_limit=False,
+                )
                 self.state_manager.upsert_task(new_doc_task)
                 logger.info(f"Added new document node: {new_doc_task.id} - {name}")
             return
 
-        task = self.state_manager.get_task(task_id)
+        if command == "RESET_STATE":
+            logger.warning("Received RESET_STATE directive. Wiping all tasks.")
+            for future in self.task_futures.values(): future.cancel()
+            self.task_futures.clear()
+            self.inflight.clear()
+            current_tasks = list(self.state_manager.get_all_tasks().keys())
+            for tid in current_tasks:
+                self.state_manager.delete_task(tid)
+            for tid, task_data in payload.items():
+                try:
+                    self.state_manager.upsert_task(Task(**task_data))
+                except Exception as e:
+                    logger.error(f"Failed to load task {tid} from state file: {e}")
+            logger.info(f"Successfully loaded {len(payload)} tasks. Broadcasting all.")
+            for task in self.state_manager.get_all_tasks().values():
+                self._broadcast_state_update(task)
+            return
 
-        if command == "UPDATE_DOCUMENT" and task and task.task_type == "document" and task.document_state:
+        # --- All subsequent commands require a valid task_id ---
+        task = self.state_manager.get_task(task_id)
+        if not task:
+            logger.warning(f"Directive '{command}' for unknown task '{task_id}' ignored.")
+            return
+
+        if command == "UPDATE_DOCUMENT" and task.task_type == "document" and task.document_state:
             if new_name := payload.get("name"):
                 task.desc = f"Document: {new_name}"
             if (new_content := payload.get("content")) is not None and generate_hash(new_content) != task.document_state.content_hash:
@@ -680,12 +762,32 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             self.state_manager.upsert_task(task)
             return
 
-        if command == "DELETE_DOCUMENT" and task and task.task_type == "document":
+        if command == "DELETE_DOCUMENT" and task.task_type == "document":
             await self._prune_specific_task(task_id, reason="Document deleted by operator.", new_status="pruned", override_critical=True)
             return
 
-        if command == "CANCEL" and task:
+        if command == "PAUSE":
+            task.status = "paused_by_human"
+            if task_id in self.task_futures and not self.task_futures[task_id].done():
+                self.task_futures[task_id].cancel()
+            self.state_manager.upsert_task(task)
+            return
+
+        if command == "RESUME":
+            if task.status == "paused_by_human":
+                task.status = "pending" # Reset to be picked up by scheduler
+                self.state_manager.upsert_task(task)
+            return
+
+        if command == "CANCEL":
             task.status, task.result = "cancelled", f"Cancelled by operator: {payload or 'No reason given.'}"
+            if task_id in self.task_futures: self.task_futures[task_id].cancel()
+            self.state_manager.upsert_task(task)
+            await self._reset_downstream_tasks(task_id)
+            return
+
+        if command == "TERMINATE":
+            task.status, task.result = "failed", f"Terminated by operator: {payload}"
             if task_id in self.task_futures: self.task_futures[task_id].cancel()
             self.state_manager.upsert_task(task)
             await self._reset_downstream_tasks(task_id)
@@ -696,56 +798,56 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             await self._prune_orphaned_tasks()
             return
 
-        if command == "RESET_STATE":
-            logger.warning("Received RESET_STATE directive. Wiping all tasks.")
-            for future in self.task_futures.values(): future.cancel()
-            self.task_futures.clear()
-            self.inflight.clear()
-
-            # This is a bit brute-force for in-memory, but fine for now.
-            # A DB implementation would be a transaction.
-            current_tasks = list(self.state_manager.get_all_tasks().keys())
-            for tid in current_tasks:
-                self.state_manager.delete_task(tid)
-
-            for tid, task_data in payload.items():
-                try:
-                    self.state_manager.upsert_task(Task(**task_data))
-                except Exception as e:
-                    logger.error(f"Failed to load task {tid} from state file: {e}")
-
-            logger.info(f"Successfully loaded {len(payload)} tasks. Broadcasting state.")
-            for task in self.state_manager.get_all_tasks().values():
-                self._broadcast_state_update(task)
-            return
-
-        if not task:
-            logger.warning(f"Directive '{command}' for unknown task {task_id} ignored.")
-            return
-
-        if task_id in self.task_futures and not self.task_futures[task_id].done():
-            self.task_futures[task_id].cancel()
-
-        reset_dependents = False
-        if command == "PAUSE": task.status = "paused_by_human"
-        elif command == "RESUME":
-            if task.status == "paused_by_human": task.status = "pending"
-        elif command == "TERMINATE":
-            task.status, task.result, reset_dependents = "failed", f"Terminated by operator: {payload}", True
-        elif command in ["REDIRECT", "MANUAL_OVERRIDE"]:
-            if command == "REDIRECT": task.human_directive = payload; task.status = "pending"
-            else: task.status, task.result = "complete", payload
+        if command == "MANUAL_OVERRIDE":
+            task.status, task.result = "complete", payload
+            if task_id in self.task_futures: self.task_futures[task_id].cancel()
             task.fix_attempts = task.grace_attempts = 0
-            task.verification_scores, task.last_llm_history, task.execution_log = [], None, []
-            reset_dependents = True
-        elif command == "ANSWER_QUESTION" and task.status == "waiting_for_user_response":
-            task.user_response = str(payload)
-            task.current_question = task.agent_role_paused = None
-
-        if reset_dependents:
+            task.verification_history, task.last_llm_history, task.execution_log = [], None, []
+            self.state_manager.upsert_task(task)
             await self._reset_downstream_tasks(task_id)
+            return
 
-        self.state_manager.upsert_task(task)
+        if command == "INJECT_DEPENDENCY":
+            if task.status == "waiting_for_user_response":
+                source_task_id = payload.get("source_task_id")
+                depth = payload.get("depth", "shallow")
+                if source_task_id and (source_task := self.state_manager.get_task(source_task_id)):
+                    if source_task.status == 'complete':
+                        task.human_injected_deps.append(HumanInjectedDependency(source_task_id=source_task_id, depth=depth))
+                        task.status = "pending" # Reset to be picked up by scheduler
+                        task.current_question = task.agent_role_paused = None
+                        logger.info(f"Injected dependency {source_task_id} into task {task_id}. Resetting.")
+                    else:
+                        logger.warning(f"Cannot inject from non-complete task {source_task_id}.")
+                else:
+                    logger.warning(f"Could not find source task {source_task_id}.")
+                self.state_manager.upsert_task(task)
+            else:
+                logger.warning(f"Cannot inject dependency into task {task_id} not waiting for user response.")
+            return
+
+        # --- Task-Level Interrupts (Context for the Task's LLM) ---
+        # These are converted into Interrupt objects and placed in the task's queue.
+
+        if command in ["REDIRECT", "ANSWER_QUESTION"]:
+            if task.status in ["complete", "failed", "cancelled", "pruned"]:
+                logger.warning(f"Cannot send directive '{command}' to inactive task {task_id}.")
+                return
+
+            interrupt = HumanDirectiveInterrupt(command=command, payload=payload)
+            heapq.heappush(task.interrupt_queue, interrupt)
+            logger.info(f"Queued '{command}' interrupt for task {task_id}.")
+
+            # If the task was waiting for an answer, this new context unblocks it.
+            if task.status == "waiting_for_user_response":
+                task.status = "pending"
+                task.current_question = None
+                task.agent_role_paused = None
+
+            self.state_manager.upsert_task(task)
+            return
+
+        logger.warning(f"Unknown or unhandled command '{command}' for task {task_id}.")
 
     async def _reset_downstream_tasks(self, task_id: str):
         logger.info(f"Resetting downstream tasks of {task_id}")
@@ -766,9 +868,16 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 task_to_reset.status = "pending"
                 task_to_reset.result = None
                 task_to_reset.fix_attempts = task_to_reset.grace_attempts = 0
-                task_to_reset.verification_scores = []
-                task_to_reset.human_directive = task_to_reset.user_response = task_to_reset.current_question = task_to_reset.last_llm_history = task_to_reset.agent_role_paused = None
+                task_to_reset.verification_history = []
+                # task_to_reset.human_directive = task_to_reset.user_response = task_to_reset.current_question = task_to_reset.last_llm_history = task_to_reset.agent_role_paused = None
                 self.state_manager.upsert_task(task_to_reset)
+
+    def _get_all_existing_tags(self) -> List[str]:
+        """Scans all tasks and returns a sorted list of unique tags."""
+        all_tags = set()
+        for task in self.state_manager.get_all_tasks().values():
+            all_tags.update(task.tags)
+        return sorted(list(all_tags))
 
     async def run(self):
         self._main_event_loop = asyncio.get_running_loop()
@@ -802,7 +911,7 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                     all_task_ids = set(tasks.keys())
 
                     executable_statuses = {"pending", "running", "planning", "proposing", "waiting_for_children"}
-                    non_executable_tasks = {t.id for t in tasks.values() if t.status not in executable_statuses and not (t.status == "waiting_for_user_response" and t.user_response is not None)}
+                    non_executable_tasks = {t.id for t in tasks.values() if t.status not in executable_statuses and not (t.status == "waiting_for_user_response")}
 
                     pending_tasks_for_scheduling = all_task_ids - non_executable_tasks
                     ready_to_run_ids = set()
@@ -810,18 +919,29 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                     for tid in pending_tasks_for_scheduling:
                         task = self.state_manager.get_task(tid)
                         if not task: continue
-                        if task.status == "waiting_for_user_response" and task.user_response is not None:
+
+                        # Condition 1: Is it a 'pending' task whose dependencies are met?
+                        if task.status == "pending" and all(
+                                (dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in
+                                task.deps):
                             ready_to_run_ids.add(tid)
-                        elif task.status == "pending" and all((dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in task.deps):
-                            ready_to_run_ids.add(tid)
-                        elif task.status == "waiting_for_children" and all((child_task := self.state_manager.get_task(c)) and child_task.status in ["complete", "failed"] for c in task.children):
-                            if any((child_task := self.state_manager.get_task(c)) and child_task.status == "failed" for c in task.children):
+
+                        # --- THIS IS THE RESTORED BLOCK ---
+                        # Condition 2: Is it a parent task waiting for its children to finish?
+                        elif task.status == "waiting_for_children" and all(
+                                (child_task := self.state_manager.get_task(c)) and child_task.status in ["complete",
+                                                                                                         "failed"] for c
+                                in task.children):
+                            # Check if any child failed.
+                            if any((child_task := self.state_manager.get_task(c)) and child_task.status == "failed" for
+                                   c in task.children):
                                 if task.status != "failed":
-                                    task.status, task.result = "failed", "A child task failed."
+                                    task.status, task.result = "failed", "A child task failed, cannot synthesize results."
                                     self.state_manager.upsert_task(task)
                             else:
+                                # All children succeeded. Wake up the parent to run its own execution (synthesis).
                                 ready_to_run_ids.add(tid)
-                                task.status = "pending"
+                                task.status = "pending"  # Set to pending so it gets picked up to run.
                                 self.state_manager.upsert_task(task)
 
                     ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
@@ -871,7 +991,7 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             span.set_attribute("dag.task.id", t.id)
             span.set_attribute("dag.task.status", t.status)
 
-            if t.status == "paused_by_human" or (t.status == "waiting_for_user_response" and t.user_response is None):
+            if t.status in ["paused_by_human", "waiting_for_user_response"]:
                 return
 
             try:
@@ -881,11 +1001,6 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                     if t.status != new_status:
                         t.status = new_status
                         self.state_manager.upsert_task(t)
-
-                if t.status == "waiting_for_user_response" and t.user_response is not None:
-                    if t.agent_role_paused == "initial_planner": update_status("planning")
-                    elif t.agent_role_paused == "adaptive_decomposer": update_status("proposing")
-                    else: update_status("running")
 
                 if t.status == "waiting_for_children":
                     update_status("running")
@@ -931,8 +1046,11 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
 
         all_tasks = self.state_manager.get_all_tasks()
         context_str = "\n".join([f"- ID: {tk.id} Desc: {tk.desc}" for tk in all_tasks.values() if tk.status == "complete" and tk.id != t.id])
-        prompt_parts = [f"Objective: {t.desc}", f"\nAvailable completed data sources:\n{context_str}", f"\n--- Shared Notebook ---\n{self._format_notebook_for_llm(t)}"]
-        self._inject_and_clear_user_response(prompt_parts, t)
+
+        existing_tags = self._get_all_existing_tags()
+        tags_str = f"\nEXISTING TAGS (reuse these if possible:\n{', '.join(existing_tags)}" if existing_tags else "\nNo existing tags."
+
+        prompt_parts = [f"Objective: {t.desc}", tags_str, f"\nAvailable completed data sources:\n{context_str}"]
 
         plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, plan_res, ChainedExecutionPlan, "initial_planner")
@@ -948,7 +1066,7 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             previous_task_global_id_in_chain = None
             for task_desc in chain_obj.chain:
                 all_new_task_descriptions.append(task_desc)
-                new_task = Task(id=str(uuid.uuid4())[:8], desc=task_desc.desc, parent=t.id, can_request_new_subtasks=task_desc.can_request_new_subtasks, mcp_servers=t.mcp_servers)
+                new_task = Task(id=str(uuid.uuid4())[:8], desc=task_desc.desc, parent=t.id, can_request_new_subtasks=task_desc.can_request_new_subtasks, mcp_servers=t.mcp_servers, tags=task_desc.tags)
                 self.state_manager.upsert_task(new_task)
                 t.children.append(new_task.id)
                 local_to_global_id_map[task_desc.local_id] = new_task.id
@@ -978,7 +1096,7 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
 
         t.dep_results = {d: (dep.result if (dep := self.state_manager.get_task(d)) else None) for d in t.deps}
         prompt_parts = [f"Your complex task is: {t.desc}", f"\nDependency Results:\n{json.dumps(t.dep_results, indent=2)}", "\nBreak this down if necessary."]
-        self._inject_and_clear_user_response(prompt_parts, t)
+        # self._inject_and_clear_user_response(prompt_parts, t)
 
         proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, proposals_res, ChainedExecutionPlan, "adaptive_decomposer")
@@ -1004,36 +1122,74 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
         t = ctx.task
         logger.info(f"[{t.id}] Running task execution for: {t.desc}")
 
+        # --- 1. CONSTRUCT BASE PROMPT (UNCHANGED) ---
+        # This section builds the initial context from dependencies and sub-tasks.
+        # It runs only once at the beginning of the execution flow.
         children_ids = set(t.children)
         prunable_deps_ids = t.deps - children_ids
         final_deps_to_use = children_ids.copy()
-
         if len(prunable_deps_ids) > self.max_dependencies_per_task:
-            logger.warning(f"Task [{t.id}] has {len(prunable_deps_ids)} prunable dependencies, exceeding limit. Selecting...")
-            pruning_candidates_prompt = "\n".join([f"- ID: {dep_id}, Description: {self.state_manager.get_task(dep_id).desc}" for dep_id in prunable_deps_ids if self.state_manager.get_task(dep_id)])
+            logger.warning(
+                f"Task [{t.id}] has {len(prunable_deps_ids)} prunable dependencies, exceeding limit. Selecting...")
+            pruning_candidates_prompt = "\n".join(
+                [f"- ID: {dep_id}, Description: {self.state_manager.get_task(dep_id).desc}" for dep_id in
+                 prunable_deps_ids if self.state_manager.get_task(dep_id)])
             pruner_prompt = f"Objective: '{t.desc}'\n\nSelect ONLY the most critical dependencies (max {self.max_dependencies_per_task}):\n{pruning_candidates_prompt}"
             selection = await self._run_stateless_agent(self.dependency_pruner, pruner_prompt, ctx)
             if selection and selection.approved_dependency_ids:
                 final_deps_to_use.update(selection.approved_dependency_ids)
-                logger.info(f"Pruned dependencies to {len(selection.approved_dependency_ids)}. Reasoning: {selection.reasoning}")
+                logger.info(
+                    f"Pruned dependencies to {len(selection.approved_dependency_ids)}. Reasoning: {selection.reasoning}")
             else:
                 import random
                 logger.error(f"[{t.id}] Dependency pruner failed. Using random subset.")
-                final_deps_to_use.update(random.sample(list(prunable_deps_ids), min(self.max_dependencies_per_task, len(prunable_deps_ids))))
+                final_deps_to_use.update(
+                    random.sample(list(prunable_deps_ids), min(self.max_dependencies_per_task, len(prunable_deps_ids))))
         else:
             final_deps_to_use.update(prunable_deps_ids)
 
-        child_results = {child.desc: child.result for cid in t.children if (child := self.state_manager.get_task(cid)) and child.status == 'complete' and child.result}
+        child_results = {child.desc: child.result for cid in t.children if
+                         (child := self.state_manager.get_task(cid)) and child.status == 'complete' and child.result}
         pruned_dep_ids = final_deps_to_use - children_ids
-        dep_results = {dep.desc: dep.result for did in pruned_dep_ids if (dep := self.state_manager.get_task(did)) and dep.status == 'complete' and dep.result}
+        dep_results = {}
+        for did in pruned_dep_ids:
+            dep_task = self.state_manager.get_task(did)
+            if not dep_task or dep_task.status != 'complete':
+                continue
+            if dep_task.task_type == "document" and dep_task.document_state:
+                dep_results[dep_task.desc] = dep_task.document_state.content
+            elif dep_task.result is not None:
+                dep_results[dep_task.desc] = dep_task.result
 
         prompt_lines = [f"Your task is: {t.desc}\n"]
+
+        if t.human_injected_deps:
+            prompt_lines.append("\n--- CONTEXT MANUALLY PROVIDED BY OPERATOR ---\n")
+            logger.info(f"Task [{t.id}] has {len(t.human_injected_deps)} injected dependencies.")
+            for injected_dep in t.human_injected_deps:
+                source_task = self.state_manager.get_task(injected_dep.source_task_id)
+                if not source_task: continue
+                if injected_dep.depth == "shallow":
+                    prompt_lines.append(
+                        f"- From injected shallow dependency '{source_task.desc}':\n{source_task.result}\n")
+                elif injected_dep.depth == "deep":
+                    history_str = json.dumps(source_task.executor_llm_history,
+                                             indent=2) if source_task.executor_llm_history else "Not available."
+                    prompt_lines.append(
+                        f"- From injected DEEP dependency '{source_task.desc}':\n  - Result: {source_task.result}\n  - Execution History: {history_str}\n")
+            prompt_lines.append("-------------------------------------------\n\n")
+            t.human_injected_deps = []
+            self.state_manager.upsert_task(t)
+
         if child_results:
-            prompt_lines.append("\nSynthesize results from sub-tasks:\n" + "\n".join([f"- From '{desc}':\n{res}\n" for desc, res in child_results.items()]))
+            prompt_lines.append("\nSynthesize results from sub-tasks:\n" + "\n".join(
+                [f"- From '{desc}':\n{res}\n" for desc, res in child_results.items()]))
         if dep_results:
-            prompt_lines.append("\nUse data from critical dependencies:\n" + "\n".join([f"- From '{desc}':\n{res}\n" for desc, res in dep_results.items()]))
+            prompt_lines.append("\nUse data from critical dependencies:\n" + "\n".join(
+                [f"- From '{desc}':\n{res}\n" for desc, res in dep_results.items()]))
         prompt_base_content = "".join(prompt_lines)
 
+        # --- 2. SETUP EXECUTOR AGENT (UNCHANGED) ---
         task_specific_mcp_clients = []
         if t.mcp_servers:
             for server_config in t.mcp_servers:
@@ -1043,47 +1199,98 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 except Exception as e:
                     logger.error(f"[{t.id}]: Failed to create MCP client for {server_config.get('name')}: {e}")
 
-        task_executor = Agent(model=self.base_llm_model, system_prompt=self.executor_system_prompt, output_type=str, tools=self._tools_for_agents, mcp_servers=task_specific_mcp_clients)
+        task_executor = Agent(
+            model=self.base_llm_model,
+            system_prompt=self.executor_system_prompt,
+            output_type=str,
+            tools=list(self._tools_for_agents),
+            mcp_servers=task_specific_mcp_clients,
+        )
+        self.comms_manager.apply_to_agent(task_executor)
+        self.notebook_manager.apply_instructions(task_executor)
+        self.notebook_manager.apply_tools(task_executor)
 
-        while True:
-            current_attempt = t.fix_attempts + t.grace_attempts + 1
-            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
+        # --- 3. SMARTLY CLEAR LOGS ---
+        # **FIX**: Only clear logs on a true "cold start" (no previous LLM history), not on every retry.
+        if not t.last_llm_history:
             t.execution_log = []
             self.state_manager.upsert_task(t)
 
-            current_prompt_parts = [prompt_base_content, f"\n\n--- Shared Notebook ---\n{self._format_notebook_for_llm(t)}", self._get_notebook_tool_guidance(t, "executor")]
-            if t.human_directive:
-                current_prompt_parts.insert(0, f"--- OPERATOR GUIDANCE ---\n{t.human_directive}\n------------------------\n\n")
-                t.human_directive = None
-                self.state_manager.upsert_task(t)
-            current_prompt = "".join(current_prompt_parts)
+        # --- 4. MAIN EXECUTION & RETRY LOOP ---
+        while True:
+            t.comm_token_bucket.refill()
+            self.state_manager.upsert_task(t)
 
+            current_attempt = t.fix_attempts + t.grace_attempts + 1
+            t.span.add_event(f"Execution Attempt", {"attempt": current_attempt})
+            attempt_marker = {"type": "thought", "content": f"--- Starting Execution Attempt #{current_attempt} ---"}
+            self._broadcast_execution_log_update(t.id, attempt_marker)
+
+            current_prompt_parts = [prompt_base_content]
+
+            # **FIX**: Process interrupts from the queue to form the next prompt's context.
+            if t.interrupt_queue:
+                interrupt = heapq.heappop(t.interrupt_queue)
+                logger.info(f"Task [{t.id}] processing interrupt (Priority: {interrupt.priority}).")
+                current_prompt_parts.insert(0, f"{interrupt.get_interrupt_prompt()}\n\n")
+                # This clears the queue for this turn and is persisted
+                self.state_manager.upsert_task(t)
+
+            # Legacy support for the old directive system
+            elif t.human_directive:
+                current_prompt_parts.insert(0,
+                                            f"--- HIGH PRIORITY CONTEXT ---\n{t.human_directive}\n------------------------\n\n")
+                t.human_directive = None
+
+            current_prompt = "".join(current_prompt_parts)
             logger.info(f"[{t.id}] Attempt {current_attempt}: Streaming executor actions...")
             exec_res, result = None, None
+
             try:
-                async with task_executor.iter(user_prompt=current_prompt, message_history=t.last_llm_history) as agent_run:
+                # **FIX**: The agent now runs with the memory of its last attempt.
+                async with task_executor.iter(
+                        user_prompt=current_prompt,
+                        message_history=t.last_llm_history,
+                        deps=ctx
+                ) as agent_run:
                     async for node in agent_run:
                         if formatted_node := self._format_stream_node(node):
-                            t.execution_log.append(formatted_node)
-                            self.state_manager.upsert_task(t)
-                exec_res = agent_run.result
-            except Exception as e:
-                t.execution_log.append({"type": "error", "content": f"Execution error: {e}"})
-                self.state_manager.upsert_task(t)
+                            self._broadcast_execution_log_update(t.id, formatted_node)
 
+                # If the loop completes without exception, the run was successful.
+                exec_res = agent_run.result
+
+            except Exception as e:
+                logger.error(f"[{t.id}] Exception during agent.iter: {e}", exc_info=True)
+                error_node = {"type": "error",
+                              "content": f"Execution error: {str(e)}\n\nTraceback: {traceback.format_exc()}"}
+                self._broadcast_execution_log_update(t.id, error_node)
+
+            # **FIX**: ALWAYS capture the latest history, no matter the outcome.
             if exec_res:
-                _, result = await self._handle_agent_output(ctx, exec_res, str, "executor")
+                t.last_llm_history = exec_res.all_messages()
+                self.state_manager.upsert_task(t)  # Persist the memory
+
+                is_paused, output = await self._handle_agent_output(ctx, exec_res, Union[str, UserQuestion], "executor")
+                if is_paused:
+                    return  # Exit if a question was asked
+                result = output
 
             if result is None:
-                t.human_directive, t.fix_attempts = "Last attempt failed or produced no output. Re-evaluate.", t.fix_attempts + 1
+                # This path is taken if exec_res was None (due to an error) or if the agent returned nothing.
+                t.human_directive = "Your last attempt failed or produced no output. Please re-evaluate your approach and try again, paying close attention to the original goal and provided context."
+                t.fix_attempts += 1
                 self.state_manager.upsert_task(t)
                 if (t.fix_attempts + t.grace_attempts) > (t.max_fix_attempts + self.max_grace_attempts):
-                    t.status = "failed"
-                    self.state_manager.upsert_task(t)
-                    raise Exception(f"Exceeded max attempts for task '{t.id}'.")
-                continue
+                    await self._escalate_to_human_question(ctx, "Executor returned no valid output after all retries.")
+                    if t.status in ["failed", "waiting_for_user_response"]:
+                        return
+                continue  # Retry, carrying over the last_llm_history.
 
+            # If we have a result, proceed to verification.
             await self._process_executor_output_for_verification(ctx, result)
+
+            # If verification passed or the task failed/paused, exit the loop.
             if t.status in ["complete", "failed", "paused_by_human", "waiting_for_user_response"]:
                 return
 
@@ -1098,7 +1305,7 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
 
         if verify_task_result.get_successful():
             t.result, t.status = result, "complete"
-            t.last_llm_history = t.agent_role_paused = None
+            t.agent_role_paused = None
             self.state_manager.upsert_task(t)
             return
 
@@ -1111,7 +1318,8 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             return
 
         if t.grace_attempts < self.max_grace_attempts:
-            analyst_prompt = f"Task: '{t.desc}'\nScores: {t.verification_scores}\nHistory: {t.executor_llm_history}\n\nDecide if one final autonomous grace attempt is viable."
+            score_history_text = [f"Score: {v.score}, Reason: {v.reason}" for v in t.verification_history]
+            analyst_prompt = f"Task: '{t.desc}'\nScores: {score_history_text}\nHistory: {t.executor_llm_history}\n\nDecide if one final autonomous grace attempt is viable."
             decision = await self._run_stateless_agent(self.retry_analyst, analyst_prompt, ctx)
             if decision and decision.should_retry:
                 t.grace_attempts += 1
@@ -1119,22 +1327,15 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
                 self.state_manager.upsert_task(t)
                 return
 
-        logger.warning(f"[{t.id}] All autonomous attempts exhausted. Escalating to human.")
-        formulator_prompt = f"Context: Task '{t.desc}' failed with scores {t.verification_scores}. Final failure reason: '{verify_task_result.reason}'. Formulate the SINGLE most critical question for the human operator to unblock this."
-        question_output = await self._run_stateless_agent(self.question_formulator, formulator_prompt, ctx)
-
-        if isinstance(question_output, UserQuestion):
-            t.current_question, t.agent_role_paused, t.status = question_output, "question_formulator", "waiting_for_user_response"
-        else:
-            error_msg = "All recovery options exhausted, and failed to formulate a question."
-            t.status, t.result = "failed", error_msg
-            t.last_llm_history = t.agent_role_paused = None
-        self.state_manager.upsert_task(t)
+        # Replace the old question formulator logic with a call to the new helper
+        await self._escalate_to_human_question(ctx, verify_task_result.reason)
 
     async def _verify_task(self, t: Task, candidate_result: str) -> Optional[verification]:
         prompt_parts = [f"Job: Verify if 'Candidate Result' completes 'Original Task'.", f"\n--- Original Task ---\n{t.desc}"]
+
+        prompt_parts.append(f"\n--- Candidate Internal Log ---\n{t.executor_llm_history}")
         if t.human_directive: prompt_parts.append(f"\n--- Operator's Directive ---\n{t.human_directive}")
-        if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
+        # if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
         prompt_parts.extend([f"\n--- Candidate Result ---\n{candidate_result}", "\n\nDoes the result, considering directives, complete the task? Be strict."])
 
         vout = await self._run_stateless_agent(self.verifier, "\n".join(prompt_parts), TaskContext(t.id, self.state_manager))
@@ -1143,7 +1344,7 @@ Set a value to 'null' (Python `None`) to delete a key from the notebook.
             logger.error(f"[{t.id}] Verifier returned invalid type or None. Score 0.")
             return verification(reason="Verifier agent failed.", message_for_user="Verification failed internally.", score=0)
 
-        t.verification_scores.append(vout.score)
+        t.verification_history.append(vout)
         t.span.set_attribute("verification.score", vout.score)
         t.span.set_attribute("verification.reason", vout.reason)
         logger.info(f"   > Verification [{t.id}]: score={vout.score}, reason='{vout.reason[:40]}...'")
