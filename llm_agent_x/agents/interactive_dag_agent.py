@@ -349,6 +349,17 @@ class InteractiveDAGAgent(DAGAgent):
             "internal_context_researcher": self.internal_context_researcher,
         }
 
+        agents_to_receive_notebook = [
+            "initial_planner",
+            "adaptive_decomposer",
+            "verifier",
+        ]
+
+        for agent_name in agents_to_receive_notebook:
+            agent = self._agent_role_map.get(agent_name)
+            if agent:
+                self.notebook_manager.apply_instructions(agent)
+
     async def _run_stateless_agent(
             self, agent: Agent, user_prompt: str, ctx: TaskContext
     ) -> Union[BaseModel, str, None]:
