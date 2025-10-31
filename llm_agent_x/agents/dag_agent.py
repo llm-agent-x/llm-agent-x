@@ -220,35 +220,6 @@ class DAGAgent:
         )
         task.cost += cost
 
-    def _format_notebook_for_llm(self, task: Task, max_len_per_entry: int = 200) -> str:
-        if not task.shared_notebook:
-            return "The shared notebook is currently empty."
-        formatted_entries = []
-        for key, value in task.shared_notebook.items():
-            truncated_value = str(value)
-            if len(truncated_value) > max_len_per_entry:
-                truncated_value = truncated_value[: max_len_per_entry - 3] + "..."
-            formatted_entries.append(f"- {key}: {truncated_value}")
-        return "\n".join(formatted_entries)
-
-    def _get_notebook_tool_guidance(self, task: Task, agent_role_name: str) -> str:
-        just_talked_to_human = (
-            task.status == "pending" and task.user_response is not None
-        )
-        is_executor_phase = agent_role_name == "executor"
-        can_update_this_turn = is_executor_phase or (
-            just_talked_to_human
-            and agent_role_name in ["initial_planner", "adaptive_decomposer"]
-        )
-        if can_update_this_turn:
-            return (
-                f"\n\n--- Shared Notebook Update Guidance ---\n"
-                f"To record critical information permanently for Task {task.id}, use `update_notebook_tool`.\n"
-                f"Call it like: `await update_notebook_tool(task_id='{task.id}', updates={{'Key Name': 'Value'}})`\n"
-                f"Set value to `None` to delete a key.\n-------------------------------------"
-            )
-        return ""
-
     async def _handle_agent_output(
         self,
         ctx: TaskContext,

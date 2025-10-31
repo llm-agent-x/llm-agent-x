@@ -79,6 +79,7 @@ from llm_agent_x.core import (
     AgentMessageInterrupt,
 )
 from llm_agent_x.managers import CommunicationManager
+from llm_agent_x.managers.notebook_manager import NotebookManager
 from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 
 from llm_agent_x.backend.extract_json_from_text import extract_json
@@ -141,10 +142,10 @@ class InteractiveDAGAgent(DAGAgent):
         self.comms_manager = CommunicationManager(
             state_manager=self.state_manager,
         )
-
-        self.update_notebook_tool = self._create_notebook_tool(
-            self.state_manager, self._broadcast_state_update
+        self.notebook_manager = NotebookManager(
+            state_manager=self.state_manager,
         )
+
         self._setup_agent_roles()
 
     def _setup_agent_roles(self):
@@ -271,6 +272,11 @@ class InteractiveDAGAgent(DAGAgent):
             tools=self._tools_for_agents,
             mcp_servers=self.mcp_servers,
         )
+
+        # This isn't actually a functional change, but it does make the code more consistent
+        self.comms_manager.apply_to_agent(self.executor)
+        self.notebook_manager.apply_instructions(self.executor)
+        self.notebook_manager.apply_tools(self.executor)
 
         self.verifier = Agent(
             model=llm_model,
@@ -426,36 +432,6 @@ class InteractiveDAGAgent(DAGAgent):
         usage = agent_res.usage()
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, getattr(usage, "request_tokens", 0))
         span.set_attribute(SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, getattr(usage, "response_tokens", 0))
-
-    def _create_notebook_tool(self, state_manager: AbstractStateManager, broadcast_callback: Callable):
-            # --- THE FIX: Make the tool function `async def` ---
-            async def update_notebook_tool_instance(task_id: str, updates: Dict[str, Any]) -> str:
-                """
-    Updates the shared notebook for a given task.
-    Provide key-value pairs in the 'updates' dictionary.
-    Set a value to 'null' (Python `None`) to delete a key from the notebook.
-                """
-                task = state_manager.get_task(task_id)
-                if not task:
-                    return f"Error: Task {task_id} not found."
-
-                updated_keys, deleted_keys = [], []
-                for key, value in updates.items():
-                    if value is None:
-                        if key in task.shared_notebook:
-                            del task.shared_notebook[key]
-                            deleted_keys.append(key)
-                    else:
-                        task.shared_notebook[key] = value
-                        updated_keys.append(key)
-
-                state_manager.upsert_task(task)
-
-                result_msg = f"Notebook for task {task_id} updated. Updated: {', '.join(updated_keys) or 'None'}. Deleted: {', '.join(deleted_keys) or 'None'}."
-                logger.info(result_msg)
-                return result_msg
-
-            return update_notebook_tool_instance
 
     def _get_publisher_channel(self) -> pika.adapters.blocking_connection.BlockingChannel:
         if self._publisher_connection is None or self._publisher_connection.is_closed:
@@ -1063,8 +1039,7 @@ class InteractiveDAGAgent(DAGAgent):
         existing_tags = self._get_all_existing_tags()
         tags_str = f"\nEXISTING TAGS (reuse these if possible:\n{', '.join(existing_tags)}" if existing_tags else "\nNo existing tags."
 
-        prompt_parts = [f"Objective: {t.desc}", tags_str, f"\nAvailable completed data sources:\n{context_str}", f"\n--- Shared Notebook ---\n{self._format_notebook_for_llm(t)}"]
-        # self._inject_and_clear_user_response(prompt_parts, t)
+        prompt_parts = [f"Objective: {t.desc}", tags_str, f"\nAvailable completed data sources:\n{context_str}"]
 
         plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, plan_res, ChainedExecutionPlan, "initial_planner")
@@ -1221,6 +1196,8 @@ class InteractiveDAGAgent(DAGAgent):
             mcp_servers=task_specific_mcp_clients,
         )
         self.comms_manager.apply_to_agent(task_executor)
+        self.notebook_manager.apply_instructions(task_executor)
+        self.notebook_manager.apply_tools(task_executor)
 
         # --- 3. SMARTLY CLEAR LOGS ---
         # **FIX**: Only clear logs on a true "cold start" (no previous LLM history), not on every retry.
