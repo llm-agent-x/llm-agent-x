@@ -80,6 +80,7 @@ from llm_agent_x.core import (
 )
 from llm_agent_x.managers import CommunicationManager
 from llm_agent_x.managers.notebook_manager import NotebookManager
+from llm_agent_x.runtime import BaseScheduler
 from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 
 from llm_agent_x.backend.extract_json_from_text import extract_json
@@ -121,6 +122,8 @@ class InteractiveDAGAgent(DAGAgent):
 
         super().__init__(*args, state_manager=state_manager, setup_agent_roles=False, **kwargs)
 
+        self.scheduler: Optional[BaseScheduler] = None
+
         self.directives_queue = asyncio.Queue()
         self._publisher_connection: Optional[pika.BlockingConnection] = None
         self._publish_channel: Optional[
@@ -148,6 +151,24 @@ class InteractiveDAGAgent(DAGAgent):
 
         self._setup_agent_roles()
 
+    def set_scheduler(self, scheduler: BaseScheduler):
+        """Injects the scheduler instance after construction."""
+        if self.scheduler is not None:
+            raise RuntimeError("InteractiveDAGAgent's scheduler is already set.")
+        self.scheduler = scheduler
+        logger.info("Scheduler successfully injected into InteractiveDAGAgent.")
+
+    def _setup_pika_publisher(self):
+        try:
+            self._publisher_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST, heartbeat=60))
+            self._publish_channel = self._publisher_connection.channel()
+            self._publish_channel.exchange_declare(exchange=self.STATE_UPDATES_EXCHANGE, exchange_type="fanout")
+            logger.info("Publisher RabbitMQ connection initialized.")
+        except Exception as e:
+            logger.critical(f"Failed to initialize publisher RabbitMQ: {e}", exc_info=True)
+            self._shutdown_event.set()
+
+
     def _setup_agent_roles(self):
         """Initializes or reinitializes all agent roles with the current self._tools_for_agents."""
         llm_model = self.base_llm_model
@@ -173,6 +194,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.initial_planner = Agent(
             model=llm_model,
+            deps_type=TaskContext,
             system_prompt=planner_system_prompt,
             output_type=ChainedExecutionPlan,
             tools=self._tools_for_agents,
@@ -216,6 +238,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.adaptive_decomposer = Agent(
             model=llm_model,
+            deps_type=TaskContext,
             system_prompt=(
                 "You are an adaptive expert. Analyze the given task. If it is too complex, break it down into one or more 'chains' of new, more granular sub-tasks. "
                 "A 'chain' is a list of tasks that must be done sequentially. You can create multiple parallel chains for independent workstreams."
@@ -280,6 +303,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         self.verifier = Agent(
             model=llm_model,
+            deps_type=TaskContext,
             system_prompt="You are a meticulous quality assurance verifier. Your job is to check if the provided 'Candidate Result' accurately and completely addresses the 'Task', considering the history and user instructions. Output JSON matching the 'verification' schema. Be strict.",
             output_type=verification,
             tools=self._tools_for_agents,
@@ -352,7 +376,6 @@ class InteractiveDAGAgent(DAGAgent):
         agents_to_receive_notebook = [
             "initial_planner",
             "adaptive_decomposer",
-            "verifier",
         ]
 
         for agent_name in agents_to_receive_notebook:
@@ -361,7 +384,7 @@ class InteractiveDAGAgent(DAGAgent):
                 self.notebook_manager.apply_instructions(agent)
 
     async def _run_stateless_agent(
-            self, agent: Agent, user_prompt: str, ctx: TaskContext
+            self, agent: Agent, user_prompt: str, ctx: TaskContext, ptc=False
     ) -> Union[BaseModel, str, None]:
         t = ctx.task if ctx else None
         if t:
@@ -880,100 +903,35 @@ class InteractiveDAGAgent(DAGAgent):
         return sorted(list(all_tags))
 
     async def run(self):
+
+        if not self.scheduler:
+            raise RuntimeError("Agent cannot run without a scheduler. Call set_scheduler() first.")
+
         self._main_event_loop = asyncio.get_running_loop()
         self._consumer_thread = threading.Thread(target=self._listen_for_directives_target, daemon=True)
         self._consumer_thread.start()
 
-        try:
-            self._publisher_connection = pika.BlockingConnection(pika.ConnectionParameters(RABBITMQ_HOST, heartbeat=60))
-            self._publish_channel = self._publisher_connection.channel()
-            self._publish_channel.exchange_declare(exchange=self.STATE_UPDATES_EXCHANGE, exchange_type="fanout")
-            logger.info("Publisher RabbitMQ connection initialized.")
-        except Exception as e:
-            logger.critical(f"Failed to initialize publisher RabbitMQ: {e}", exc_info=True)
-            self._shutdown_event.set()
-            return
+        self._setup_pika_publisher()
 
-        for task in self.state_manager.get_all_tasks().values():
-            self._broadcast_state_update(task)
+        # Delegate scheduling to the injected scheduler instance
+        scheduler_task = asyncio.create_task(self.scheduler.run())
 
         try:
-            with self.tracer.start_as_current_span("InteractiveDAGAgent.run"):
-                while not self._shutdown_event.is_set():
-                    if not self._consumer_thread.is_alive():
-                        logger.error("Consumer thread has died. Shutting down agent worker.")
-                        break
+            while not self._shutdown_event.is_set():
+                if not self._consumer_thread.is_alive():
+                    logger.error("Consumer thread has died. Shutting down agent worker.")
+                    break
 
-                    while not self.directives_queue.empty():
-                        await self._handle_directive(await self.directives_queue.get())
-
-                    tasks = self.state_manager.get_all_tasks()
-                    all_task_ids = set(tasks.keys())
-
-                    executable_statuses = {"pending", "running", "planning", "proposing", "waiting_for_children"}
-                    non_executable_tasks = {t.id for t in tasks.values() if t.status not in executable_statuses and not (t.status == "waiting_for_user_response")}
-
-                    pending_tasks_for_scheduling = all_task_ids - non_executable_tasks
-                    ready_to_run_ids = set()
-
-                    for tid in pending_tasks_for_scheduling:
-                        task = self.state_manager.get_task(tid)
-                        if not task: continue
-
-                        # Condition 1: Is it a 'pending' task whose dependencies are met?
-                        if task.status == "pending" and all(
-                                (dep_task := self.state_manager.get_task(d)) and dep_task.status == "complete" for d in
-                                task.deps):
-                            ready_to_run_ids.add(tid)
-
-                        # --- THIS IS THE RESTORED BLOCK ---
-                        # Condition 2: Is it a parent task waiting for its children to finish?
-                        elif task.status == "waiting_for_children" and all(
-                                (child_task := self.state_manager.get_task(c)) and child_task.status in ["complete",
-                                                                                                         "failed"] for c
-                                in task.children):
-                            # Check if any child failed.
-                            if any((child_task := self.state_manager.get_task(c)) and child_task.status == "failed" for
-                                   c in task.children):
-                                if task.status != "failed":
-                                    task.status, task.result = "failed", "A child task failed, cannot synthesize results."
-                                    self.state_manager.upsert_task(task)
-                            else:
-                                # All children succeeded. Wake up the parent to run its own execution (synthesis).
-                                ready_to_run_ids.add(tid)
-                                task.status = "pending"  # Set to pending so it gets picked up to run.
-                                self.state_manager.upsert_task(task)
-
-                    ready = [tid for tid in ready_to_run_ids if tid not in self.inflight]
-
-                    if not ready and not self.inflight and self.directives_queue.empty():
-                        await asyncio.sleep(0.1)
-                        continue
-
-                    for tid in ready:
-                        if self.state_manager.get_task(tid):
-                            self.inflight.add(tid)
-                            self.task_futures[tid] = asyncio.create_task(self._run_taskflow(tid))
-
-                    if self.task_futures:
-                        done, _ = await asyncio.wait(list(self.task_futures.values()), timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
-                        for fut in done:
-                            tid = next((tid for tid, f in self.task_futures.items() if f == fut), None)
-                            if tid:
-                                self.inflight.discard(tid)
-                                del self.task_futures[tid]
-                                try: fut.result()
-                                except asyncio.CancelledError: logger.info(f"Task [{tid}] was cancelled.")
-                                except Exception as e:
-                                    logger.error(f"Task [{tid}] future failed: {e}", exc_info=True)
-                                    if t := self.state_manager.get_task(tid):
-                                        if t.status != "failed":
-                                            t.status, t.result = "failed", f"Execution failed: {e}"
-                                            self.state_manager.upsert_task(t)
-                    await asyncio.sleep(0.05)
+                try:
+                    # The agent's main job is now just processing incoming commands
+                    directive = await asyncio.wait_for(self.directives_queue.get(), timeout=0.1)
+                    await self._handle_directive(directive)
+                except asyncio.TimeoutError:
+                    pass # Continue loop if no directives
         finally:
             logger.info("Agent run loop shutting down.")
-            self._shutdown_event.set()
+            self.scheduler.shutdown()
+            await scheduler_task
             if self._publisher_connection and self._publisher_connection.is_open:
                 self._publisher_connection.close()
             if self._consumer_thread and self._consumer_thread.is_alive():
@@ -1052,7 +1010,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         prompt_parts = [f"Objective: {t.desc}", tags_str, f"\nAvailable completed data sources:\n{context_str}"]
 
-        plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
+        plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), deps = ctx, message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, plan_res, ChainedExecutionPlan, "initial_planner")
 
         if is_paused or not chained_plan or not chained_plan.task_chains:
@@ -1098,7 +1056,7 @@ class InteractiveDAGAgent(DAGAgent):
         prompt_parts = [f"Your complex task is: {t.desc}", f"\nDependency Results:\n{json.dumps(t.dep_results, indent=2)}", "\nBreak this down if necessary."]
         # self._inject_and_clear_user_response(prompt_parts, t)
 
-        proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
+        proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), deps = ctx, message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, proposals_res, ChainedExecutionPlan, "adaptive_decomposer")
 
         if is_paused or not chained_plan or not chained_plan.task_chains:
@@ -1338,7 +1296,7 @@ class InteractiveDAGAgent(DAGAgent):
         # if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
         prompt_parts.extend([f"\n--- Candidate Result ---\n{candidate_result}", "\n\nDoes the result, considering directives, complete the task? Be strict."])
 
-        vout = await self._run_stateless_agent(self.verifier, "\n".join(prompt_parts), TaskContext(t.id, self.state_manager))
+        vout = await self._run_stateless_agent(self.verifier, "\n".join(prompt_parts), TaskContext(t.id, self.state_manager), ptc=True)
 
         if not isinstance(vout, verification):
             logger.error(f"[{t.id}] Verifier returned invalid type or None. Score 0.")

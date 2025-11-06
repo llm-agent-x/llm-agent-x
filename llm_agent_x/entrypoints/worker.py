@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 # --- Import from your project structure ---
 from llm_agent_x.core import Task
+from llm_agent_x.runtime import Scheduler, TaskProcessor
 from llm_agent_x.state_manager import InMemoryStateManager
 from llm_agent_x.agents.interactive_dag_agent import InteractiveDAGAgent
 
@@ -33,9 +34,15 @@ async def start_worker():
     """Initializes and runs the interactive agent worker."""
     # registry = setup_initial_tasks()
 
+    state_manager = InMemoryStateManager()
     agent = InteractiveDAGAgent(
         llm_model=model,
+        state_manager=state_manager,
     )
+    task_processor = TaskProcessor(state_manager=state_manager, agent_base=agent)
+    scheduler = Scheduler(state_manager, task_processor=task_processor)
+
+    agent.set_scheduler(scheduler)
 
     logger.info("Starting Interactive DAG Agent worker...")
     await agent.run()
