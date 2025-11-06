@@ -42,6 +42,8 @@ async def start_worker():
     task_processor = TaskProcessor(state_manager=state_manager, agent_base=agent)
     scheduler = Scheduler(state_manager, task_processor=task_processor)
 
+    state_manager.set_broadcast_callback(agent._broadcast_state_update)
+
     agent.set_scheduler(scheduler)
 
     logger.info("Starting Interactive DAG Agent worker...")
