@@ -2,6 +2,7 @@
 
 import heapq
 import logging
+from os import getenv
 from typing import List, Dict, Any, Callable
 
 from pydantic_ai import Agent, RunContext
@@ -101,7 +102,7 @@ class CommunicationManager:
                     f"Question: {message}"
                 )
 
-                spirit_agent = Agent(model="gpt-4o-mini", output_type=str)
+                spirit_agent = Agent(model=getenv("DEFAULT_LLM", "gpt-4o-mini"), output_type=str)
                 response = await spirit_agent.run(user_prompt=prompt, message_history=target_task.last_llm_history)
 
                 return f"Response from completed task '{target_task_id}': {response.output}"

@@ -109,15 +109,15 @@ def agent_pika_heartbeat_thread(connection_ref, lock_ref, shutdown_event_ref):
 
 
 class InteractiveDAGAgent(DAGAgent):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, state_manager: Optional[AbstractStateManager], *args, **kwargs):
         self._init_args = args
         self._init_kwargs = kwargs
         kwargs.pop("min_question_priority", None)
 
         self.max_total_tasks = kwargs.pop("max_total_tasks", 25)
         self.max_dependencies_per_task = kwargs.pop("max_dependencies_per_task", 7)
-
-        state_manager = InMemoryStateManager(broadcast_callback=self._broadcast_state_update)
+        if state_manager is None:
+            state_manager = InMemoryStateManager(broadcast_callback=self._broadcast_state_update)
 
         super().__init__(*args, state_manager=state_manager, setup_agent_roles=False, **kwargs)
 
