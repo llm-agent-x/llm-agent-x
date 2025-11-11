@@ -138,6 +138,7 @@ class InteractiveDAGAgent(DAGAgent):
         self._publisher_connection_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._consumer_thread: Optional[threading.Thread] = None
+        self._publisher_heartbeat_thread: Optional[threading.Thread] = None
         self._main_event_loop: Optional[asyncio.AbstractEventLoop] = None
         self.proposed_tasks_buffer = []
         self.proposed_task_dependencies_buffer = []
@@ -912,6 +913,19 @@ class InteractiveDAGAgent(DAGAgent):
         self._consumer_thread.start()
 
         self._setup_pika_publisher()
+
+        self._publisher_heartbeat_thread = threading.Thread(
+            target=agent_pika_heartbeat_thread,
+            args=(
+                lambda: self._publisher_connection,
+                self._publisher_connection_lock,
+                self._shutdown_event,
+            ),
+            daemon=True,
+        )
+
+        self._publisher_heartbeat_thread.start()
+        logger.info("Publisher heartbeat thread started.")
 
         # Delegate scheduling to the injected scheduler instance
         scheduler_task = asyncio.create_task(self.scheduler.run())
