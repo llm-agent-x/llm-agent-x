@@ -80,6 +80,9 @@ class TokenBucket(BaseModel):
 class Task(BaseModel):
     id: str
     desc: str
+
+    metadata: Optional[Dict[str,Any]] = {}
+
     deps: Set[str] = Field(default_factory=set)
     status: str = "pending"  # can be: pending, planning, proposing, waiting_for_children, running, complete, failed, cancelled, pruned, paused_by_human, waiting_for_user_response
     is_critical: bool = Field(False,
