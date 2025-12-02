@@ -59,6 +59,7 @@ services:
       - RABBITMQ_HOST=rabbitmq
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - BRAVE_API_KEY=${BRAVE_API_KEY}
+      - ENABLED_AGENTS=${ENABLED_AGENTS}
     # <<< VOLUME IS REMOVED FROM HERE >>>
     depends_on:
       rabbitmq:

@@ -32,6 +32,14 @@ shutdown_event = threading.Event()
 
 DIRECTIVES_QUEUE = "directives_queue"
 
+ENABLED_AGENTS = os.getenv("ENABLED_AGENTS", "interactive_dag").split(",")
+DEFAULT_AGENT = ENABLED_AGENTS[0] if ENABLED_AGENTS else "interactive_dag"
+
+def get_queue_name(agent_type: str) -> str:
+    # Must match the logic in InteractiveDAGAgent: f"{queue_prefix}directives_queue"
+    # where queue_prefix is "{agent_type}_"
+    return f"{agent_type}_directives_queue"
+
 def pika_heartbeat_thread():
     """Periodically processes pika events to keep the publisher connection alive."""
     while not shutdown_event.is_set():
@@ -101,6 +109,9 @@ def get_pika_channel() -> BlockingChannel:
             if channel and channel.is_open:
                 channel.close()
 
+@app.get("/api/agents")
+async def get_available_agents():
+    return {"agents": ENABLED_AGENTS, "default": DEFAULT_AGENT}
 
 # --- API Endpoints ---
 @app.get("/api/tasks")
@@ -113,6 +124,20 @@ async def get_all_tasks():
 async def add_root_task(request: Request, channel: BlockingChannel = Depends(get_pika_channel)):
     try:
         body = await request.json()
+
+        # Validate agent_type
+        agent_type = body.get("agent_type", DEFAULT_AGENT)
+        if agent_type not in ENABLED_AGENTS:
+             # Fallback or error? Let's error to be safe, or fallback to default
+             logger.warning(f"Requested unknown agent '{agent_type}', defaulting to {DEFAULT_AGENT}")
+             agent_type = DEFAULT_AGENT
+
+        # Construct the routing key dynamically
+        target_queue = get_queue_name(agent_type)
+
+        # Ensure the queue exists before publishing (safety)
+        channel.queue_declare(queue=target_queue, durable=True)
+
         message = {
             "task_id": str(uuid.uuid4()),
             "command": "ADD_ROOT_TASK",
@@ -120,13 +145,21 @@ async def add_root_task(request: Request, channel: BlockingChannel = Depends(get
                 "desc": body.get("desc"),
                 "needs_planning": True,
                 "mcp_servers": body.get("mcp_servers", []),
+                # Pass tags and the agent_type itself so the worker can hydrate the Task object correctly
+                "tags": body.get("tags", []),
+                "agent_type": agent_type
             },
         }
+
+        logger.info(f"Routing new task to agent '{agent_type}' on queue '{target_queue}'")
+
         channel.basic_publish(
-            exchange="", routing_key=DIRECTIVES_QUEUE, body=json.dumps(message),
+            exchange="",
+            routing_key=target_queue, # <--- DYNAMIC ROUTING KEY
+            body=json.dumps(message),
             properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
         )
-        return {"status": "new task submitted"}
+        return {"status": "new task submitted", "agent_type": agent_type}
     except Exception as e:
         logger.exception(f"Error in add_root_task: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -201,14 +234,28 @@ async def delete_document(document_id: str, channel: BlockingChannel = Depends(g
 @app.post("/api/tasks/{task_id}/directive")
 async def post_directive(task_id: str, request: Request, channel: BlockingChannel = Depends(get_pika_channel)):
     try:
+        # Lookup the task to find its agent_type
+        task = task_state_cache.get(task_id)
+
+        # Default to the first agent if task is not found (race condition) or has no type
+        agent_type = task.get("agent_type", DEFAULT_AGENT) if task else DEFAULT_AGENT
+
+        target_queue = get_queue_name(agent_type)
+        channel.queue_declare(queue=target_queue, durable=True)
+
         directive = await request.json()
         message = {
             "task_id": task_id,
             "command": directive.get("command"),
             "payload": directive.get("payload"),
         }
+
+        logger.info(f"Routing directive for task {task_id} to '{target_queue}'")
+
         channel.basic_publish(
-            exchange="", routing_key=DIRECTIVES_QUEUE, body=json.dumps(message),
+            exchange="",
+            routing_key=target_queue, # <--- DYNAMIC ROUTING KEY
+            body=json.dumps(message),
             properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
         )
         return {"status": "directive sent"}

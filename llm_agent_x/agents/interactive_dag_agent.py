@@ -112,7 +112,7 @@ def agent_pika_heartbeat_thread(connection_ref, lock_ref, shutdown_event_ref):
 
 
 class InteractiveDAGAgent(DAGAgent):
-    def __init__(self, state_manager: Optional[AbstractStateManager], *args, **kwargs):
+    def __init__(self, state_manager: Optional[AbstractStateManager], *args, queue_prefix: str="", **kwargs):
         self._init_args = args
         self._init_kwargs = kwargs
         kwargs.pop("min_question_priority", None)
@@ -136,7 +136,7 @@ class InteractiveDAGAgent(DAGAgent):
         self._consumer_channel_for_thread: Optional[
             pika.adapters.blocking_connection.BlockingChannel
         ] = None
-        self.DIRECTIVES_QUEUE = "directives_queue"
+        self.DIRECTIVES_QUEUE = f"{queue_prefix}directives_queue"
         self._publisher_connection_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._consumer_thread: Optional[threading.Thread] = None
@@ -733,10 +733,12 @@ class InteractiveDAGAgent(DAGAgent):
                     needs_planning=payload.get("needs_planning", True),
                     status="pending",
                     mcp_servers=payload.get("mcp_servers", []),
-                    tags=set(payload.get("tags", [])), # <-- Handle tags on creation
+                    tags=set(payload.get("tags", [])),
+                    # --- FIX: Capture the agent type ---
+                    agent_type=payload.get("agent_type", "interactive_dag")
                 )
                 self.state_manager.upsert_task(new_task)
-                logger.info(f"Added new root task: {new_task.id} - {new_task.desc}")
+                logger.info(f"Added new root task: {new_task.id} - {new_task.desc} [{new_task.agent_type}]")
             return
 
         if command == "ADD_DOCUMENT":

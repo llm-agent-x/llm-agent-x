@@ -3,15 +3,24 @@
 // Import the McpServer type for type safety and clarity.
 // Adjust the path if your component is located elsewhere.
 import type { McpServer } from "@/app/components/McpServerManager";
+import type { AgentInfo } from "@/lib/types";
 
 const API_BASE_URL = "http://localhost:8000";
+
+export const fetchAvailableAgents = async (): Promise<AgentInfo> => {
+  const res = await fetch(`${API_BASE_URL}/api/agents`);
+  if (!res.ok) throw new Error("Failed to fetch agents");
+  return res.json();
+};
+
 
 /**
  * Submits a new root task to the agent swarm.
  * @param desc - The task description.
  * @param mcp_servers - An array of selected MCP server objects to be used for the task.
+ * @param agent_type - The type of agent to use for the task.
  */
-export async function addTask(desc: string, mcp_servers: McpServer[]) {
+export async function addTask(desc: string, mcp_servers: McpServer[], agent_type: string) {
   // <-- UPDATED SIGNATURE
   if (!desc.trim()) {
     console.error("Task description cannot be empty.");
@@ -22,7 +31,7 @@ export async function addTask(desc: string, mcp_servers: McpServer[]) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // The body now includes the description and the array of server objects.
-      body: JSON.stringify({ desc, mcp_servers }), // <-- UPDATED BODY
+      body: JSON.stringify({ desc, mcp_servers, agent_type }), // <-- UPDATED BODY
     });
     if (!response.ok) {
       throw new Error(`Failed to add task: ${response.statusText}`);

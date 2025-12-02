@@ -83,6 +83,11 @@ class Task(BaseModel):
     id: str
     desc: str
 
+    agent_type: str = Field(
+        "interactive_dag",
+        description="The type of agent responsible for this task (e.g., 'interactive_dag', 'research_agent')."
+    )
+
     metadata: Optional[Dict[str,Any]] = {}
 
     deps: Set[str] = Field(default_factory=set)

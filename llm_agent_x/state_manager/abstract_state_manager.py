@@ -23,7 +23,7 @@ state is updated, used to notify UIs.
         """
         self._broadcast = broadcast_callback or (lambda task: None)
 
-    def set_broadcast_callback(self, broadcast_callback: Callable[[Task], None]):
+    def set_broadcast_callback(self, broadcast_callback: Callable[["Task"], None]):
         """Injects the broadcast callback function after initialization."""
         self._broadcast = broadcast_callback
 

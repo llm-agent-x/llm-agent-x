@@ -1,3 +1,8 @@
+export interface AgentInfo {
+  agents: string[];
+  default: string;
+}
+
 interface UserQuestion {
   priority: number;
   question: string;

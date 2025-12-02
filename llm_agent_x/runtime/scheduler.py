@@ -21,7 +21,6 @@ class Scheduler(BaseScheduler): # <-- Inherits from BaseScheduler
 
     # The get_ready_tasks() method remains identical to the previous version.
     def get_ready_tasks(self) -> Set[str]:
-        # ... (code is unchanged, copy from previous response)
         tasks = self.state_manager.get_all_tasks()
         all_task_ids = set(tasks.keys())
         executable_statuses = {"pending", "running", "planning", "proposing", "waiting_for_children"}

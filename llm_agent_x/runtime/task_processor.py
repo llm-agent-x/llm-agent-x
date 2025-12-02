@@ -6,7 +6,8 @@ from opentelemetry.trace import StatusCode
 
 from typing import TYPE_CHECKING, Optional
 
-from llm_agent_x.state_manager import AbstractStateManager, TaskContext
+from llm_agent_x.state_manager import AbstractStateManager
+from llm_agent_x.core import TaskContext
 
 # Forward reference for type hinting
 from typing import TYPE_CHECKING
@@ -42,7 +43,7 @@ class TaskProcessor:
             logger.error(f"TaskProcessor started for non-existent task ID: {task_id}")
             return
 
-        ctx = TaskContext(task_id, self.state_manager)
+        ctx = TaskContext(task_id=task_id, state_manager=self.state_manager)
 
         # The entire _run_taskflow logic from before fits perfectly here.
         # We just call methods on `self.agent_base` instead of `self`.
