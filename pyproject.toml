@@ -17,7 +17,6 @@ python-dotenv = "^1.0.0"
 rich = "^13.0.0"
 icecream = "^2.1.3"
 arize-phoenix = "^10.5.0"
-huggingface-hub = "^0.32.3"
 bs4 = "^0.0.2"
 lxml = "^5.4.0"
 sumy = "^0.11.0"
@@ -33,11 +32,11 @@ asyncio-throttle = "^1.0.2"
 pika = "^1.3.2"
 python-socketio = "^5.13.0"
 aio-pika = "^9.5.7"
-pydantic-ai-slim = {extras = ["mcp", "openai"], version = "^1.0.10"}
 
 # --- Dependencies from Sandbox ---
 fastapi = "^0.115.12"
 python-multipart = "*" # Needed for FastAPI file uploads
+pydantic-ai = "^1.11.1"
 
 [tool.poetry.group.dev.dependencies]
 black = "^25.1.0"

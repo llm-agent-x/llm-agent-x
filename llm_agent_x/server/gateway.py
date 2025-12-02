@@ -265,7 +265,6 @@ def listen_for_state_updates():
     logger.info("Waiting for state updates from the agent...")
 
     def callback(ch, method, properties, body):
-        global task_state_cache
         try:
             update = json.loads(body)
             task_id = update.get("id")

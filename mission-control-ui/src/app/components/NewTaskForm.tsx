@@ -22,10 +22,9 @@ export const NewTaskForm = ({ mcpServers }: NewTaskFormProps) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (description.trim()) {
-      const selectedServers =
-        selectedServerIds.length > 0
-          ? mcpServers.filter((server) => selectedServerIds.includes(server.id))
-          : mcpServers;
+      const selectedServers = mcpServers.filter((server) =>
+          selectedServerIds.includes(server.id)
+        );
       await addTask(description, selectedServers);
       setDescription("");
     }
