@@ -1,4 +1,4 @@
-from .types import Task, UserQuestion, DocumentState
+from .types import Task, UserQuestion, DocumentState, TaskContext
 
 from .types import (
     verification,
@@ -21,7 +21,7 @@ from .types import (
     ChainedExecutionPlan,
     HumanInjectedDependency,
     TokenBucket,
+    TaskContext,
 )
-from ..state_manager.abstract_state_manager import TaskContext
 
 from .interrupts import Interrupt, HumanDirectiveInterrupt, AgentMessageInterrupt

@@ -76,14 +76,15 @@ from llm_agent_x.core import (
     HumanInjectedDependency,
     Interrupt,
     HumanDirectiveInterrupt,
-    AgentMessageInterrupt,
+    AgentMessageInterrupt, TaskContext,
 )
 from llm_agent_x.managers import CommunicationManager
 from llm_agent_x.managers.notebook_manager import NotebookManager
-from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 
 from llm_agent_x.backend.extract_json_from_text import extract_json
 from llm_agent_x.state_manager import InMemoryStateManager, AbstractStateManager
+
+TaskContext.model_rebuild()
 
 load_dotenv(".env", override=True)
 logging.basicConfig(
@@ -984,7 +985,7 @@ class InteractiveDAGAgent(DAGAgent):
     async def _run_taskflow(self, tid: str):
         t = self.state_manager.get_task(tid)
         if not t: return
-        ctx = TaskContext(tid, self.state_manager)
+        ctx = TaskContext(task_id=tid, state_manager=self.state_manager)
 
         with self.tracer.start_as_current_span(f"Task: {t.desc[:50]}") as span:
             t.span = span
@@ -1052,7 +1053,7 @@ class InteractiveDAGAgent(DAGAgent):
 
         prompt_parts = [f"Objective: {t.desc}", tags_str, f"\nAvailable completed data sources:\n{context_str}"]
 
-        plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
+        plan_res = await self.initial_planner.run(user_prompt="\n".join(prompt_parts), deps=ctx, message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, plan_res, ChainedExecutionPlan, "initial_planner")
 
         if is_paused or not chained_plan or not chained_plan.task_chains:
@@ -1098,7 +1099,7 @@ class InteractiveDAGAgent(DAGAgent):
         prompt_parts = [f"Your complex task is: {t.desc}", f"\nDependency Results:\n{json.dumps(t.dep_results, indent=2)}", "\nBreak this down if necessary."]
         # self._inject_and_clear_user_response(prompt_parts, t)
 
-        proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), message_history=t.last_llm_history)
+        proposals_res = await self.adaptive_decomposer.run(user_prompt="\n".join(prompt_parts), deps=ctx, message_history=t.last_llm_history)
         is_paused, chained_plan = await self._handle_agent_output(ctx, proposals_res, ChainedExecutionPlan, "adaptive_decomposer")
 
         if is_paused or not chained_plan or not chained_plan.task_chains:
@@ -1338,7 +1339,7 @@ class InteractiveDAGAgent(DAGAgent):
         # if t.user_response: prompt_parts.append(f"\n--- Operator's Answer ---\n{t.user_response}")
         prompt_parts.extend([f"\n--- Candidate Result ---\n{candidate_result}", "\n\nDoes the result, considering directives, complete the task? Be strict."])
 
-        vout = await self._run_stateless_agent(self.verifier, "\n".join(prompt_parts), TaskContext(t.id, self.state_manager))
+        vout = await self._run_stateless_agent(self.verifier, "\n".join(prompt_parts), TaskContext(task_id=t.id, state_manager=self.state_manager))
 
         if not isinstance(vout, verification):
             logger.error(f"[{t.id}] Verifier returned invalid type or None. Score 0.")

@@ -2,11 +2,13 @@
 
 import hashlib
 from datetime import datetime, timezone
-from typing import Set, Dict, Any, Optional, List, Literal
+from typing import Set, Dict, Any, Optional, List, Literal, TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from llm_agent_x.core.interrupts import Interrupt
+if TYPE_CHECKING:
+    from llm_agent_x.state_manager import AbstractStateManager
 
 
 # --- All Pydantic Models related to the Task graph structure go here ---
@@ -350,3 +352,28 @@ class ChainedExecutionPlan(BaseModel):
     task_chains: List[TaskChain] = Field(
         description="A list of task chains. All chains can run in parallel."
     )
+
+
+
+
+class TaskContext(BaseModel):
+    """
+    A context object that provides a convenient, state-aware view for a single task.
+    The 'task' attribute is automatically loaded upon initialization.
+    """
+    # --- CHANGE 1: Use ConfigDict to allow arbitrary types ---
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    task_id: str
+    state_manager: "AbstractStateManager"
+    task: Optional["Task"] = None
+
+
+    def model_post_init(self, context: Any) -> None:
+        """
+        After the model is initialized, use the state_manager to load the
+        full task object into the 'task' field.
+        """
+        # By the time this runs, self.state_manager is a real object, not a string.
+        if self.state_manager:
+            self.task = self.state_manager.get_task(self.task_id)

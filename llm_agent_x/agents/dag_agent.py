@@ -19,10 +19,9 @@ from openinference.semconv.trace import SpanAttributes
 
 from llm_agent_x.core.types import verification, RetryDecision, ExecutionPlan, ProposedSubtask, ProposalResolutionPlan, \
     ChainedExecutionPlan
-from llm_agent_x.state_manager.abstract_state_manager import TaskContext
 # --- NEW STATE MANAGER IMPORTS ---
 from llm_agent_x.state_manager import AbstractStateManager, InMemoryStateManager
-from llm_agent_x.core import Task, UserQuestion
+from llm_agent_x.core import Task, UserQuestion, TaskContext
 
 # --- Basic Setup ---
 load_dotenv(".env", override=True)

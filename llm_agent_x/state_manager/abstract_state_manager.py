@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, TYPE_CHECKING
 
-from llm_agent_x.core import Task
+if TYPE_CHECKING:
+    from llm_agent_x.core import Task
 
 class AbstractStateManager(ABC):
     """
@@ -12,7 +13,7 @@ tasks in the agent's state graph, decoupling the agent logic from the
 underlying storage mechanism (e.g., in-memory dictionary, database).
 """
 
-    def __init__(self, broadcast_callback: Optional[Callable[[Task], None]] = None):
+    def __init__(self, broadcast_callback: Optional[Callable[["Task"], None]] = None):
         """
 Initializes the state manager.
 
@@ -23,17 +24,17 @@ state is updated, used to notify UIs.
         self._broadcast = broadcast_callback or (lambda task: None)
 
     @abstractmethod
-    def upsert_task(self, task: Task):
+    def upsert_task(self, task: "Task"):
         """Adds a new task or updates an existing one."""
         pass
 
     @abstractmethod
-    def get_task(self, task_id: str) -> Optional[Task]:
+    def get_task(self, task_id: str) -> Optional["Task"]:
         """Retrieves a single task by its ID."""
         pass
 
     @abstractmethod
-    def get_all_tasks(self) -> Dict[str, Task]:
+    def get_all_tasks(self) -> Dict[str, "Task"]:
         """Retrieves all tasks in the current state."""
         pass
 
@@ -51,8 +52,3 @@ This is a high-level graph operation that modifies two tasks.
         pass
 
 
-class TaskContext:
-    def __init__(self, task_id: str, state_manager: AbstractStateManager):
-        self.task_id = task_id
-        self.state_manager = state_manager
-        self.task = self.state_manager.get_task(task_id)
